@@ -8275,6 +8275,264 @@ def _default_scan_pids():
         return []
 
 
+def _default_proc_table() -> dict:
+    """Map live pid -> ``(ppid, create_time)``. Derived from the OS.
+
+    This is the ancestry/identity source: ``ppid`` gives the parent chain and
+    ``create_time`` gives a pid-reuse-proof identity that SURVIVES
+    reparenting (unlike the session id, which a descendant can leave by
+    calling ``setsid()``).
+
+    psutil is a declared dependency but this must degrade gracefully: an
+    empty table simply disables the ancestry arm, leaving the group and
+    session arms exactly as they were.
+    """
+    try:
+        import psutil  # type: ignore
+    except Exception:
+        return {}
+    table: dict[int, tuple[int, float]] = {}
+    try:
+        for proc in psutil.process_iter(["pid", "ppid", "create_time"]):
+            try:
+                info = proc.info
+                table[int(info["pid"])] = (
+                    int(info["ppid"]), float(info["create_time"]),
+                )
+            except Exception:
+                continue
+    except Exception:
+        return {}
+    return table
+
+
+def _ancestry_reaches(cand: int, worker: int, table: dict, limit: int = 64) -> bool:
+    """True when walking ``cand``'s parent chain reaches ``worker``.
+
+    Bounded and cycle-guarded; a missing table entry ends the walk.
+    """
+    seen: set[int] = set()
+    cur = int(cand)
+    for _ in range(limit):
+        entry = table.get(cur)
+        if entry is None:
+            return False
+        parent = int(entry[0])
+        if parent == worker:
+            return True
+        if parent <= 1 or parent in seen:
+            return False
+        seen.add(parent)
+        cur = parent
+    return False
+
+
+def _capture_worker_tree(
+    pid: int,
+    *,
+    getpgid=None,
+    getsid=None,
+    scan_pids=None,
+    proc_table=None,
+) -> dict:
+    """Snapshot every pid owned by worker ``pid``, BEFORE it is signalled.
+
+    Ownership is the UNION of three derived sources (never a hand-maintained
+    list):
+
+    a) the worker's own process GROUP (handled by the caller's ``killpg``),
+    b) the SESSION the worker leads (``getsid(pid) == pid``),
+    c) ANCESTRY: every live pid whose parent chain reaches the worker pid.
+
+    (c) exists because neither the group nor the session is a complete
+    boundary — any descendant may call ``setsid()``/``start_new_session``
+    and leave the session entirely. Measured live:
+
+        worker 90579 pgid 90579 sid 90579
+          desc 90580 ppid 90579 pgid 90580 sid 90580
+        NEW-SESSION descendants: [90580]
+
+    Production workers do this routinely (node, zsh job control, MCP stdio
+    servers).
+
+    Why a SNAPSHOT and not a live derivation at kill time: once the worker
+    dies its descendants are reparented to init(1) and the ancestry chain to
+    the worker is GONE. The escalation pass (SIGKILL) therefore reuses this
+    snapshot instead of re-deriving from a chain that no longer exists.
+
+    PID-reuse safety travels with the snapshot: each entry carries the
+    ``create_time`` captured here, re-verified immediately before the signal.
+    """
+    pid = int(pid)
+    if getpgid is None:
+        getpgid = getattr(os, "getpgid", None)
+    if getsid is None:
+        getsid = getattr(os, "getsid", None)
+    if proc_table is None:
+        proc_table = _default_proc_table
+    try:
+        table = proc_table() if callable(proc_table) else dict(proc_table)
+    except Exception:
+        table = {}
+    if not isinstance(table, dict):
+        table = {}
+
+    owns_session = False
+    if getsid is not None:
+        try:
+            owns_session = int(getsid(pid)) == pid
+        except Exception:
+            owns_session = False
+
+    # pid -> [create_time|None, via_session]
+    owned: dict[int, list] = {}
+
+    def _ctime(cand: int):
+        entry = table.get(cand)
+        return None if entry is None else float(entry[1])
+
+    # (b) SESSION arm — only a session we can prove we created. The scan is
+    # not even consulted otherwise.
+    if owns_session:
+        scanner = _default_scan_pids if scan_pids is None else scan_pids
+        try:
+            candidates = scanner() if callable(scanner) else scanner
+            candidates = list(candidates)
+        except Exception:
+            candidates = []
+        for raw in candidates:
+            try:
+                cand = int(raw)
+            except Exception:
+                continue
+            if cand <= 0 or cand == pid:
+                continue
+            try:
+                if int(getsid(cand)) != pid:
+                    continue
+            except Exception:
+                continue
+            owned.setdefault(cand, [_ctime(cand), False])[1] = True
+
+    # (c) ANCESTRY arm — derived from the OS parent chain.
+    for cand in list(table.keys()):
+        cand = int(cand)
+        if cand <= 0 or cand == pid or cand in owned:
+            continue
+        if _ancestry_reaches(cand, pid, table):
+            owned[cand] = [_ctime(cand), False]
+    # Group leaders among the owned set: a separate process GROUP (the
+    # `set -m` job case, or a new-session descendant) gets a group signal so
+    # children appearing after this enumeration are still covered.
+    groups: list[tuple[int, Any, bool]] = []
+    if getpgid is not None:
+        for cand, (ctime, via_session) in owned.items():
+            try:
+                cand_pgid = int(getpgid(cand))
+            except Exception:
+                continue
+            if cand_pgid != cand or cand_pgid == pid:
+                continue
+            groups.append((cand_pgid, ctime, via_session))
+
+    return {
+        "pid": pid,
+        "owns_session": owns_session,
+        "pids": [
+            (cand, ctime, via_session)
+            for cand, (ctime, via_session) in sorted(owned.items())
+        ],
+        "groups": groups,
+    }
+
+
+def _verify_snapshot_identity(
+    cand: int,
+    ctime,
+    via_session: bool,
+    *,
+    worker: int,
+    getsid,
+    fresh: dict,
+) -> bool:
+    """Re-verify a snapshotted pid immediately before signalling it.
+
+    ``create_time`` is the authoritative check: it survives reparenting,
+    which the session id does not (a descendant that called ``setsid()`` was
+    never in our session, and after the worker dies the ancestry chain is
+    gone). A pid whose ``create_time`` changed has been RECYCLED and must be
+    skipped. Session-derived entries additionally keep the session re-check.
+    """
+    if via_session and getsid is not None:
+        try:
+            if int(getsid(cand)) != worker:
+                return False
+        except Exception:
+            return False
+    if ctime is not None:
+        cur = fresh.get(int(cand))
+        if cur is None:
+            return False
+        try:
+            if abs(float(cur[1]) - float(ctime)) > 1e-6:
+                return False
+        except Exception:
+            return False
+        return True
+    # No identity proof available (no psutil): only session-derived entries
+    # are signallable, and they were just re-verified above.
+    return bool(via_session and getsid is not None)
+
+
+def _signal_captured_tree(
+    snapshot: dict,
+    sig: int,
+    *,
+    kill,
+    killpg,
+    getsid,
+    proc_table=None,
+) -> None:
+    """Signal every pid in a pre-death snapshot, identity-verified."""
+    worker = int(snapshot.get("pid", 0))
+    entries = list(snapshot.get("pids") or ())
+    groups = list(snapshot.get("groups") or ())
+    if not entries and not groups:
+        return
+    if proc_table is None:
+        proc_table = _default_proc_table
+    try:
+        fresh = proc_table() if callable(proc_table) else dict(proc_table)
+    except Exception:
+        fresh = {}
+    if not isinstance(fresh, dict):
+        fresh = {}
+
+    for cand, ctime, via_session in entries:
+        if not _verify_snapshot_identity(
+            cand, ctime, via_session,
+            worker=worker, getsid=getsid, fresh=fresh,
+        ):
+            continue
+        try:
+            kill(cand, sig)
+        except Exception:
+            continue
+
+    if killpg is None:
+        return
+    for pgid, ctime, via_session in groups:
+        if not _verify_snapshot_identity(
+            pgid, ctime, via_session,
+            worker=worker, getsid=getsid, fresh=fresh,
+        ):
+            continue
+        try:
+            killpg(pgid, sig)
+        except Exception:
+            continue
+
+
 def _signal_worker_tree(
     pid: int,
     sig: int,
@@ -8284,6 +8542,8 @@ def _signal_worker_tree(
     getpgid=None,
     getsid=None,
     scan_pids=None,
+    proc_table=None,
+    snapshot=None,
 ) -> None:
     """Signal a dispatcher worker AND its descendants.
 
@@ -8313,18 +8573,27 @@ def _signal_worker_tree(
           desc 80763 ppid 80762 pgid 80762 sid 80761
         LEAKED after killpg-only: [80762, 80763]
 
-    The correct ownership invariant is therefore the SESSION, not the group:
-    workers are spawned with ``start_new_session=True``, so the worker pid IS
-    the session id of every descendant, transitively, and no unrelated
-    process can ever join that session. We enumerate live pids and signal
-    every pid whose session id is the worker's — and ONLY when
-    ``getsid(pid) == pid`` (proof we created that session; if the worker does
-    not lead its own session we do not own it and must not scan it).
+    The session is a better invariant, but it is STILL not complete: any
+    descendant may call ``setsid()``/``start_new_session`` and leave the
+    session (node, zsh job control and MCP stdio servers all do). Measured
+    live:
 
-    ``kill`` / ``killpg`` / ``getpgid`` / ``getsid`` / ``scan_pids`` are
-    injectable for tests; they default to the ``os`` equivalents and a live
-    psutil-derived pid enumeration. Raises whatever the underlying signal
-    call raises (callers already handle ProcessLookupError/OSError).
+        worker 90579 pgid 90579 sid 90579
+          desc 90580 ppid 90579 pgid 90580 sid 90580
+        LEAKED after the session-only sweep: [90580]
+
+    So ownership is the UNION of three DERIVED sources: the owned process
+    group, the owned session, and process ANCESTRY (see
+    ``_capture_worker_tree``). The owned set is snapshotted BEFORE the
+    worker is signalled, because the worker's death reparents its
+    descendants to init(1) and destroys the ancestry chain; callers pass
+    that same ``snapshot`` back in for the SIGKILL escalation.
+
+    ``kill`` / ``killpg`` / ``getpgid`` / ``getsid`` / ``scan_pids`` /
+    ``proc_table`` are injectable for tests; they default to the ``os``
+    equivalents and a live psutil-derived enumeration. Raises whatever the
+    underlying signal call raises (callers already handle
+    ProcessLookupError/OSError).
     """
     pid = int(pid)
     if kill is None:
@@ -8338,15 +8607,19 @@ def _signal_worker_tree(
     if getsid is None:
         getsid = getattr(os, "getsid", None)
 
-    # ── Session sweep: the descendants killpg cannot reach ───────────────
+    # ── Owned-set sweep: the descendants killpg cannot reach ─────────────
     # Runs BEFORE the worker signal so the worker's death (and the ensuing
     # reparent-to-init) cannot race the enumeration.
-    if getsid is not None:
-        _signal_owned_session(
-            pid, sig,
-            kill=kill, killpg=killpg, getpgid=getpgid, getsid=getsid,
-            scan_pids=scan_pids,
+    if snapshot is None:
+        snapshot = _capture_worker_tree(
+            pid,
+            getpgid=getpgid, getsid=getsid,
+            scan_pids=scan_pids, proc_table=proc_table,
         )
+    _signal_captured_tree(
+        snapshot, sig,
+        kill=kill, killpg=killpg, getsid=getsid, proc_table=proc_table,
+    )
 
     if killpg is not None and getpgid is not None:
         try:
@@ -8365,89 +8638,6 @@ def _signal_worker_tree(
                 # killpg unsupported/failed -> fall through to pid signal.
 
     kill(pid, sig)
-
-
-def _signal_owned_session(
-    pid: int,
-    sig: int,
-    *,
-    kill,
-    killpg,
-    getpgid,
-    getsid,
-    scan_pids=None,
-) -> None:
-    """Signal every live pid in the session the worker ``pid`` leads.
-
-    No-ops unless ``getsid(pid) == pid`` — we only sweep a session we can
-    prove we created (``start_new_session=True`` at spawn). Every target is
-    DERIVED from the OS enumeration; there is no hand-maintained list.
-
-    PID-reuse safety: each candidate's session id is re-verified immediately
-    before its signal is delivered, and any exception skips that pid.
-    """
-    try:
-        sid = int(getsid(pid))
-    except Exception:
-        return
-    if sid != pid:
-        # Not our session — somebody else owns these processes.
-        return
-
-    if scan_pids is None:
-        scan_pids = _default_scan_pids
-    try:
-        candidates = scan_pids() if callable(scan_pids) else scan_pids
-        candidates = list(candidates)
-    except Exception:
-        return
-
-    groups: list[int] = []
-    for raw in candidates:
-        try:
-            cand = int(raw)
-        except Exception:
-            continue
-        if cand == pid or cand <= 0:
-            continue
-        try:
-            if int(getsid(cand)) != pid:
-                continue
-        except Exception:
-            continue
-        # A separate process GROUP inside our session (the `set -m` case):
-        # remember its leader so a child that appears after this enumeration
-        # is still covered by a group signal below.
-        if getpgid is not None:
-            try:
-                cand_pgid = int(getpgid(cand))
-            except Exception:
-                cand_pgid = None
-            if (
-                cand_pgid is not None
-                and cand_pgid != pid
-                and cand_pgid == cand
-                and cand_pgid not in groups
-            ):
-                groups.append(cand_pgid)
-        try:
-            # Re-verify immediately before the kill: the pid could have died
-            # and been reused by an unrelated process since the scan.
-            if int(getsid(cand)) != pid:
-                continue
-            kill(cand, sig)
-        except Exception:
-            continue
-
-    if killpg is None:
-        return
-    for pgid in groups:
-        try:
-            if int(getsid(pgid)) != pid:
-                continue
-            killpg(pgid, sig)
-        except Exception:
-            continue
 
 
 def _terminate_reclaimed_worker(
@@ -8485,8 +8675,15 @@ def _terminate_reclaimed_worker(
         return info
 
     info["termination_attempted"] = True
+    # Snapshot the owned set BEFORE the worker is signalled: its death
+    # reparents the descendants to init(1) and destroys the ancestry chain,
+    # so the SIGKILL escalation below must reuse this same snapshot.
+    tree = _capture_worker_tree(int(pid))
     try:
-        _signal_worker_tree(int(pid), signal.SIGTERM, kill=kill, killpg=killpg)
+        _signal_worker_tree(
+            int(pid), signal.SIGTERM,
+            kill=kill, killpg=killpg, snapshot=tree,
+        )
     except ProcessLookupError:
         # Process is already gone — that's a successful termination, not a
         # survival. Leaving terminated=False here would make the reclaim guard
@@ -8507,7 +8704,10 @@ def _terminate_reclaimed_worker(
             # signal.SIGKILL doesn't exist on Windows; fall back to SIGTERM
             # (which maps to TerminateProcess via the stdlib shim).
             _sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
-            _signal_worker_tree(int(pid), _sigkill, kill=kill, killpg=killpg)
+            _signal_worker_tree(
+                int(pid), _sigkill,
+                kill=kill, killpg=killpg, snapshot=tree,
+            )
             info["sigkill"] = True
         except (ProcessLookupError, OSError):
             return info
@@ -8680,8 +8880,14 @@ def enforce_max_runtime(
         # group signal too.
         killpg = signal_fn if signal_fn is not None else None
         if kill is not None:
+            # Pre-death snapshot; reused by the SIGKILL escalation (the
+            # ancestry chain is gone once the worker dies).
+            tree = _capture_worker_tree(pid)
             try:
-                _signal_worker_tree(pid, signal.SIGTERM, kill=kill, killpg=killpg)
+                _signal_worker_tree(
+                    pid, signal.SIGTERM,
+                    kill=kill, killpg=killpg, snapshot=tree,
+                )
             except (ProcessLookupError, OSError):
                 pass
             # Short polling wait — no time.sleep on the write txn.
@@ -8693,7 +8899,10 @@ def enforce_max_runtime(
                 try:
                     # signal.SIGKILL doesn't exist on Windows.
                     _sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
-                    _signal_worker_tree(pid, _sigkill, kill=kill, killpg=killpg)
+                    _signal_worker_tree(
+                        pid, _sigkill,
+                        kill=kill, killpg=killpg, snapshot=tree,
+                    )
                     killed = True
                 except (ProcessLookupError, OSError):
                     pass

@@ -16,6 +16,7 @@ from __future__ import annotations
 import os
 import signal
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -584,3 +585,317 @@ def test_max_runtime_kills_separate_process_group_descendants(
     assert session_bystander.poll() is None, (
         "a process in its OWN session must survive the timeout reap"
     )
+
+
+# ---------------------------------------------------------------------------
+# REGRESSION: NEW-SESSION descendants (the measured session-sweep leak)
+#
+# Any descendant may call setsid()/start_new_session and leave the worker's
+# session entirely. Node, zsh job control and MCP stdio servers all do this.
+# Measured live against the session-only fix:
+#
+#     worker 90579 pgid 90579 sid 90579
+#       desc 90580 ppid 90579 pgid 90580 sid 90580
+#     LEAKED after the session-only sweep: [90580]
+#
+# The third, derived ownership source is process ANCESTRY.
+# ---------------------------------------------------------------------------
+
+
+class _NewSessionTree:
+    """A worker whose grandchild lives in a BRAND NEW session."""
+
+    _SCRIPT = (
+        "import os,subprocess,time;"
+        "subprocess.Popen(['sleep','120'], start_new_session=True);"
+        "time.sleep(120)"
+    )
+
+    def __init__(self) -> None:
+        self.proc = subprocess.Popen(
+            [
+                "/bin/sh", "-c",
+                f"exec {sys.executable} -c {self._SCRIPT!r}",
+            ],
+            start_new_session=True,
+        )
+        self.pid = self.proc.pid
+        assert os.getsid(self.pid) == self.pid, "worker must lead its session"
+
+        deadline = time.time() + 10.0
+        self.descendants: list[int] = []
+        self.new_session_descendants: list[int] = []
+        while time.time() < deadline:
+            descs = _descendants_of(self.pid)
+            new_session = [
+                d for d in descs
+                if _safe_getsid(d) not in (None, self.pid)
+            ]
+            if new_session:
+                self.descendants = descs
+                self.new_session_descendants = new_session
+                break
+            time.sleep(0.05)
+        else:  # pragma: no cover - environment failure, must FAIL not skip
+            self.descendants = _descendants_of(self.pid)
+
+        # PRECONDITION (hard failure, never a skip): at least one live
+        # descendant is in a DIFFERENT session than the worker.
+        assert self.new_session_descendants, (
+            "precondition not established: no descendant left the worker's "
+            f"session. worker={self.pid} sid={os.getsid(self.pid)} "
+            "descendants="
+            + repr([
+                (d, _safe_getpgid(d), _safe_getsid(d))
+                for d in _descendants_of(self.pid)
+            ])
+        )
+
+    def all_pids(self) -> list[int]:
+        return [self.pid, *self.descendants]
+
+    def receipts(self) -> list[tuple]:
+        return [
+            (p, _safe_getpgid(p), _safe_getsid(p)) for p in self.all_pids()
+        ]
+
+    def cleanup(self) -> None:
+        for pid in reversed(self.all_pids()):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        try:
+            self.proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+        for pid in self.all_pids():
+            assert _wait_gone(pid, timeout=5), f"teardown failed to reap {pid}"
+
+
+def _safe_getsid(pid: int):
+    try:
+        return os.getsid(pid)
+    except (ProcessLookupError, OSError):
+        return None
+
+
+def _safe_getpgid(pid: int):
+    try:
+        return os.getpgid(pid)
+    except (ProcessLookupError, OSError):
+        return None
+
+
+@pytest.fixture
+def ns_tree():
+    t = _NewSessionTree()
+    try:
+        yield t
+    finally:
+        t.cleanup()
+
+
+@pytest.fixture
+def new_session_bystander():
+    """An unrelated process in its OWN new session. Must always survive."""
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(300)"],
+        start_new_session=True,
+    )
+    try:
+        yield proc
+    finally:
+        proc.kill()
+        proc.wait(timeout=5)
+
+
+def test_reclaim_kills_new_session_descendants(
+    ns_tree: _NewSessionTree, new_session_bystander: subprocess.Popen
+) -> None:
+    """A. The reclaim path reaps a descendant that left the session."""
+    print("PID RECEIPTS (reclaim, new session):", ns_tree.receipts())
+    print("NEW-SESSION descendants:", ns_tree.new_session_descendants)
+
+    info = kb._terminate_reclaimed_worker(ns_tree.pid, kb._claimer_id())
+    assert info["host_local"] is True
+    assert info["termination_attempted"] is True
+
+    assert _wait_gone(ns_tree.pid), "worker must die"
+    leaked = [p for p in ns_tree.new_session_descendants if not _wait_gone(p)]
+    assert leaked == [], (
+        f"NEW-SESSION descendants leaked: {leaked} (worker={ns_tree.pid})"
+    )
+    assert [p for p in ns_tree.descendants if not _wait_gone(p)] == []
+    assert info["terminated"] is True
+    assert new_session_bystander.poll() is None, (
+        "an unrelated process in its own session must survive the sweep"
+    )
+
+
+def test_max_runtime_kills_new_session_descendants(
+    kanban_home: Path,
+    ns_tree: _NewSessionTree,
+    new_session_bystander: subprocess.Popen,
+) -> None:
+    """B. Same regression on the enforce_max_runtime timeout path."""
+    print("PID RECEIPTS (max_runtime, new session):", ns_tree.receipts())
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="overrunning job", assignee="worker",
+            max_runtime_seconds=1,
+        )
+        assert kb.claim_task(conn, tid) is not None
+        kb._set_worker_pid(conn, tid, ns_tree.pid)
+        old = int(time.time()) - 300
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET started_at = ? WHERE id = ?", (old, tid))
+            conn.execute(
+                "UPDATE task_runs SET started_at = ? "
+                "WHERE id = (SELECT current_run_id FROM tasks WHERE id = ?)",
+                (old, tid),
+            )
+        assert tid in kb.enforce_max_runtime(conn)
+
+    assert _wait_gone(ns_tree.pid), "worker must die on timeout"
+    leaked = [p for p in ns_tree.new_session_descendants if not _wait_gone(p)]
+    assert leaked == [], (
+        f"NEW-SESSION descendants leaked on the timeout path: {leaked}"
+    )
+    assert new_session_bystander.poll() is None, (
+        "an unrelated process in its own session must survive the reap"
+    )
+
+
+def test_parent_first_death_still_reaps_the_reparented_orphan(
+    ns_tree: _NewSessionTree, new_session_bystander: subprocess.Popen
+) -> None:
+    """C. PARENT-FIRST: the ancestry chain is gone, the snapshot is not.
+
+    Once the worker dies its descendants are reparented to init(1), so a
+    kill-time ancestry derivation finds NOTHING. The escalation pass must
+    reuse the pre-death snapshot.
+    """
+    orphan = ns_tree.new_session_descendants[0]
+    print("PID RECEIPTS (parent-first):", ns_tree.receipts())
+
+    snapshot = kb._capture_worker_tree(ns_tree.pid)
+    assert orphan in [p for p, _c, _s in snapshot["pids"]], (
+        f"orphan {orphan} missing from the pre-death snapshot {snapshot}"
+    )
+
+    # Kill the worker FIRST. The orphan is reparented to init.
+    os.kill(ns_tree.pid, signal.SIGKILL)
+    assert _wait_gone(ns_tree.pid)
+    try:
+        ns_tree.proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        pass
+    assert _alive(orphan), "orphan must still be alive before the sweep"
+
+    # Proof the chain is gone: a fresh derivation finds no descendants.
+    fresh = kb._capture_worker_tree(ns_tree.pid)
+    assert [p for p, _c, _s in fresh["pids"] if p == orphan] == [], (
+        "precondition not established: ancestry to the dead worker survived"
+    )
+
+    # The escalation pass reuses the pre-death snapshot. Signalling the dead
+    # worker pid itself raises ProcessLookupError (the documented contract
+    # callers already handle) — the snapshot sweep runs BEFORE that.
+    with pytest.raises(ProcessLookupError):
+        kb._signal_worker_tree(
+            ns_tree.pid, signal.SIGKILL,
+            kill=os.kill, killpg=os.killpg, snapshot=snapshot,
+        )
+    assert _wait_gone(orphan), (
+        f"reparented orphan {orphan} leaked: the snapshot was not reused"
+    )
+    assert new_session_bystander.poll() is None
+
+
+def test_snapshotted_pid_whose_create_time_changed_is_skipped() -> None:
+    """D. PID-reuse safety on the snapshot (injected, no real pids)."""
+    worker, recycled, stable = 700, 701, 702
+    before = {
+        worker: (1, 10.0), recycled: (worker, 20.0), stable: (worker, 30.0),
+    }
+    # After the worker's death both are reparented to init; ``recycled`` has
+    # been recycled by an unrelated process (different create_time).
+    after = {worker: (1, 10.0), recycled: (1, 99.0), stable: (1, 30.0)}
+
+    snapshot = kb._capture_worker_tree(
+        worker,
+        getpgid=lambda p: int(p),
+        getsid=lambda _p: -1,  # not a session leader: ancestry arm only
+        scan_pids=(),
+        proc_table=before,
+    )
+    owned = sorted(p for p, _c, _s in snapshot["pids"])
+    assert owned == [recycled, stable]
+
+    kills: list[tuple[int, int]] = []
+    pgkills: list[tuple[int, int]] = []
+    kb._signal_captured_tree(
+        snapshot, signal.SIGTERM,
+        kill=lambda p, s: kills.append((int(p), s)),
+        killpg=lambda p, s: pgkills.append((int(p), s)),
+        getsid=lambda _p: -1,
+        proc_table=after,
+    )
+    signalled = [p for p, _s in kills]
+    assert recycled not in signalled, "recycled pid must not be signalled"
+    assert stable in signalled
+    assert recycled not in [p for p, _s in pgkills]
+
+
+def test_ancestry_sweep_spares_unrelated_processes() -> None:
+    """E. Bystander negative control (injected).
+
+    Neither an unrelated process in its own session nor one that merely
+    shares a pgid/sid coincidence may be signalled.
+    """
+    worker, child = 800, 801
+    unrelated_session = 900        # ppid 1, own session
+    pgid_coincidence = 901         # unrelated, but pgid == worker's pid value
+    table = {
+        worker: (1, 1.0),
+        child: (worker, 2.0),
+        unrelated_session: (1, 3.0),
+        pgid_coincidence: (1, 4.0),
+    }
+    pgids = {
+        worker: worker, child: child,
+        unrelated_session: unrelated_session,
+        pgid_coincidence: worker,  # coincidental shared group id
+    }
+    sids = {
+        worker: worker, child: child,
+        unrelated_session: unrelated_session,
+        pgid_coincidence: worker,  # coincidental shared session id
+    }
+
+    kills: list[tuple[int, int]] = []
+    pgkills: list[tuple[int, int]] = []
+    snapshot = kb._capture_worker_tree(
+        worker,
+        getpgid=lambda p: pgids.get(int(p), int(p)),
+        # Worker does NOT lead its own session here, so the session arm is
+        # disabled and the pgid/sid coincidences must not save the bystander.
+        getsid=lambda p: sids.get(int(p), -1) if int(p) != worker else -1,
+        scan_pids=[unrelated_session, pgid_coincidence],
+        proc_table=table,
+    )
+    kb._signal_captured_tree(
+        snapshot, signal.SIGTERM,
+        kill=lambda p, s: kills.append((int(p), s)),
+        killpg=lambda p, s: pgkills.append((int(p), s)),
+        getsid=lambda p: sids.get(int(p), -1),
+        proc_table=table,
+    )
+    signalled = [p for p, _s in kills]
+    assert child in signalled, "the real descendant must be signalled"
+    assert unrelated_session not in signalled
+    assert pgid_coincidence not in signalled
+    assert pgid_coincidence not in [p for p, _s in pgkills]
+    assert unrelated_session not in [p for p, _s in pgkills]
