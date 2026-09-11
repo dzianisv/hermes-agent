@@ -70,7 +70,10 @@ class _Tree:
         for pid in (self.child_pid, self.pid):
             try:
                 os.kill(pid, signal.SIGKILL)
-            except OSError:
+            except Exception:
+                # Best-effort teardown. On the pre-fix (RED) arm the leaked
+                # grandchild is reparented to init, which puts it outside the
+                # test subtree and trips conftest's live-system os.kill guard.
                 pass
         try:
             self.proc.wait(timeout=5)
