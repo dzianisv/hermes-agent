@@ -8256,6 +8256,25 @@ def _pid_alive(pid: Optional[int]) -> bool:
     return True
 
 
+def _default_scan_pids():
+    """Enumerate live pids on this host. Derived from the OS, never a list.
+
+    psutil is a declared dependency (pyproject.toml), but this must degrade
+    gracefully rather than hard-fail if it is missing: fall back to ``/proc``
+    on Linux, then to an empty enumeration (the group/pid signal still runs).
+    """
+    try:
+        import psutil  # type: ignore
+
+        return list(psutil.pids())
+    except Exception:
+        pass
+    try:
+        return [int(name) for name in os.listdir("/proc") if name.isdigit()]
+    except Exception:
+        return []
+
+
 def _signal_worker_tree(
     pid: int,
     sig: int,
@@ -8263,6 +8282,8 @@ def _signal_worker_tree(
     kill=None,
     killpg=None,
     getpgid=None,
+    getsid=None,
+    scan_pids=None,
 ) -> None:
     """Signal a dispatcher worker AND its descendants.
 
@@ -8282,9 +8303,28 @@ def _signal_worker_tree(
     Falls back to a plain pid signal on ProcessLookupError / OSError /
     AttributeError (Windows has neither ``getpgid`` nor ``killpg``).
 
-    ``kill`` / ``killpg`` / ``getpgid`` are injectable for tests; they
-    default to the ``os`` equivalents. Raises whatever the underlying
-    signal call raises (callers already handle ProcessLookupError/OSError).
+    The group signal is NOT sufficient on its own. The real worker chain is
+    a job-control shell (``sh -c 'set -m; gtimeout ... pi ... &'``), and
+    ``set -m`` puts the ``gtimeout`` -> ``pi`` pair in a *separate process
+    group* that ``killpg(worker_pgid)`` never reaches. Measured live:
+
+        worker 80761 pgid 80761 sid 80761
+          desc 80762 ppid 80761 pgid 80762 sid 80761
+          desc 80763 ppid 80762 pgid 80762 sid 80761
+        LEAKED after killpg-only: [80762, 80763]
+
+    The correct ownership invariant is therefore the SESSION, not the group:
+    workers are spawned with ``start_new_session=True``, so the worker pid IS
+    the session id of every descendant, transitively, and no unrelated
+    process can ever join that session. We enumerate live pids and signal
+    every pid whose session id is the worker's — and ONLY when
+    ``getsid(pid) == pid`` (proof we created that session; if the worker does
+    not lead its own session we do not own it and must not scan it).
+
+    ``kill`` / ``killpg`` / ``getpgid`` / ``getsid`` / ``scan_pids`` are
+    injectable for tests; they default to the ``os`` equivalents and a live
+    psutil-derived pid enumeration. Raises whatever the underlying signal
+    call raises (callers already handle ProcessLookupError/OSError).
     """
     pid = int(pid)
     if kill is None:
@@ -8295,6 +8335,18 @@ def _signal_worker_tree(
         killpg = getattr(os, "killpg", None)
     if getpgid is None:
         getpgid = getattr(os, "getpgid", None)
+    if getsid is None:
+        getsid = getattr(os, "getsid", None)
+
+    # ── Session sweep: the descendants killpg cannot reach ───────────────
+    # Runs BEFORE the worker signal so the worker's death (and the ensuing
+    # reparent-to-init) cannot race the enumeration.
+    if getsid is not None:
+        _signal_owned_session(
+            pid, sig,
+            kill=kill, killpg=killpg, getpgid=getpgid, getsid=getsid,
+            scan_pids=scan_pids,
+        )
 
     if killpg is not None and getpgid is not None:
         try:
@@ -8313,6 +8365,89 @@ def _signal_worker_tree(
                 # killpg unsupported/failed -> fall through to pid signal.
 
     kill(pid, sig)
+
+
+def _signal_owned_session(
+    pid: int,
+    sig: int,
+    *,
+    kill,
+    killpg,
+    getpgid,
+    getsid,
+    scan_pids=None,
+) -> None:
+    """Signal every live pid in the session the worker ``pid`` leads.
+
+    No-ops unless ``getsid(pid) == pid`` — we only sweep a session we can
+    prove we created (``start_new_session=True`` at spawn). Every target is
+    DERIVED from the OS enumeration; there is no hand-maintained list.
+
+    PID-reuse safety: each candidate's session id is re-verified immediately
+    before its signal is delivered, and any exception skips that pid.
+    """
+    try:
+        sid = int(getsid(pid))
+    except Exception:
+        return
+    if sid != pid:
+        # Not our session — somebody else owns these processes.
+        return
+
+    if scan_pids is None:
+        scan_pids = _default_scan_pids
+    try:
+        candidates = scan_pids() if callable(scan_pids) else scan_pids
+        candidates = list(candidates)
+    except Exception:
+        return
+
+    groups: list[int] = []
+    for raw in candidates:
+        try:
+            cand = int(raw)
+        except Exception:
+            continue
+        if cand == pid or cand <= 0:
+            continue
+        try:
+            if int(getsid(cand)) != pid:
+                continue
+        except Exception:
+            continue
+        # A separate process GROUP inside our session (the `set -m` case):
+        # remember its leader so a child that appears after this enumeration
+        # is still covered by a group signal below.
+        if getpgid is not None:
+            try:
+                cand_pgid = int(getpgid(cand))
+            except Exception:
+                cand_pgid = None
+            if (
+                cand_pgid is not None
+                and cand_pgid != pid
+                and cand_pgid == cand
+                and cand_pgid not in groups
+            ):
+                groups.append(cand_pgid)
+        try:
+            # Re-verify immediately before the kill: the pid could have died
+            # and been reused by an unrelated process since the scan.
+            if int(getsid(cand)) != pid:
+                continue
+            kill(cand, sig)
+        except Exception:
+            continue
+
+    if killpg is None:
+        return
+    for pgid in groups:
+        try:
+            if int(getsid(pgid)) != pid:
+                continue
+            killpg(pgid, sig)
+        except Exception:
+            continue
 
 
 def _terminate_reclaimed_worker(
