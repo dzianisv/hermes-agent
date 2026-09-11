@@ -8006,6 +8006,12 @@ DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = 300  # 5 minutes
 # Within this window a GitHub PR URL in a comment blocks re-spawn.
 _RESPAWN_GUARD_PR_WINDOW = 86400  # 24 hours
 
+# Cache of PR-URL -> (is_open, checked_at). Dispatch re-checks the same few
+# PR URLs on every tick; without this each tick would shell out to `gh` once
+# per guarded task.
+_PR_STATE_CACHE: dict = {}
+_PR_STATE_CACHE_TTL = 120  # seconds
+
 # Pattern matching a GitHub PR URL in task comments.
 _RESPAWN_GUARD_PR_URL_RE = re.compile(
     r"https?://github\.com/[^/\s]+/[^/\s]+/pull/\d+",
@@ -8792,6 +8798,17 @@ def _error_fingerprint(error_text: str) -> str:
 # precedence ``_record_task_failure`` documents for every other failure kind.
 _PROTOCOL_VIOLATION_FAILURE_LIMIT = 3
 
+# Bounded retry budget for reclaims where we could NOT determine why the
+# worker died (``_classify_worker_exit`` -> "unknown"). The reap registry
+# (``_recent_worker_exits``) is in-memory, so ANY dispatcher/host restart
+# turns every in-flight worker into an "unknown" exit — a fact about our own
+# process lifecycle, not about the task. With the default failure limit of 2
+# that meant two unrelated restarts permanently blocked a card with
+# "pid N not alive", which is how dozens of healthy cards ended up frozen for
+# days. Unknown exits get their own, larger budget so infrastructure churn
+# cannot trip the breaker on work that never actually failed.
+_UNKNOWN_EXIT_FAILURE_LIMIT = 6
+
 # How far back to walk a task's closed runs when counting the violation
 # streak. The streak trips at a handful of violations, so anything beyond a
 # few dozen rows (violations interleaved with neutral rate-limited requeues)
@@ -9113,11 +9130,19 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 continue
             fp = _error_fingerprint(error_text)
             is_systemic = _fp_counts.get(fp, 0) >= 3
+            # "unknown" exits (pid vanished from the in-memory reap registry,
+            # typically because the dispatcher itself restarted) get their own
+            # larger budget — see ``_UNKNOWN_EXIT_FAILURE_LIMIT``. Systemic
+            # same-error storms still trip immediately.
+            _unknown_exit = error_text.endswith("not alive")
             tripped = _record_task_failure(
                 conn, tid,
                 error=error_text,
                 outcome="crashed",
-                failure_limit=1 if is_systemic else None,
+                failure_limit=(
+                    1 if is_systemic
+                    else (_UNKNOWN_EXIT_FAILURE_LIMIT if _unknown_exit else None)
+                ),
                 release_claim=False,
                 end_run=False,
                 event_payload_extra={"pid": pid, "claimer": claimer},
@@ -9526,15 +9551,72 @@ def check_respawn_guard(
             return "recent_success"
 
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
+    #
+    # An OPEN PR means work is genuinely in flight, so defer the respawn. A
+    # MERGED or CLOSED PR is finished work: continuing to guard on it freezes
+    # the task forever (the comment never expires within the window), which
+    # deadlocks the board — `ready` grows while nothing spawns. Only an open
+    # PR is evidence of in-flight work.
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
     for c in conn.execute(
         "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
         (task_id, pr_cutoff),
     ).fetchall():
-        if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
+        if not c["body"]:
+            continue
+        match = _RESPAWN_GUARD_PR_URL_RE.search(c["body"])
+        if not match:
+            continue
+        if _pr_url_is_open(match.group(0)):
             return "active_pr"
 
     return None
+
+
+def _pr_url_is_open(pr_url: str) -> bool:
+    """Return True if ``pr_url`` points at a still-open GitHub PR.
+
+    Fails OPEN (returns True) when the state cannot be determined, so a
+    network blip or a missing ``gh`` CLI degrades to the old conservative
+    behaviour of guarding, rather than stampeding duplicate workers onto a
+    task whose PR is actually still in flight.
+
+    Results are cached per-process: dispatch checks the same handful of PR
+    URLs on every tick, and an uncached `gh` call per task per tick would
+    make the dispatcher unusably slow.
+    """
+    cached = _PR_STATE_CACHE.get(pr_url)
+    now = time.time()
+    if cached is not None and now - cached[1] < _PR_STATE_CACHE_TTL:
+        return cached[0]
+
+    is_open = True  # fail-open default
+    try:
+        import re as _re
+        import subprocess
+
+        m = _re.search(r"github\.com/([^/]+)/([^/]+)/pull/(\d+)", pr_url)
+        if m:
+            owner, repo, number = m.group(1), m.group(2), m.group(3)
+            proc = subprocess.run(
+                (
+                    "gh", "pr", "view", number,
+                    "--repo", f"{owner}/{repo}",
+                    "--json", "state", "--jq", ".state",
+                ),
+                capture_output=True,
+                text=True,
+                timeout=20,
+                env={**os.environ, "PAGER": "cat", "GH_PAGER": "cat"},
+            )
+            state = (proc.stdout or "").strip().upper()
+            if proc.returncode == 0 and state in {"OPEN", "MERGED", "CLOSED"}:
+                is_open = state == "OPEN"
+    except Exception:
+        is_open = True  # unreachable/ambiguous -> keep guarding
+
+    _PR_STATE_CACHE[pr_url] = (is_open, now)
+    return is_open
 
 
 def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
