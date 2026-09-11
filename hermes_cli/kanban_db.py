@@ -8256,6 +8256,65 @@ def _pid_alive(pid: Optional[int]) -> bool:
     return True
 
 
+def _signal_worker_tree(
+    pid: int,
+    sig: int,
+    *,
+    kill=None,
+    killpg=None,
+    getpgid=None,
+) -> None:
+    """Signal a dispatcher worker AND its descendants.
+
+    Workers are spawned with ``start_new_session=True``, which makes each
+    worker the leader of its own session/process GROUP. Signalling only the
+    worker pid leaves its children (e.g. ``gtimeout`` -> ``pi``) running
+    against a task that has already been handed to a new worker — the
+    observed descendant leak.
+
+    Safety property (load-bearing): we only ever group-signal when the pid
+    is ITSELF the group leader (``os.getpgid(pid) == pid``), i.e. the group
+    is one we created for that worker. If the pid is not the leader it
+    belongs to somebody else's group, and ``killpg`` on it would take out
+    unrelated processes — in that case we signal the single pid only.
+    Never assume ``pgid == pid``: derive it.
+
+    Falls back to a plain pid signal on ProcessLookupError / OSError /
+    AttributeError (Windows has neither ``getpgid`` nor ``killpg``).
+
+    ``kill`` / ``killpg`` / ``getpgid`` are injectable for tests; they
+    default to the ``os`` equivalents. Raises whatever the underlying
+    signal call raises (callers already handle ProcessLookupError/OSError).
+    """
+    pid = int(pid)
+    if kill is None:
+        kill = getattr(os, "kill", None)
+    if kill is None:
+        return
+    if killpg is None:
+        killpg = getattr(os, "killpg", None)
+    if getpgid is None:
+        getpgid = getattr(os, "getpgid", None)
+
+    if killpg is not None and getpgid is not None:
+        try:
+            pgid = getpgid(pid)
+        except (ProcessLookupError, OSError, AttributeError):
+            pgid = None
+        if pgid is not None and int(pgid) == pid:
+            # We own this group (worker is its own session/group leader):
+            # signal the whole tree.
+            try:
+                killpg(int(pgid), sig)
+                return
+            except (OSError, AttributeError) as exc:
+                if isinstance(exc, ProcessLookupError):
+                    raise
+                # killpg unsupported/failed -> fall through to pid signal.
+
+    kill(pid, sig)
+
+
 def _terminate_reclaimed_worker(
     pid: Optional[int],
     claim_lock: Optional[str],
@@ -8283,12 +8342,16 @@ def _terminate_reclaimed_worker(
     kill = signal_fn if signal_fn is not None else (
         os.kill if hasattr(os, "kill") else None
     )
+    # When a test injects ``signal_fn`` it must intercept BOTH the single-pid
+    # and the process-group signal, otherwise a real ``os.killpg`` would fire
+    # at the test runner's own group.
+    killpg = signal_fn if signal_fn is not None else None
     if kill is None:
         return info
 
     info["termination_attempted"] = True
     try:
-        kill(int(pid), signal.SIGTERM)
+        _signal_worker_tree(int(pid), signal.SIGTERM, kill=kill, killpg=killpg)
     except ProcessLookupError:
         # Process is already gone — that's a successful termination, not a
         # survival. Leaving terminated=False here would make the reclaim guard
@@ -8309,7 +8372,7 @@ def _terminate_reclaimed_worker(
             # signal.SIGKILL doesn't exist on Windows; fall back to SIGTERM
             # (which maps to TerminateProcess via the stdlib shim).
             _sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
-            kill(int(pid), _sigkill)
+            _signal_worker_tree(int(pid), _sigkill, kill=kill, killpg=killpg)
             info["sigkill"] = True
         except (ProcessLookupError, OSError):
             return info
@@ -8478,9 +8541,12 @@ def enforce_max_runtime(
         kill = signal_fn if signal_fn is not None else (
             os.kill if hasattr(os, "kill") else None
         )
+        # See _terminate_reclaimed_worker: an injected hook intercepts the
+        # group signal too.
+        killpg = signal_fn if signal_fn is not None else None
         if kill is not None:
             try:
-                kill(pid, signal.SIGTERM)
+                _signal_worker_tree(pid, signal.SIGTERM, kill=kill, killpg=killpg)
             except (ProcessLookupError, OSError):
                 pass
             # Short polling wait — no time.sleep on the write txn.
@@ -8492,7 +8558,7 @@ def enforce_max_runtime(
                 try:
                     # signal.SIGKILL doesn't exist on Windows.
                     _sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
-                    kill(pid, _sigkill)
+                    _signal_worker_tree(pid, _sigkill, kill=kill, killpg=killpg)
                     killed = True
                 except (ProcessLookupError, OSError):
                     pass
@@ -9463,6 +9529,13 @@ def check_respawn_guard(
         A GitHub PR URL appears in a recent task comment (within
         ``_RESPAWN_GUARD_PR_WINDOW`` seconds).  A prior worker already
         opened a PR; re-spawning risks a duplicate PR on the same task.
+        Exception: when the task's LATEST run ended with the
+        ``changes_requested`` outcome, this rule is bypassed entirely.
+        That outcome is the reviewer explicitly routing the task back to
+        the same implementer to push more commits to the SAME open PR —
+        the open-PR comment is the *precondition* of that rework, not a
+        duplicate-work signal. Without the bypass the guard fires on
+        every dispatch tick forever and the rework never spawns.
 
     Stale / dead claim locks are NOT a guard reason — they are handled
     by ``release_stale_claims`` and ``detect_crashed_workers`` which
@@ -9492,7 +9565,11 @@ def check_respawn_guard(
     latest_run = conn.execute(
         "SELECT outcome, ended_at FROM task_runs "
         "WHERE task_id = ? AND ended_at IS NOT NULL "
-        "ORDER BY ended_at DESC LIMIT 1",
+        # ``id DESC`` tiebreak: the review-handoff run and the reviewer's
+        # verdict run routinely end in the SAME unix second, and without a
+        # deterministic tiebreak the older row non-deterministically shadows
+        # the newer outcome.
+        "ORDER BY ended_at DESC, id DESC LIMIT 1",
         (task_id,),
     ).fetchone()
     if (
@@ -9557,6 +9634,16 @@ def check_respawn_guard(
     # the task forever (the comment never expires within the window), which
     # deadlocks the board — `ready` grows while nothing spawns. Only an open
     # PR is evidence of in-flight work.
+    #
+    # Bypass, mirroring rule 3's explicit-re-queue bypass: a latest run that
+    # ended ``changes_requested`` IS the deliberate "run it again" request —
+    # the reviewer handed the task back to the same implementer to push more
+    # commits to the same PR. That card always carries an open-PR comment, so
+    # without this the guard would fire every tick forever and the rework
+    # would never spawn.
+    if latest_run is not None and latest_run["outcome"] == "changes_requested":
+        return None
+
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
     for c in conn.execute(
         "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
