@@ -758,6 +758,35 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Emit machine-readable JSON result",
     )
 
+    p_reopen_done = sub.add_parser(
+        "reopen-done",
+        help=(
+            "Operator recovery: retract a verified-bad done/archived task back "
+            "to ready/todo for rework. Deliberately CLI-only (no kanban_* model "
+            "tool): per the Footprint Ladder this is an operator action, and a "
+            "delegated worker retracting its own completion is exactly the abuse "
+            "the denied-actions set exists to prevent."
+        ),
+    )
+    p_reopen_done.add_argument("task_id")
+    p_reopen_done.add_argument(
+        "reason",
+        nargs="*",
+        help="Audit-trail reason (recorded on the event + a durable comment)",
+    )
+    p_reopen_done.add_argument(
+        "--ids",
+        nargs="+",
+        default=None,
+        help="Additional task ids to reopen with the same reason (bulk mode)",
+    )
+    p_reopen_done.add_argument(
+        "--json",
+        dest="json",
+        action="store_true",
+        help="Emit machine-readable JSON result",
+    )
+
     p_archive = sub.add_parser("archive", help="Archive one or more tasks")
     p_archive.add_argument("task_ids", nargs="*",
                            help="Task ids to archive (default mode)")
@@ -1160,6 +1189,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "request-review": _cmd_request_review,
             "request-changes": _cmd_request_changes,
             "reopen-review":  _cmd_reopen_review,
+            "reopen-done":  _cmd_reopen_done,
             "promote":  _cmd_promote,
             "archive":  _cmd_archive,
             "tail":     _cmd_tail,
@@ -1227,6 +1257,10 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "schedule",
     "unblock",
     "promote",
+    # Operator recovery action: it retracts a completed card and can
+    # terminate a live worker. A delegated child must never be able to
+    # retract its own completion.
+    "reopen-done",
     "archive",
     "dispatch",
     "daemon",
@@ -2573,6 +2607,69 @@ def _cmd_reopen_review(args: argparse.Namespace) -> int:
     return 0 if not failed else 1
 
 
+def _cmd_reopen_done(args: argparse.Namespace) -> int:
+    """``hermes kanban reopen-done`` — retract a verified-bad completion.
+
+    Surface wiring only: all semantics (terminate-before-release, the
+    self-healing hold, descendant retraction, the ``consecutive_failures``
+    reset, and the ready/todo landing re-gate) live in
+    :func:`kanban_db.reopen_done_task`.
+
+    Deliberately NOT exposed as a ``kanban_*`` model tool: per AGENTS.md's
+    Footprint Ladder a CLI command (rung 2) beats a new core tool (rung 3+),
+    and this is an operator recovery action, not a worker action — see
+    ``_DELEGATED_CHILD_DENIED_ACTIONS``.
+    """
+    reason = " ".join(args.reason).strip() if args.reason else None
+    if reason:
+        # Redact at the surface: the reason lands in a durable comment.
+        reason = str(kb.redact_review_value(reason)).strip() or None
+    author = _profile_author()
+    as_json = getattr(args, "json", False)
+    extra_ids = list(getattr(args, "ids", None) or [])
+    # Dedupe while preserving order; positional task_id always first.
+    ids: list[str] = []
+    seen: set[str] = set()
+    for tid in [args.task_id, *extra_ids]:
+        if tid not in seen:
+            ids.append(tid)
+            seen.add(tid)
+
+    results: list[dict[str, object]] = []
+    with kb.connect_closing() as conn:
+        for tid in ids:
+            ok, detail = kb.reopen_done_task(
+                conn,
+                tid,
+                actor=author,
+                reason=reason,
+            )
+            results.append({
+                "task_id": tid,
+                "reopened": bool(ok),
+                "status": detail if ok else None,
+                "reason": reason,
+                "error": None if ok else detail,
+            })
+
+    failed = [r for r in results if not r["reopened"]]
+    if as_json:
+        # Single-id stays a flat object for back-compat; bulk emits a list.
+        payload: object = results[0] if len(results) == 1 else results
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+        return 0 if not failed else 1
+
+    for r in results:
+        if r["reopened"]:
+            suffix = f": {reason}" if reason else ""
+            print(f"Reopened {r['task_id']} -> {r['status']}{suffix}")
+        else:
+            print(
+                f"cannot reopen {r['task_id']}: {r['error']}", file=sys.stderr,
+            )
+    return 0 if not failed else 1
+
+
 def _cmd_promote(args: argparse.Namespace) -> int:
     reason = " ".join(args.reason).strip() if args.reason else None
     author = _profile_author()
@@ -3405,6 +3502,7 @@ Common subcommands:
   `attach <id> <path>`  Attach a local file; `attachments <id>` to list
   `complete <id>…`      Mark task(s) done
   `request-review <id>` Enter first-class review; `request-changes <id> <reason>` returns an active review to its implementer
+  `reopen-done <id> [reason]` Operator recovery: retract a verified-bad done/archived card back to ready/todo
   `block <id> [reason]` Mark blocked; `schedule <id> [reason]` parks time-delay work; `unblock <id>` to revive
   `assign <id> <profile>`  Reassign
   `boards list`         Show all boards
