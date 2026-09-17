@@ -1141,6 +1141,10 @@ class Task:
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
+    # Unix timestamp this ``scheduled`` task is due to wake. NULL = the card
+    # waits for an explicit ``unblock_task`` (the historical contract).
+    # Cleared whenever the task leaves ``scheduled``.
+    scheduled_wake_at: Optional[int] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1234,6 +1238,11 @@ class Task:
                 int(row["block_recurrences"])
                 if "block_recurrences" in keys and row["block_recurrences"] is not None
                 else 0
+            ),
+            scheduled_wake_at=(
+                int(row["scheduled_wake_at"])
+                if "scheduled_wake_at" in keys and row["scheduled_wake_at"] is not None
+                else None
             ),
         )
 
@@ -1422,7 +1431,15 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- Unix timestamp a ``scheduled`` task is due to wake up, set by
+    -- ``schedule_task(wake_at=...)`` and cleared whenever the task leaves
+    -- ``scheduled``. ``promote_due_scheduled`` (run by the dispatcher each
+    -- tick) resumes every due task into the phase it was parked from. NULL
+    -- means "waiting for a manual ``unblock``" — the historical contract for
+    -- a parked card, which is preserved: a card with no wake time is never
+    -- auto-promoted.
+    scheduled_wake_at    INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -2677,6 +2694,14 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "tasks",
             "block_recurrences",
             "block_recurrences INTEGER NOT NULL DEFAULT 0",
+        )
+
+    if "scheduled_wake_at" not in cols:
+        # Wake time for ``scheduled`` tasks. Existing rows get NULL, which
+        # keeps their historical behaviour exactly: they wait for a manual
+        # ``unblock`` and are never auto-promoted.
+        _add_column_if_missing(
+            conn, "tasks", "scheduled_wake_at", "scheduled_wake_at INTEGER"
         )
 
     # Indexes over additive ``tasks`` columns must be created after the
@@ -4483,6 +4508,8 @@ def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
 
     Events written by review workers carry ``source_status``/``retry_status``;
     an explicit unblock that must wait for parents carries ``resume_status``.
+    A ``scheduled`` park records the phase it parked FROM as ``source_status``
+    so a timed wait resumes into ``review`` instead of being re-implemented.
     Legacy events omit these fields and therefore retain the historical
     ``ready`` behavior.
     """
@@ -4491,7 +4518,8 @@ def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
         "WHERE task_id = ? AND kind IN ("
         "'blocked', 'block_loop_detected', 'dependency_wait', 'gave_up', "
         "'unblocked', 'changes_requested', 'review_reopened', 'status', 'reclaimed', "
-        "'stale', 'timed_out', 'crashed', 'spawn_failed', 'rate_limited'"
+        "'stale', 'timed_out', 'crashed', 'spawn_failed', 'rate_limited', "
+        "'scheduled'"
         ") ORDER BY id DESC LIMIT 1",
         (task_id,),
     ).fetchone()
@@ -6887,6 +6915,73 @@ def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str
     return "todo" if undone_parents else "ready"
 
 
+def _resume_parked_task_locked(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    statuses: tuple[str, ...],
+    event_kind: str,
+    now: int,
+    note: str,
+    extra_payload: Optional[dict] = None,
+    legacy_empty_payload: bool = False,
+) -> Optional[str]:
+    """Flip a parked (``blocked``/``scheduled``) task back to its live phase.
+
+    Shared body of :func:`unblock_task` and :func:`promote_due_scheduled` so a
+    timed wake and a manual unblock can't drift: both recover the phase the
+    task was parked from, re-gate on parent completion, clear the wake time,
+    and close any dangling run. MUST be called inside an open ``write_txn``.
+    Returns the landed status, or ``None`` when the task was not parked.
+    """
+    current = conn.execute(
+        "SELECT status FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    resume_status = (
+        _resume_status_from_events(conn, task_id)
+        if current and current["status"] in ("blocked", "scheduled")
+        else "ready"
+    )
+    _reclaim_dangling_run(conn, task_id, statuses=statuses, now=now, note=note)
+    # Re-gate on parent completion before restoring the source phase.
+    landing_status = _landing_status_after_parents(conn, task_id)
+    new_status = (
+        "review"
+        if landing_status == "ready" and resume_status == "review"
+        else landing_status
+    )
+    # NOTE: deliberately does NOT touch ``block_recurrences`` or
+    # ``block_kind``. Resetting the recurrence counter on unblock is exactly
+    # the amnesia that let a cron unblock → worker re-block loop run
+    # unbounded (Dale's report). The counter survives the unblock so that a
+    # subsequent same-cause ``block_task`` can detect the loop and route to
+    # triage at ``BLOCK_RECURRENCE_LIMIT``. It is reset to 0 only on a
+    # successful completion (see ``complete_task``). ``consecutive_failures``
+    # (the *dispatcher* spawn/crash/timeout counter — a different signal) is
+    # still reset here, which is correct: a deliberate unblock is a fresh
+    # start for the dispatcher's retry budget.
+    placeholders = ", ".join("?" for _ in statuses)
+    cur = conn.execute(
+        "UPDATE tasks SET status = ?, current_run_id = NULL, "
+        "consecutive_failures = 0, last_failure_error = NULL, "
+        "scheduled_wake_at = NULL "
+        f"WHERE id = ? AND status IN ({placeholders})",
+        (new_status, task_id, *statuses),
+    )
+    if cur.rowcount != 1:
+        return None
+    payload: Optional[dict] = {
+        "status": new_status, "resume_status": resume_status,
+    }
+    if extra_payload:
+        payload.update(extra_payload)
+    elif legacy_empty_payload and new_status == "ready" and resume_status == "ready":
+        payload = None
+    _append_event(conn, task_id, event_kind, payload)
+    return new_status
+
+
 def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """Transition ``blocked``/``scheduled`` to its safe resumable phase.
 
@@ -6896,56 +6991,64 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     the leaked run is closed as ``reclaimed`` inside the same txn so the
     runs invariant (``current_run_id IS NULL`` ⇔ run row in terminal
     state) holds for the rest of this function's lifetime.
+
+    The parked phase is recovered for ``scheduled`` as well as ``blocked``:
+    a card parked out of ``review`` resumes INTO ``review``, not ``ready``
+    (resuming to ``ready`` re-implements work that was already awaiting
+    review). Any pending ``scheduled_wake_at`` is cleared — the card is no
+    longer waiting on time.
     """
     now = int(time.time())
     with write_txn(conn):
-        current = conn.execute(
-            "SELECT status FROM tasks WHERE id = ?",
-            (task_id,),
-        ).fetchone()
-        resume_status = (
-            _resume_status_from_events(conn, task_id)
-            if current and current["status"] == "blocked"
-            else "ready"
-        )
-        _reclaim_dangling_run(
-            conn, task_id, statuses=("blocked", "scheduled"), now=now,
+        return _resume_parked_task_locked(
+            conn, task_id,
+            statuses=("blocked", "scheduled"),
+            event_kind="unblocked",
+            now=now,
             note="invariant recovery on unblock",
-        )
-        # Re-gate on parent completion before restoring the source phase.
-        landing_status = _landing_status_after_parents(conn, task_id)
-        new_status = (
-            "review"
-            if landing_status == "ready" and resume_status == "review"
-            else landing_status
-        )
-        # NOTE: deliberately does NOT touch ``block_recurrences`` or
-        # ``block_kind``. Resetting the recurrence counter on unblock is exactly
-        # the amnesia that let a cron unblock → worker re-block loop run
-        # unbounded (Dale's report). The counter survives the unblock so that a
-        # subsequent same-cause ``block_task`` can detect the loop and route to
-        # triage at ``BLOCK_RECURRENCE_LIMIT``. It is reset to 0 only on a
-        # successful completion (see ``complete_task``). ``consecutive_failures``
-        # (the *dispatcher* spawn/crash/timeout counter — a different signal) is
-        # still reset here, which is correct: a deliberate unblock is a fresh
-        # start for the dispatcher's retry budget.
-        cur = conn.execute(
-            "UPDATE tasks SET status = ?, current_run_id = NULL, "
-            "consecutive_failures = 0, last_failure_error = NULL "
-            "WHERE id = ? AND status IN ('blocked', 'scheduled')",
-            (new_status, task_id),
-        )
-        if cur.rowcount != 1:
-            return False
-        _append_event(
-            conn, task_id, "unblocked",
-            (
-                {"status": new_status, "resume_status": resume_status}
-                if new_status != "ready" or resume_status != "ready"
-                else None
-            ),
-        )
-        return True
+            legacy_empty_payload=True,
+        ) is not None
+
+
+def promote_due_scheduled(conn: sqlite3.Connection) -> list[str]:
+    """Resume every ``scheduled`` task whose ``scheduled_wake_at`` has passed.
+
+    The other half of :func:`schedule_task`'s timed wait: without it a
+    ``wake_at`` would be a note rather than a wake. Each due task takes the
+    exact transition :func:`unblock_task` performs (source-phase recovery,
+    parent re-gating, dangling-run close, wake time cleared) and records a
+    ``scheduled_wake`` event so the automatic resume is distinguishable from a
+    human unblock in ``hermes kanban tail``.
+
+    A ``scheduled`` task with no ``scheduled_wake_at`` is never promoted: that
+    is the pre-existing manual-unblock contract. Returns the ids resumed.
+    """
+    now = int(time.time())
+    rows = conn.execute(
+        "SELECT id, scheduled_wake_at FROM tasks "
+        "WHERE status = 'scheduled' "
+        "  AND scheduled_wake_at IS NOT NULL "
+        "  AND scheduled_wake_at <= ? "
+        "ORDER BY scheduled_wake_at",
+        (now,),
+    ).fetchall()
+    woken: list[str] = []
+    for row in rows:
+        with write_txn(conn):
+            landed = _resume_parked_task_locked(
+                conn, row["id"],
+                statuses=("scheduled",),
+                event_kind="scheduled_wake",
+                now=now,
+                note="invariant recovery on scheduled wake",
+                extra_payload={
+                    "wake_at": int(row["scheduled_wake_at"]),
+                    "now": now,
+                },
+            )
+        if landed is not None:
+            woken.append(row["id"])
+    return woken
 
 
 def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
@@ -8041,23 +8144,52 @@ def schedule_task(
     *,
     reason: Optional[str] = None,
     expected_run_id: Optional[int] = None,
+    wake_at: Optional[int] = None,
+    signal_fn=None,
 ) -> bool:
     """Park a task in ``scheduled`` so it is waiting on time, not human input.
 
     ``scheduled`` tasks are intentionally not dispatchable; an external cron,
     human action, or automation can later call ``unblock_task`` to re-gate them
-    to ``ready`` (or ``todo`` if parents are still incomplete).
+    to ``ready`` (or ``todo`` if parents are still incomplete). With ``wake_at``
+    (unix seconds) the wait is self-clearing: the dispatcher's
+    :func:`promote_due_scheduled` pass resumes the card once the time passes.
+    Without one the historical manual-unblock contract is preserved.
+
+    ``review`` is an accepted source phase: a reviewer waiting on CI, a
+    scheduled re-check, or any timed wait mid-review must be able to park.
+    Leaving the card in ``review`` instead means the next dispatcher tick
+    re-claims it (``claim_review_task``) and a second reviewer runs over
+    unchanged work. The source phase is recorded on the ``scheduled`` event as
+    ``source_status`` so :func:`_resume_status_from_events` restores it on
+    wake/unblock. ``triage`` is deliberately NOT accepted — it is a human lane.
+
+    This path is a release: it NULLs the claim columns. When the caller is not
+    the current worker (it did not prove ownership via ``expected_run_id``),
+    that worker is still running in the card's workspace, so it is terminated
+    strictly AFTER the transaction commits (audit trail first), and if it
+    survives the release is held rather than left claimable beside a live
+    writer. A worker parking its OWN run is never signalled.
     """
+    terminate_pid: Optional[int] = None
+    terminate_lock: Optional[str] = None
     with write_txn(conn):
-        params: list[Any] = [task_id]
+        trow = conn.execute(
+            "SELECT status, claim_lock, worker_pid, current_run_id "
+            "FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        wake = int(wake_at) if wake_at is not None else None
+        params: list[Any] = [wake, task_id]
         sql = """
             UPDATE tasks
                SET status       = 'scheduled',
                    claim_lock   = NULL,
                    claim_expires= NULL,
-                   worker_pid   = NULL
+                   worker_pid   = NULL,
+                   scheduled_wake_at = ?
              WHERE id = ?
-               AND status IN ('todo', 'ready', 'running', 'blocked')
+               AND status IN ('todo', 'ready', 'running', 'blocked', 'review')
         """
         if expected_run_id is not None:
             sql += " AND current_run_id = ?"
@@ -8065,6 +8197,13 @@ def schedule_task(
         cur = conn.execute(sql, params)
         if cur.rowcount != 1:
             return False
+        # Ownership guard: a worker parking its own run must never be
+        # signalled. Any other caller just orphaned a live writer.
+        if trow is not None and not _caller_is_current_worker(
+            expected_run_id, trow["current_run_id"],
+        ):
+            terminate_pid = trow["worker_pid"]
+            terminate_lock = trow["claim_lock"]
         run_id = _end_run(
             conn, task_id,
             outcome="scheduled", status="scheduled",
@@ -8076,8 +8215,26 @@ def schedule_task(
                 outcome="scheduled",
                 summary=reason,
             )
-        _append_event(conn, task_id, "scheduled", {"reason": reason}, run_id=run_id)
-        return True
+        _append_event(
+            conn, task_id, "scheduled",
+            {
+                "reason": reason,
+                "source_status": trow["status"] if trow else None,
+                "wake_at": wake,
+            },
+            run_id=run_id,
+        )
+    # Post-commit (events precede the kill, mirroring the review-handoff path).
+    _terminate_released_worker(
+        conn,
+        task_id,
+        terminate_pid,
+        terminate_lock,
+        "scheduled",
+        reason="scheduled_park_worker_alive",
+        signal_fn=signal_fn,
+    )
+    return True
 
 
 # Dispatcher (one-shot pass)
@@ -8324,6 +8481,11 @@ class DispatchResult:
 
     reclaimed: int = 0
     promoted: int = 0
+    woken_scheduled: int = 0
+    """Count of ``scheduled`` tasks whose ``scheduled_wake_at`` came due this
+    tick and were resumed into their parked phase by
+    :func:`promote_due_scheduled`. Parked cards with no wake time are never
+    auto-promoted and never appear here."""
     reconciled_orphans: list[str] = field(default_factory=list)
     """Task ids requeued by :func:`reconcile_orphaned_running` this tick —
     ``running`` cards whose claim bookkeeping was broken (no valid claim,
@@ -9070,6 +9232,93 @@ def _defer_reclaim_for_live_worker(
         }
         payload.update(termination)
         _append_event(conn, task_id, "reclaim_deferred", payload, run_id=run_id)
+
+
+def _caller_is_current_worker(
+    expected_run_id: Optional[int],
+    current_run_id: Optional[int],
+) -> bool:
+    """True when the caller proved it owns the task's current run.
+
+    Workers prove ownership by passing their own run id; anything else
+    (an operator parking a card, a cron, the dashboard) is a third party
+    releasing somebody else's live claim.
+    """
+    if expected_run_id is None or current_run_id is None:
+        return False
+    return int(expected_run_id) == int(current_run_id)
+
+
+def _hold_released_task_for_live_worker(
+    conn: sqlite3.Connection,
+    task_id: str,
+    claim_lock: Optional[str],
+    worker_pid: Optional[int],
+    status: Optional[str],
+    now: int,
+    termination: dict,
+    *,
+    reason: str,
+) -> None:
+    """Re-assert a claim hold on a task released beside a surviving worker.
+
+    Sibling of :func:`_defer_reclaim_for_live_worker` for release paths whose
+    transaction has already committed (the audit trail must precede the kill),
+    so the task is no longer ``running`` and its claim columns are NULL.
+    Restoring ``claim_lock``/``claim_expires``/``worker_pid`` keeps both
+    :func:`claim_task` and :func:`claim_review_task` (each requires
+    ``claim_lock IS NULL``) from spawning a second writer into the card's
+    workspace while the previous one lives, and records a ``reclaim_deferred``
+    event so the hold is visible in ``hermes kanban tail``.
+    """
+    if not status:
+        return
+    grace = now + RECLAIM_DEFER_GRACE_SECONDS
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE tasks SET claim_lock = ?, claim_expires = ?, worker_pid = ? "
+            "WHERE id = ? AND status = ? AND claim_lock IS NULL",
+            (claim_lock, grace, worker_pid, task_id, status),
+        )
+        if cur.rowcount != 1:
+            return
+        run_id = _current_run_id(conn, task_id)
+        payload = {
+            "reason": reason,
+            "claim_lock": claim_lock,
+            "held_status": status,
+            "claim_expires_now": grace,
+        }
+        payload.update(termination)
+        _append_event(conn, task_id, "reclaim_deferred", payload, run_id=run_id)
+
+
+def _terminate_released_worker(
+    conn: sqlite3.Connection,
+    task_id: str,
+    worker_pid: Optional[int],
+    claim_lock: Optional[str],
+    status: Optional[str],
+    *,
+    reason: str,
+    signal_fn=None,
+) -> None:
+    """Post-commit worker termination for claim-releasing transitions.
+
+    Called AFTER the releasing transaction committed, so the events are
+    durable before anything is signalled. When the worker survives, the
+    release is held rather than left claimable beside a live writer.
+    """
+    if not worker_pid or not claim_lock:
+        return
+    termination = _terminate_reclaimed_worker(
+        worker_pid, claim_lock, signal_fn=signal_fn,
+    )
+    if _worker_survived_termination(termination):
+        _hold_released_task_for_live_worker(
+            conn, task_id, claim_lock, worker_pid, status,
+            int(time.time()), termination, reason=reason,
+        )
 
 
 def heartbeat_worker(
@@ -10785,6 +11034,10 @@ def _dispatch_once_locked(
     if _crash_rate_limited:
         result.rate_limited.extend(_crash_rate_limited)
     result.timed_out = enforce_max_runtime(conn)
+    # Timed waits come due before the ready-promotion pass so a woken card is
+    # dispatchable on the SAME tick it wakes (a card resumed into ``todo`` by
+    # parent gating is picked up by recompute_ready immediately below).
+    result.woken_scheduled = len(promote_due_scheduled(conn))
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
 
     # Count tasks already running so max_spawn enforces concurrency rather

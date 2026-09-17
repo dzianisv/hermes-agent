@@ -197,7 +197,13 @@ def test_schedule_task_parks_time_delay_without_dispatching(kanban_home):
         assert kb.claim_task(conn, t) is None
 
         events = kb.list_events(conn, t)
-        assert any(e.kind == "scheduled" and e.payload == {"reason": "run next week"} for e in events)
+        scheduled = [e for e in events if e.kind == "scheduled"]
+        assert scheduled, "no scheduled event recorded"
+        assert scheduled[-1].payload["reason"] == "run next week"
+        # The park records where it came from (so the phase can be restored)
+        # and has no wake time, i.e. it waits for a manual unblock.
+        assert scheduled[-1].payload["source_status"] == "ready"
+        assert scheduled[-1].payload["wake_at"] is None
 
 
 
@@ -1614,3 +1620,199 @@ def test_bare_connect_does_not_close_on_context_exit(tmp_path):
     # Still usable after with-block exit (the leak).
     conn.execute("SELECT 1").fetchone()
     conn.close()  # explicit close to avoid leaking THIS test
+
+
+# ---------------------------------------------------------------------------
+# Scheduled parks out of review + timed wake (promote_due_scheduled)
+#
+# A review card had no supported park: schedule_task refused `review`, so a
+# reviewer waiting on something external left the card in `review` and the
+# next dispatcher tick re-claimed it (claim_review_task) — a second reviewer
+# over unchanged work. Parking through `block_task` instead hit the
+# unblock-loop breaker on the second identical wait and dumped the card in
+# `triage`. And even a park that landed resumed into `ready`, losing the
+# review phase.
+# ---------------------------------------------------------------------------
+
+
+def _park_review_card(conn, *, wake_at=None, title="review park"):
+    """Create a card, take it through to ``review``, park it, return its id."""
+    tid = kb.create_task(conn, title=title, assignee="impl")
+    kb.claim_task(conn, tid)
+    run_id = kb.get_task(conn, tid).current_run_id
+    assert kb.request_review(conn, tid, summary="please review",
+                             expected_run_id=run_id) is True
+    assert kb.get_task(conn, tid).status == "review"
+    assert kb.schedule_task(
+        conn, tid, reason="waiting on CI", wake_at=wake_at,
+    ) is True
+    return tid
+
+
+def test_schedule_task_parks_a_review_card_and_blocks_respawn(kanban_home):
+    """(a) review parks cleanly and the review lane can no longer re-claim it."""
+    with kb.connect() as conn:
+        wake = int(time.time()) + 3600
+        tid = _park_review_card(conn, wake_at=wake)
+
+        task = kb.get_task(conn, tid)
+        assert task.status == "scheduled"
+        assert task.scheduled_wake_at == wake
+        # No respawn: the review lane must not pick a parked card back up.
+        assert kb.claim_review_task(conn, tid) is None
+        assert kb.claim_task(conn, tid) is None
+        assert kb.get_task(conn, tid).status == "scheduled"
+
+        scheduled = [e for e in kb.list_events(conn, tid) if e.kind == "scheduled"]
+        assert scheduled[-1].payload["source_status"] == "review"
+        assert scheduled[-1].payload["wake_at"] == wake
+
+
+def test_unblock_restores_the_review_phase_for_a_scheduled_card(kanban_home):
+    """(b) a parked review card resumes into review, not ready."""
+    with kb.connect() as conn:
+        tid = _park_review_card(conn, wake_at=int(time.time()) + 3600)
+
+        assert kb.unblock_task(conn, tid) is True
+        task = kb.get_task(conn, tid)
+        assert task.status == "review"
+        assert task.scheduled_wake_at is None
+
+
+def test_promote_due_scheduled_only_wakes_past_due_cards(kanban_home):
+    """(c) past wake promotes (into review) and clears; future/None do not."""
+    with kb.connect() as conn:
+        due = _park_review_card(
+            conn, wake_at=int(time.time()) - 5, title="due",
+        )
+        later = _park_review_card(
+            conn, wake_at=int(time.time()) + 3600, title="later",
+        )
+        manual = _park_review_card(conn, wake_at=None, title="manual")
+
+        woken = kb.promote_due_scheduled(conn)
+        assert woken == [due]
+
+        promoted = kb.get_task(conn, due)
+        assert promoted.status == "review"
+        assert promoted.scheduled_wake_at is None
+        assert kb.get_task(conn, later).status == "scheduled"
+        assert kb.get_task(conn, manual).status == "scheduled"
+        assert kb.get_task(conn, manual).scheduled_wake_at is None
+
+        wake_events = [
+            e for e in kb.list_events(conn, due) if e.kind == "scheduled_wake"
+        ]
+        assert wake_events, "no scheduled_wake event recorded"
+        assert wake_events[-1].payload["status"] == "review"
+
+
+def test_repeated_scheduled_waits_never_reach_triage_but_blocks_still_do(
+    kanban_home,
+):
+    """(d) the schedule lane is loop-breaker-free; block_task's breaker is intact."""
+    with kb.connect() as conn:
+        tid = _park_review_card(conn, wake_at=int(time.time()) - 5, title="waits")
+        assert kb.promote_due_scheduled(conn) == [tid]
+        # Second identical wait — this is exactly what degraded to triage.
+        assert kb.schedule_task(
+            conn, tid, reason="waiting on CI",
+            wake_at=int(time.time()) - 5,
+        ) is True
+        assert kb.promote_due_scheduled(conn) == [tid]
+        task = kb.get_task(conn, tid)
+        assert task.status == "review"
+        assert task.block_recurrences == 0
+
+        # The unblock-loop breaker still trips on two same-kind blocks.
+        other = kb.create_task(conn, title="flaky", assignee="impl")
+        kb.claim_task(conn, other)
+        assert kb.block_task(conn, other, reason="need input", kind="needs_input")
+        assert kb.get_task(conn, other).status == "blocked"
+        assert kb.unblock_task(conn, other) is True
+        kb.claim_task(conn, other)
+        assert kb.block_task(conn, other, reason="need input", kind="needs_input")
+        assert kb.get_task(conn, other).status == "triage"
+
+
+def test_schedule_task_terminates_a_foreign_live_worker_before_releasing(
+    kanban_home,
+):
+    """(e) parking somebody else's live claim never leaves a claimable card
+    beside a live writer: either the worker is dead after the call, or the
+    release is held and the card is not claimable."""
+    with kb.connect() as conn:
+        host = kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="live worker", assignee="impl")
+        kb.claim_task(conn, tid, claimer=f"{host}:A")
+        sleeper = subprocess.Popen(["sleep", "30"])
+        try:
+            kb._set_worker_pid(conn, tid, sleeper.pid)
+            # No expected_run_id: a third party is parking the card.
+            assert kb.schedule_task(conn, tid, reason="park it") is True
+
+            deadline = time.time() + 15
+            while time.time() < deadline and sleeper.poll() is None:
+                time.sleep(0.1)
+            if sleeper.poll() is None:
+                # Survived: the release must have been held, not left open.
+                held = conn.execute(
+                    "SELECT claim_lock FROM tasks WHERE id = ?", (tid,),
+                ).fetchone()
+                assert held["claim_lock"] is not None
+                assert kb.claim_task(conn, tid) is None
+                assert kb.claim_review_task(conn, tid) is None
+        finally:
+            sleeper.terminate()
+            sleeper.wait()
+
+
+def test_worker_parking_its_own_card_is_not_terminated(kanban_home):
+    """(f) self-park: proving ownership must never signal the caller."""
+    with kb.connect() as conn:
+        host = kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="self park", assignee="impl")
+        kb.claim_task(conn, tid, claimer=f"{host}:A")
+        sleeper = subprocess.Popen(["sleep", "30"])
+        try:
+            kb._set_worker_pid(conn, tid, sleeper.pid)
+            run_id = kb.get_task(conn, tid).current_run_id
+            signalled: list[tuple] = []
+            assert kb.schedule_task(
+                conn, tid, reason="I'll be back",
+                expected_run_id=run_id,
+                signal_fn=lambda *a: signalled.append(a),
+            ) is True
+            assert signalled == [], "a worker parking its own card was signalled"
+            assert sleeper.poll() is None, "self-parking worker was killed"
+            assert kb.get_task(conn, tid).status == "scheduled"
+        finally:
+            sleeper.terminate()
+            sleeper.wait()
+
+
+def test_legacy_db_without_scheduled_wake_at_migrates(tmp_path, monkeypatch):
+    """(g) an old board file opens and gains the column cleanly."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    kb.init_db()
+    db_path = kb.kanban_db_path()
+
+    # Simulate a pre-column board: drop it back out of the tasks table.
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="legacy", assignee="impl")
+        conn.execute("ALTER TABLE tasks DROP COLUMN scheduled_wake_at")
+        conn.commit()
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(tasks)")}
+        assert "scheduled_wake_at" not in cols
+
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+    kb.init_db()
+    with kb.connect() as conn:
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(tasks)")}
+        assert "scheduled_wake_at" in cols
+        assert kb.get_task(conn, tid).scheduled_wake_at is None
+        assert kb.schedule_task(conn, tid, wake_at=int(time.time()) - 1) is True
+        assert kb.promote_due_scheduled(conn) == [tid]
