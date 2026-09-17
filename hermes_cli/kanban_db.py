@@ -5145,6 +5145,7 @@ def reclaim_task(
     *,
     reason: Optional[str] = None,
     signal_fn=None,
+    expected_run_id: Optional[int] = None,
 ) -> bool:
     """Operator-driven reclaim: release the claim and restore its source phase.
 
@@ -5155,10 +5156,15 @@ def reclaim_task(
     for the TTL to expire (e.g. after seeing a hallucination warning).
 
     Returns True if a reclaim happened, False if the task isn't in a
-    reclaimable state (not running, or doesn't exist).
+    reclaimable state (not running, or doesn't exist) OR if containment
+    failed — i.e. the previous worker survived termination and the claim was
+    re-asserted as a hold. Returning False in that last case is what stops
+    :func:`reassign_task` from handing a card to a new profile while the old
+    worker is still writing into its workspace.
     """
     row = conn.execute(
-        "SELECT status, claim_lock, worker_pid FROM tasks WHERE id = ?",
+        "SELECT status, claim_lock, worker_pid, current_run_id "
+        "FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
     if not row:
@@ -5167,9 +5173,12 @@ def reclaim_task(
         # Nothing to reclaim — already ready / blocked / done.
         return False
     prev_lock = row["claim_lock"]
-    termination = _terminate_reclaimed_worker(
-        row["worker_pid"], prev_lock, signal_fn=signal_fn,
-    )
+    prev_pid = row["worker_pid"]
+    prev_run_id = row["current_run_id"]
+    # Termination is deliberately NOT done here: it happens post-commit via
+    # the shared primitive so the audit trail is durable before any signal.
+    termination: dict[str, Any] = {}
+    reclaimed_event_id: Optional[int] = None
     with write_txn(conn):
         retry_status = _retry_status_for_run(conn, task_id)
         cur = conn.execute(
@@ -5202,12 +5211,85 @@ def reclaim_task(
             payload,
             run_id=run_id,
         )
+        reclaimed_event_id = int(
+            conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        )
+    # Post-commit: the ``reclaimed`` event is durable, now contain the worker.
+    outcome = _terminate_released_worker(
+        conn,
+        task_id,
+        prev_pid,
+        prev_lock,
+        retry_status,
+        reason="manual_reclaim_worker_alive",
+        signal_fn=signal_fn,
+        expected_run_id=expected_run_id,
+        current_run_id=prev_run_id,
+    )
+    # Stamp the termination receipt onto the already-durable audit rows so the
+    # ``reclaimed`` event / run metadata still carry it (ordering changed, the
+    # contents did not).
+    _stamp_release_termination(
+        conn, reclaimed_event_id, run_id, outcome["termination"],
+    )
+    if not outcome["contained"]:
+        # The previous worker survived; the claim has been re-asserted as a
+        # hold. This is NOT a completed reclaim.
+        return False
     # Operator intervention — they've looked at the task, so the
     # consecutive-failures counter is now stale. Give the next retry
     # a fresh budget. (_clear_failure_counter opens its own write_txn,
     # so it runs after the enclosing one commits.)
     _clear_failure_counter(conn, task_id)
     return True
+
+
+def _stamp_release_termination(
+    conn: sqlite3.Connection,
+    event_id: Optional[int],
+    run_id: Optional[int],
+    termination: dict,
+) -> None:
+    """Merge a post-commit termination receipt into existing audit rows.
+
+    The release event must be durable BEFORE the kill, so the termination
+    outcome cannot be known when the event is written. Rather than drop the
+    diagnostic, merge it in afterwards — same payload keys as before the
+    ordering change, just written one transaction later.
+    """
+    if not termination or (event_id is None and run_id is None):
+        return
+    with write_txn(conn):
+        if event_id is not None:
+            row = conn.execute(
+                "SELECT payload FROM task_events WHERE id = ?", (event_id,),
+            ).fetchone()
+            if row is not None:
+                try:
+                    payload = json.loads(row["payload"]) if row["payload"] else {}
+                except (TypeError, ValueError):
+                    payload = {}
+                if isinstance(payload, dict):
+                    payload.update(termination)
+                    conn.execute(
+                        "UPDATE task_events SET payload = ? WHERE id = ?",
+                        (json.dumps(payload), event_id),
+                    )
+        if run_id is not None:
+            row = conn.execute(
+                "SELECT metadata FROM task_runs WHERE id = ?", (run_id,),
+            ).fetchone()
+            if row is not None:
+                try:
+                    meta = json.loads(row["metadata"]) if row["metadata"] else {}
+                except (TypeError, ValueError):
+                    meta = {}
+                if isinstance(meta, dict):
+                    meta.update(termination)
+                    conn.execute(
+                        "UPDATE task_runs SET metadata = ? WHERE id = ?",
+                        (json.dumps(meta), run_id),
+                    )
 
 
 def reassign_task(
@@ -5217,6 +5299,8 @@ def reassign_task(
     *,
     reclaim_first: bool = False,
     reason: Optional[str] = None,
+    signal_fn=None,
+    expected_run_id: Optional[int] = None,
 ) -> bool:
     """Reassign a task, optionally reclaiming a stuck running worker first.
 
@@ -5226,12 +5310,33 @@ def reassign_task(
     otherwise the function refuses to reassign a currently-running task
     and returns False (caller can retry with ``reclaim_first=True``).
 
+    Containment is INHERITED from :func:`reclaim_task`, which routes through
+    :func:`_terminate_released_worker`. When that reclaim could not verify the
+    old worker's exit it re-asserts the claim as a hold; this function then
+    refuses the reassign rather than silently handing the card to a new
+    profile while the previous worker is still writing into its workspace.
+    The refusal is derived from the card's own state (``claim_lock`` is still
+    held) rather than from a boolean, so a hold placed by any path blocks it.
+
     Returns True if the reassign landed. ``profile`` may be ``None`` to
     unassign entirely.
     """
     if reclaim_first:
         # Safe to call even if nothing to reclaim.
-        reclaim_task(conn, task_id, reason=reason or "reassign")
+        reclaim_task(
+            conn, task_id,
+            reason=reason or "reassign",
+            signal_fn=signal_fn,
+            expected_run_id=expected_run_id,
+        )
+        held = conn.execute(
+            "SELECT claim_lock FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        if held is not None and held["claim_lock"] is not None:
+            # Containment failed (or somebody else claimed in between): a live
+            # worker still owns this card. Reassigning now would put a second
+            # writer into the same workspace.
+            return False
     # assign_task handles its own txn + the still-running guard.
     try:
         return assign_task(conn, task_id, profile)
@@ -6278,6 +6383,7 @@ def block_task(
     reason: Optional[str] = None,
     kind: Optional[str] = None,
     expected_run_id: Optional[int] = None,
+    signal_fn=None,
 ) -> bool:
     """Transition ``running``/``ready`` → ``blocked`` (or route elsewhere).
 
@@ -6305,19 +6411,38 @@ def block_task(
 
     Returns True on any successful transition (to ``blocked``, ``todo``, or
     ``triage``), False when the task wasn't in a blockable state.
+
+    ALL THREE arms are claim releases: each NULLs ``claim_lock``/``worker_pid``
+    on a card that may still have a live worker in its workspace. When the
+    caller did not prove it owns the current run (``expected_run_id``), that
+    worker is contained through the shared primitive
+    :func:`_terminate_released_worker` strictly AFTER this transaction commits.
+    A worker blocking ITSELF — the overwhelmingly common case, every
+    ``kanban_block`` call — passes its own run id and is never signalled.
     """
     if kind is not None and kind not in VALID_BLOCK_KINDS:
         raise ValueError(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
         )
     recurrences = 0
+    terminate_pid: Optional[int] = None
+    terminate_lock: Optional[str] = None
+    terminate_run_id: Optional[int] = None
+    landed_status: Optional[str] = None
+    dependency_arm = False
     with write_txn(conn):
         cur_row = conn.execute(
-            "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?",
+            "SELECT status, block_kind, block_recurrences, claim_lock, "
+            "worker_pid, current_run_id FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if cur_row is None:
             return False
+        # Captured BEFORE the release NULLs them; the ownership guard and the
+        # post-commit containment both need the pre-release values.
+        terminate_pid = cur_row["worker_pid"]
+        terminate_lock = cur_row["claim_lock"]
+        terminate_run_id = cur_row["current_run_id"]
         source_status = (
             _retry_status_for_run(conn, task_id)
             if cur_row["status"] == "running"
@@ -6379,63 +6504,25 @@ def block_task(
                 run_id=run_id,
                 reason=reason,
             )
-            return True
-
-        # Truly-blocked kinds. Increment the unblock-loop counter when this is a
-        # re-block for the SAME reason after a prior unblock. block_task only
-        # fires from running/ready (i.e. AFTER an unblock returned the task to
-        # the work pool), so a stored block_kind that matches the incoming kind
-        # means: blocked → unblocked → about-to-re-block for the same cause.
-        # An un-typed (None) block compares as "same" to a prior un-typed block.
-        same_cause = prev_kind == kind
-        recurrences = prev_recurrences + 1 if same_cause else 1
-
-        if recurrences >= BLOCK_RECURRENCE_LIMIT:
-            # Loop detected — stop letting the unblocker spin this task. Route
-            # to triage for a human-in-the-loop decision instead of blocked.
-            cur = conn.execute(
-                """
-                UPDATE tasks
-                   SET status        = 'triage',
-                       claim_lock    = NULL,
-                       claim_expires = NULL,
-                       worker_pid    = NULL,
-                       block_kind    = ?,
-                       block_recurrences = ?
-                 WHERE id = ?
-                   AND status IN ('running', 'ready')
-                """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
-                (kind, recurrences, task_id) if expected_run_id is None
-                else (kind, recurrences, task_id, int(expected_run_id)),
-            )
-            if cur.rowcount != 1:
-                return False
-            run_id = _end_run(
-                conn, task_id,
-                outcome="blocked", status="blocked",
-                summary=reason,
-            )
-            if run_id is None and reason:
-                run_id = _synthesize_ended_run(
-                    conn, task_id, outcome="blocked", summary=reason,
-                )
-            _append_event(
-                conn, task_id, "block_loop_detected",
-                {
-                    "reason": reason,
-                    "kind": kind,
-                    "recurrences": recurrences,
-                    "limit": BLOCK_RECURRENCE_LIMIT,
-                    "source_status": source_status,
-                },
-                run_id=run_id,
-            )
+            landed_status = "todo"
+            dependency_arm = True
         else:
-            if expected_run_id is None:
+            # Truly-blocked kinds. Increment the unblock-loop counter when this is a
+            # re-block for the SAME reason after a prior unblock. block_task only
+            # fires from running/ready (i.e. AFTER an unblock returned the task to
+            # the work pool), so a stored block_kind that matches the incoming kind
+            # means: blocked → unblocked → about-to-re-block for the same cause.
+            # An un-typed (None) block compares as "same" to a prior un-typed block.
+            same_cause = prev_kind == kind
+            recurrences = prev_recurrences + 1 if same_cause else 1
+
+            if recurrences >= BLOCK_RECURRENCE_LIMIT:
+                # Loop detected — stop letting the unblocker spin this task. Route
+                # to triage for a human-in-the-loop decision instead of blocked.
                 cur = conn.execute(
                     """
                     UPDATE tasks
-                       SET status        = 'blocked',
+                       SET status        = 'triage',
                            claim_lock    = NULL,
                            claim_expires = NULL,
                            worker_pid    = NULL,
@@ -6443,58 +6530,113 @@ def block_task(
                            block_recurrences = ?
                      WHERE id = ?
                        AND status IN ('running', 'ready')
-                    """,
-                    (kind, recurrences, task_id),
+                    """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
+                    (kind, recurrences, task_id) if expected_run_id is None
+                    else (kind, recurrences, task_id, int(expected_run_id)),
                 )
-            else:
-                cur = conn.execute(
-                    """
-                    UPDATE tasks
-                       SET status        = 'blocked',
-                           claim_lock    = NULL,
-                           claim_expires = NULL,
-                           worker_pid    = NULL,
-                           block_kind    = ?,
-                           block_recurrences = ?
-                     WHERE id = ?
-                       AND status IN ('running', 'ready')
-                       AND current_run_id = ?
-                    """,
-                    (kind, recurrences, task_id, int(expected_run_id)),
-                )
-            if cur.rowcount != 1:
-                return False
-            run_id = _end_run(
-                conn, task_id,
-                outcome="blocked", status="blocked",
-                summary=reason,
-            )
-            # Synthesize a run when blocking a never-claimed task so the
-            # reason is preserved in attempt history.
-            if run_id is None and reason:
-                run_id = _synthesize_ended_run(
+                if cur.rowcount != 1:
+                    return False
+                landed_status = "triage"
+                run_id = _end_run(
                     conn, task_id,
-                    outcome="blocked",
+                    outcome="blocked", status="blocked",
                     summary=reason,
                 )
-            _append_event(
-                conn, task_id, "blocked",
-                {
-                    "reason": reason,
-                    "kind": kind,
-                    "recurrences": recurrences,
-                    "source_status": source_status,
-                },
-                run_id=run_id,
-            )
-        _blocked_task = get_task(conn, task_id)
-    _fire_kanban_lifecycle_hook(
-        "kanban_task_blocked",
+                if run_id is None and reason:
+                    run_id = _synthesize_ended_run(
+                        conn, task_id, outcome="blocked", summary=reason,
+                    )
+                _append_event(
+                    conn, task_id, "block_loop_detected",
+                    {
+                        "reason": reason,
+                        "kind": kind,
+                        "recurrences": recurrences,
+                        "limit": BLOCK_RECURRENCE_LIMIT,
+                        "source_status": source_status,
+                    },
+                    run_id=run_id,
+                )
+            else:
+                if expected_run_id is None:
+                    cur = conn.execute(
+                        """
+                        UPDATE tasks
+                           SET status        = 'blocked',
+                               claim_lock    = NULL,
+                               claim_expires = NULL,
+                               worker_pid    = NULL,
+                               block_kind    = ?,
+                               block_recurrences = ?
+                         WHERE id = ?
+                           AND status IN ('running', 'ready')
+                        """,
+                        (kind, recurrences, task_id),
+                    )
+                else:
+                    cur = conn.execute(
+                        """
+                        UPDATE tasks
+                           SET status        = 'blocked',
+                               claim_lock    = NULL,
+                               claim_expires = NULL,
+                               worker_pid    = NULL,
+                               block_kind    = ?,
+                               block_recurrences = ?
+                         WHERE id = ?
+                           AND status IN ('running', 'ready')
+                           AND current_run_id = ?
+                        """,
+                        (kind, recurrences, task_id, int(expected_run_id)),
+                    )
+                if cur.rowcount != 1:
+                    return False
+                landed_status = "blocked"
+                run_id = _end_run(
+                    conn, task_id,
+                    outcome="blocked", status="blocked",
+                    summary=reason,
+                )
+                # Synthesize a run when blocking a never-claimed task so the
+                # reason is preserved in attempt history.
+                if run_id is None and reason:
+                    run_id = _synthesize_ended_run(
+                        conn, task_id,
+                        outcome="blocked",
+                        summary=reason,
+                    )
+                _append_event(
+                    conn, task_id, "blocked",
+                    {
+                        "reason": reason,
+                        "kind": kind,
+                        "recurrences": recurrences,
+                        "source_status": source_status,
+                    },
+                    run_id=run_id,
+                )
+            _blocked_task = get_task(conn, task_id)
+    if not dependency_arm:
+        _fire_kanban_lifecycle_hook(
+            "kanban_task_blocked",
+            task_id,
+            board=get_current_board(),
+            assignee=_blocked_task.assignee if _blocked_task else None,
+            run_id=run_id,
+            reason=reason,
+        )
+    # Post-commit containment: the block is durable, now make sure no worker
+    # is still writing into a card whose claim we just released.
+    _terminate_released_worker(
+        conn,
         task_id,
-        board=get_current_board(),
-        assignee=_blocked_task.assignee if _blocked_task else None,
-        run_id=run_id,
-        reason=reason,
+        terminate_pid,
+        terminate_lock,
+        landed_status,
+        reason="block_release_worker_alive",
+        signal_fn=signal_fn,
+        expected_run_id=expected_run_id,
+        current_run_id=terminate_run_id,
     )
     return True
 
@@ -8173,6 +8315,7 @@ def schedule_task(
     """
     terminate_pid: Optional[int] = None
     terminate_lock: Optional[str] = None
+    terminate_run_id: Optional[int] = None
     with write_txn(conn):
         trow = conn.execute(
             "SELECT status, claim_lock, worker_pid, current_run_id "
@@ -8197,13 +8340,13 @@ def schedule_task(
         cur = conn.execute(sql, params)
         if cur.rowcount != 1:
             return False
-        # Ownership guard: a worker parking its own run must never be
-        # signalled. Any other caller just orphaned a live writer.
-        if trow is not None and not _caller_is_current_worker(
-            expected_run_id, trow["current_run_id"],
-        ):
+        # Ownership guard lives in the shared primitive: a worker parking its
+        # own run must never be signalled. Any other caller just orphaned a
+        # live writer.
+        if trow is not None:
             terminate_pid = trow["worker_pid"]
             terminate_lock = trow["claim_lock"]
+            terminate_run_id = trow["current_run_id"]
         run_id = _end_run(
             conn, task_id,
             outcome="scheduled", status="scheduled",
@@ -8233,6 +8376,8 @@ def schedule_task(
         "scheduled",
         reason="scheduled_park_worker_alive",
         signal_fn=signal_fn,
+        expected_run_id=expected_run_id,
+        current_run_id=terminate_run_id,
     )
     return True
 
@@ -9259,7 +9404,7 @@ def _hold_released_task_for_live_worker(
     termination: dict,
     *,
     reason: str,
-) -> None:
+) -> bool:
     """Re-assert a claim hold on a task released beside a surviving worker.
 
     Sibling of :func:`_defer_reclaim_for_live_worker` for release paths whose
@@ -9270,9 +9415,11 @@ def _hold_released_task_for_live_worker(
     ``claim_lock IS NULL``) from spawning a second writer into the card's
     workspace while the previous one lives, and records a ``reclaim_deferred``
     event so the hold is visible in ``hermes kanban tail``.
+
+    Returns True when the hold actually landed on the card.
     """
     if not status:
-        return
+        return False
     grace = now + RECLAIM_DEFER_GRACE_SECONDS
     with write_txn(conn):
         cur = conn.execute(
@@ -9281,7 +9428,7 @@ def _hold_released_task_for_live_worker(
             (claim_lock, grace, worker_pid, task_id, status),
         )
         if cur.rowcount != 1:
-            return
+            return False
         run_id = _current_run_id(conn, task_id)
         payload = {
             "reason": reason,
@@ -9291,6 +9438,39 @@ def _hold_released_task_for_live_worker(
         }
         payload.update(termination)
         _append_event(conn, task_id, "reclaim_deferred", payload, run_id=run_id)
+    return True
+
+
+def _record_release_containment_failure(
+    conn: sqlite3.Connection,
+    task_id: str,
+    claim_lock: Optional[str],
+    worker_pid: Optional[int],
+    status: Optional[str],
+    termination: dict,
+    *,
+    reason: str,
+) -> None:
+    """Record that a release could neither kill nor hold its surviving worker.
+
+    The hold in :func:`_hold_released_task_for_live_worker` is the primary
+    containment; it can still miss (no landing status, or the row moved under
+    us between the commit and the kill). That residual case must never be
+    silent, so it gets its own event carrying the full termination dict.
+    """
+    payload = {
+        "reason": reason,
+        "claim_lock": claim_lock,
+        "worker_pid": worker_pid,
+        "held_status": status,
+        "held": False,
+    }
+    payload.update(termination)
+    with write_txn(conn):
+        _append_event(
+            conn, task_id, "release_containment_failed", payload,
+            run_id=_current_run_id(conn, task_id),
+        )
 
 
 def _terminate_released_worker(
@@ -9302,23 +9482,83 @@ def _terminate_released_worker(
     *,
     reason: str,
     signal_fn=None,
-) -> None:
-    """Post-commit worker termination for claim-releasing transitions.
+    expected_run_id: Optional[int] = None,
+    current_run_id: Optional[int] = None,
+) -> dict[str, Any]:
+    """THE claim-release containment primitive. One implementation, one call.
 
-    Called AFTER the releasing transaction committed, so the events are
-    durable before anything is signalled. When the worker survives, the
-    release is held rather than left claimable beside a live writer.
+    Every third-party claim-releasing transition (``block_task`` in all three
+    of its arms, ``reclaim_task``, ``reassign_task`` via reclaim, and
+    ``schedule_task``) routes through here so the whole invariant is expressed
+    once:
+
+        A claim-releasing transition may clear ``claim_lock``/``worker_pid``
+        or end a foreign run ONLY after verified exit of the owned process
+        tree. If termination fails or the process survives, the previous
+        ownership is re-asserted as a NON-DISPATCHABLE hold and a containment
+        failure is recorded. A self-transition by the current expected run
+        must never signal itself.
+
+    Call it strictly AFTER the releasing transaction has committed, so the
+    audit trail is durable before anything is signalled.
+
+    ``expected_run_id``/``current_run_id`` implement the ownership guard: a
+    worker that proved it owns the live run (``kanban_block`` on ITSELF, a
+    worker parking its own card) is the process we would be signalling, so
+    nothing is signalled at all. This is the single most important regression
+    risk in the whole primitive — every worker blocks itself.
+
+    Returns a receipt dict:
+
+    ``self_transition``
+        the ownership guard fired; no signal was sent.
+    ``acted``
+        a host-local foreign worker was actually signalled.
+    ``terminated``
+        the owned process tree verifiably exited (or was never ours).
+    ``held``
+        the worker survived and the claim was re-asserted on the card.
+    ``contained``
+        False ONLY when a live foreign worker survived termination. Callers
+        that must not proceed past an uncontained worker (``reclaim_task``,
+        and therefore ``reassign_task``) check this.
+    ``termination``
+        the raw :func:`_terminate_reclaimed_worker` dict.
     """
+    outcome: dict[str, Any] = {
+        "self_transition": False,
+        "acted": False,
+        "terminated": False,
+        "held": False,
+        "contained": True,
+        "termination": {},
+    }
+    # Ownership guard FIRST: a worker releasing its own run must never be
+    # signalled, whatever its pid/claim columns say.
+    if _caller_is_current_worker(expected_run_id, current_run_id):
+        outcome["self_transition"] = True
+        return outcome
     if not worker_pid or not claim_lock:
-        return
+        return outcome
     termination = _terminate_reclaimed_worker(
         worker_pid, claim_lock, signal_fn=signal_fn,
     )
+    outcome["termination"] = termination
+    outcome["acted"] = bool(termination.get("termination_attempted"))
     if _worker_survived_termination(termination):
-        _hold_released_task_for_live_worker(
+        outcome["contained"] = False
+        outcome["held"] = _hold_released_task_for_live_worker(
             conn, task_id, claim_lock, worker_pid, status,
             int(time.time()), termination, reason=reason,
         )
+        if not outcome["held"]:
+            _record_release_containment_failure(
+                conn, task_id, claim_lock, worker_pid, status, termination,
+                reason=reason,
+            )
+    else:
+        outcome["terminated"] = True
+    return outcome
 
 
 def heartbeat_worker(
