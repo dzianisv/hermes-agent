@@ -944,8 +944,10 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                     # to override a live worker claim (M1 guard).
                     force=True,
                 )
-                if ok and review_assignee_deferred and not payload.assignee:
-                    ok = kanban_db.assign_task(conn, task_id, None)
+                # A blank assignee here is NOT "unassign the review": it means
+                # "use the board's default reviewer". request_review already
+                # resolved it (or failed closed), so clearing the assignee now
+                # would strand the card in an unroutable review lane.
             elif s == "ready":
                 # Re-open a blocked/scheduled/review task, or just an explicit
                 # status set. "Changes requested" (review -> ready) goes through

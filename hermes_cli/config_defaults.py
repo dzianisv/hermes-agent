@@ -2715,6 +2715,11 @@ DEFAULT_CONFIG = {
         # the assigned profile with the bundled sdlc-review skill. Disable for
         # boards where every review is performed manually from the dashboard.
         "review_dispatch": True,
+        # Profile that takes ownership of a card when a worker calls
+        # request_review without naming a reviewer. Leave empty to require an
+        # explicit reviewer: an omitted reviewer then FAILS CLOSED instead of
+        # silently leaving the implementer assigned to their own review.
+        "default_reviewer": "",
         # Seconds between dispatcher ticks (idle or not). Lower = snappier
         # pickup of newly-ready tasks; higher = less SQL pressure.
         "dispatch_interval_seconds": 60,
