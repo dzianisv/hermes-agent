@@ -2622,7 +2622,9 @@ def _cmd_reopen_review(args: argparse.Namespace) -> int:
     failed: list[str] = []
     with kb.connect_closing() as conn:
         for tid in ids:
-            if not kb.reopen_review_task(conn, tid):
+            if not kb.reopen_review_task(
+                conn, tid, expected_run_id=_worker_run_id_for(tid),
+            ):
                 failed.append(tid)
                 print(f"cannot reopen {tid} (not in review?)", file=sys.stderr)
             else:
@@ -2708,7 +2710,9 @@ def _cmd_archive(args: argparse.Namespace) -> int:
                     print(f"Deleted {tid}")
             return 0 if not failed else 1
         for tid in ids:
-            if not kb.archive_task(conn, tid):
+            if not kb.archive_task(
+                conn, tid, expected_run_id=_worker_run_id_for(tid),
+            ):
                 failed.append(tid)
                 print(f"cannot archive {tid}", file=sys.stderr)
             else:

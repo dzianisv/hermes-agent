@@ -86,20 +86,24 @@ DECLARED: dict[str, tuple[str, bool, str]] = {
         "timed park; the original complete implementation, now refactored "
         "onto the shared primitive",
     ),
-    # --- third-party releases NOT yet on the shared primitive (known gap) ---
     "invalidate_descendants_for_parent_reopen": (
-        THIRD_PARTY_RELEASE, False,
-        "already terminates post-commit via _terminate_reclaimed_worker, but "
-        "does not hold on survival; out of scope of this change and reported "
-        "as a known gap rather than silently reclassified",
+        THIRD_PARTY_RELEASE, True,
+        "ancestor reopen retracts live descendants; each descendant is now "
+        "contained through the shared primitive (landing 'todo'), so a "
+        "surviving worker holds the card instead of leaving it claimable. "
+        "The composed-transaction caller drains the returned tuples through "
+        "the same primitive post-commit",
     ),
     "reopen_review_task": (
-        THIRD_PARTY_RELEASE, False,
-        "review reopen; known gap, same reasoning",
+        THIRD_PARTY_RELEASE, True,
+        "review reopen releases the reviewer's claim; contained post-commit "
+        "with the computed landing status, held on survival",
     ),
     "archive_task": (
-        THIRD_PARTY_RELEASE, False,
-        "operator archive; known gap, same reasoning",
+        THIRD_PARTY_RELEASE, True,
+        "operator archive: archive + event commit first, then containment; "
+        "a surviving worker REFUSES the archive (card reverted out of "
+        "'archived' to the held state, workspace NOT reaped, returns False)",
     ),
     # --- worker-owned self transitions: the caller IS the process ---
     "complete_task": (
@@ -140,7 +144,14 @@ DECLARED: dict[str, tuple[str, bool, str]] = {
 }
 
 # The call sites this change is contracted to route through the primitive.
-REQUIRED_ROUTED = {"block_task", "reclaim_task", "schedule_task"}
+REQUIRED_ROUTED = {
+    "block_task",
+    "reclaim_task",
+    "schedule_task",
+    "reopen_review_task",
+    "invalidate_descendants_for_parent_reopen",
+    "archive_task",
+}
 
 
 # ---------------------------------------------------------------------------

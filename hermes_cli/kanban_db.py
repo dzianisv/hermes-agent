@@ -7193,7 +7193,13 @@ def promote_due_scheduled(conn: sqlite3.Connection) -> list[str]:
     return woken
 
 
-def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
+def reopen_review_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    expected_run_id: Optional[int] = None,
+    signal_fn=None,
+) -> bool:
     """Transition ``review`` -> ready (or todo) so the implementer re-runs.
 
     The "changes requested" counterpart of :func:`request_review`: sends the
@@ -7206,14 +7212,34 @@ def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
     not a block, so there is no loop counter to reset. (A stale counter from a
     genuine block *before* review is left intact — only :func:`complete_task`
     clears it.) Returns False when the task is missing or not in ``review``.
+
+    This path is a release: it NULLs the claim columns while a reviewer may
+    still be running in the card's workspace. When the caller did not prove
+    run ownership (``expected_run_id``) that worker is contained through the
+    shared primitive :func:`_terminate_released_worker`, strictly AFTER the
+    transaction commits so the ``review_reopened`` audit row is durable before
+    anything is signalled. If the worker survives, the primitive re-asserts
+    the previous claim as a non-dispatchable hold. A reviewer reopening its
+    OWN run is never signalled.
     """
     now = int(time.time())
+    terminate_pid: Optional[int] = None
+    terminate_lock: Optional[str] = None
+    terminate_run_id: Optional[int] = None
+    landing_status: Optional[str] = None
     with write_txn(conn):
         _reclaim_dangling_run(
             conn, task_id, statuses=("review",), now=now,
             note="invariant recovery on review reopen",
         )
         new_status = _landing_status_after_parents(conn, task_id)
+        # Snapshot the claim ownership BEFORE it is NULLed; containment runs
+        # post-commit (the ownership guard itself lives in the primitive).
+        claim_row = conn.execute(
+            "SELECT claim_lock, worker_pid, current_run_id "
+            "FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
         review_event = conn.execute(
             "SELECT payload FROM task_events "
             "WHERE task_id = ? AND kind = 'review_requested' "
@@ -7258,7 +7284,24 @@ def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
             "review_reopened",
             payload if payload != {"status": "ready"} else None,
         )
-        return True
+        if claim_row is not None:
+            terminate_pid = claim_row["worker_pid"]
+            terminate_lock = claim_row["claim_lock"]
+            terminate_run_id = claim_row["current_run_id"]
+        landing_status = new_status
+    # Post-commit: the audit trail is durable, now contain the worker.
+    _terminate_released_worker(
+        conn,
+        task_id,
+        terminate_pid,
+        terminate_lock,
+        landing_status,
+        reason="review_reopen_worker_alive",
+        signal_fn=signal_fn,
+        expected_run_id=expected_run_id,
+        current_run_id=terminate_run_id,
+    )
+    return True
 
 
 def invalidate_descendants_for_parent_reopen(
@@ -7266,6 +7309,8 @@ def invalidate_descendants_for_parent_reopen(
     task_id: str,
     *,
     author: str,
+    expected_run_id: Optional[int] = None,
+    signal_fn=None,
 ) -> dict[str, Any]:
     """Retract every dispatchable/completed descendant of a reopened ancestor.
 
@@ -7299,14 +7344,17 @@ def invalidate_descendants_for_parent_reopen(
 
     Live ``running`` descendants keep the termination behavior (a running
     child building on a retracted premise is wasted spend): their run is
-    closed ``reclaimed`` and their worker is killed via
-    :func:`_terminate_reclaimed_worker` — the same helper the reclaim paths
-    use. Events/comments are written inside the transaction and the kill
-    happens strictly post-commit, so the audit trail exists BEFORE the
-    worker dies. When this function opened its own transaction it performs
-    the terminations itself after commit; when composing under a caller's
+    closed ``reclaimed`` and their worker is contained via the shared
+    claim-release primitive :func:`_terminate_released_worker` — the same
+    one ``block_task`` / ``reclaim_task`` / ``schedule_task`` use, so a
+    descendant whose worker SURVIVES termination is held (claim re-asserted,
+    non-dispatchable) instead of being left claimable beside a live writer.
+    Events/comments are written inside the transaction and the kill happens
+    strictly post-commit, so the audit trail exists BEFORE the worker dies.
+    When this function opened its own transaction it performs the
+    containment itself after commit; when composing under a caller's
     transaction the caller MUST drain the returned ``terminations`` list
-    with ``_terminate_reclaimed_worker`` after its own commit.
+    through :func:`_terminate_released_worker` after its own commit.
 
     ``consecutive_failures`` is reset to 0 on every invalidated descendant:
     ancestor reopen is a deliberate operator action, so demoted work gets a
@@ -7320,12 +7368,17 @@ def invalidate_descendants_for_parent_reopen(
 
     Returns ``{"invalidated": [...], "terminations": [...]}`` where each
     invalidated entry is ``{id, prior_status, new_status, resume_status}``
-    and each termination is a ``(worker_pid, claim_lock)`` tuple.
+    and each termination is a
+    ``(task_id, worker_pid, claim_lock, current_run_id)`` tuple — everything
+    the shared primitive needs to contain (and, on survival, hold) that
+    descendant.
     """
     caller_owns_txn = bool(getattr(conn, "in_transaction", False))
     now = int(time.time())
     invalidated: list[dict[str, Any]] = []
-    terminations: list[tuple[Optional[int], Optional[str]]] = []
+    terminations: list[
+        tuple[str, Optional[int], Optional[str], Optional[int]]
+    ] = []
     with write_txn(conn, allow_nested=True):
         rows = conn.execute(
             """
@@ -7355,7 +7408,12 @@ def invalidate_descendants_for_parent_reopen(
                 resume_status = _retry_status_for_run(
                     conn, row["id"], row["current_run_id"]
                 )
-                terminations.append((row["worker_pid"], row["claim_lock"]))
+                terminations.append((
+                    row["id"],
+                    row["worker_pid"],
+                    row["claim_lock"],
+                    row["current_run_id"],
+                ))
                 run_id = _end_run(
                     conn,
                     row["id"],
@@ -7424,10 +7482,20 @@ def invalidate_descendants_for_parent_reopen(
             )
     if not caller_owns_txn:
         # Standalone call: we committed above, so the audit trail is durable
-        # — safe to kill workers now. Composed calls leave this to the
+        # — safe to contain workers now. Composed calls leave this to the
         # caller (post-commit), preserving events-before-termination.
-        for pid, claim_lock in terminations:
-            _terminate_reclaimed_worker(pid, claim_lock)
+        for child_id, pid, claim_lock, run_id in terminations:
+            _terminate_released_worker(
+                conn,
+                child_id,
+                pid,
+                claim_lock,
+                "todo",
+                reason="ancestor_reopen_worker_alive",
+                signal_fn=signal_fn,
+                expected_run_id=expected_run_id,
+                current_run_id=run_id,
+            )
     return {"invalidated": invalidated, "terminations": terminations}
 
 
@@ -7755,8 +7823,41 @@ def decompose_triage_task(
     return child_ids
 
 
-def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
+def archive_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    expected_run_id: Optional[int] = None,
+    signal_fn=None,
+) -> bool:
+    """Archive a task, containing any live worker first.
+
+    Archiving is the sharpest claim release on the board: it NULLs the claim
+    columns, closes the run AND reaps the workspace — while a worker may
+    still be writing into that very directory. So the containment decision
+    here is REFUSAL, not best effort: the archive UPDATE and its ``archived``
+    event commit first (durable audit), then the shared primitive
+    :func:`_terminate_released_worker` contains the worker post-commit, and
+    only if the worker verifiably exited do we ``recompute_ready`` and reap
+    the workspace.
+
+    If the worker SURVIVES, the primitive re-asserts the previous claim as a
+    non-dispatchable hold; we then revert the card out of ``archived`` back
+    to the held state in its own committed transaction, emit an
+    ``archive_refused`` event, skip the workspace reap, and return False so
+    the CLI prints ``cannot archive <id>``. A worker archiving its OWN run
+    (``expected_run_id``) is never signalled.
+    """
+    terminate_pid: Optional[int] = None
+    terminate_lock: Optional[str] = None
+    terminate_run_id: Optional[int] = None
+    prev_status: Optional[str] = None
     with write_txn(conn):
+        trow = conn.execute(
+            "SELECT status, claim_lock, worker_pid, current_run_id "
+            "FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
             "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
@@ -7765,6 +7866,11 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
         )
         if cur.rowcount != 1:
             return False
+        if trow is not None:
+            terminate_pid = trow["worker_pid"]
+            terminate_lock = trow["claim_lock"]
+            terminate_run_id = trow["current_run_id"]
+            prev_status = trow["status"]
         # If archive happened while a run was still in flight (e.g. user
         # archived a running task from the dashboard), close that run with
         # outcome='reclaimed' so attempt history isn't orphaned.
@@ -7774,6 +7880,27 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
             summary="task archived with run still active",
         )
         _append_event(conn, task_id, "archived", None, run_id=run_id)
+    # Post-commit: the ``archived`` event is durable, now contain the worker.
+    outcome = _terminate_released_worker(
+        conn,
+        task_id,
+        terminate_pid,
+        terminate_lock,
+        "archived",
+        reason="archive_worker_alive",
+        signal_fn=signal_fn,
+        expected_run_id=expected_run_id,
+        current_run_id=terminate_run_id,
+    )
+    if not outcome["contained"]:
+        # A live writer is still in the workspace: refuse the archive rather
+        # than reaping the directory underneath it.
+        _refuse_archive_for_live_worker(
+            conn, task_id, prev_status, terminate_pid, terminate_lock,
+            held=bool(outcome["held"]),
+            termination=outcome["termination"],
+        )
+        return False
     # ``archived`` parents no longer block children, same as ``done``.
     # Promote newly-unblocked dependents immediately instead of waiting
     # for a later dispatcher tick.
@@ -7782,6 +7909,52 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
     # completing previously kept their scratch dir / worktree forever.
     _cleanup_workspace(conn, task_id)
     return True
+
+
+def _refuse_archive_for_live_worker(
+    conn: sqlite3.Connection,
+    task_id: str,
+    prev_status: Optional[str],
+    worker_pid: Optional[int],
+    claim_lock: Optional[str],
+    *,
+    held: bool,
+    termination: dict,
+) -> None:
+    """Undo a committed archive whose worker survived containment.
+
+    Runs in its own transaction, strictly after the archive commit and after
+    the termination attempt. The revert is guarded on the row still being
+    ``archived`` AND still carrying the hold the primitive re-asserted, so it
+    is idempotent and a no-op if the row moved underneath us. When the hold
+    did NOT land the card stays ``archived`` — which is itself
+    non-dispatchable, and strictly safer than restoring a claimable status
+    beside a live writer — and only the refusal event is recorded.
+    """
+    reverted_to: Optional[str] = None
+    with write_txn(conn):
+        if held and prev_status and prev_status != "archived":
+            cur = conn.execute(
+                "UPDATE tasks SET status = ? "
+                "WHERE id = ? AND status = 'archived' "
+                "AND claim_lock IS NOT NULL",
+                (prev_status, task_id),
+            )
+            if cur.rowcount == 1:
+                reverted_to = prev_status
+        payload: dict[str, Any] = {
+            "reason": "archive_worker_alive",
+            "worker_pid": worker_pid,
+            "claim_lock": claim_lock,
+            "held": held,
+            "prior_status": prev_status,
+            "reverted_to": reverted_to,
+        }
+        payload.update(termination or {})
+        _append_event(
+            conn, task_id, "archive_refused", payload,
+            run_id=_current_run_id(conn, task_id),
+        )
 
 
 def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:

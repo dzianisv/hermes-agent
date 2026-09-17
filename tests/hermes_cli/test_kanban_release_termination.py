@@ -272,6 +272,76 @@ def _release_schedule(conn, tid, **kw):
     return kb.schedule_task(conn, tid, reason="timed park", **kw)
 
 
+# --- reopen_review_task ----------------------------------------------------
+#
+# A ``review`` card normally carries no claim, but it does whenever a release
+# was HELD in the review phase (``_hold_released_task_for_live_worker`` with a
+# ``review`` landing status) or a reviewer run was re-asserted. That is the
+# exact shape this release must contain, so the setup reproduces it: a really
+# claimed card (claim_lock + worker_pid + current_run_id from ``claim_task``)
+# sitting in ``review``.
+
+
+def _setup_review_held(conn, writer):
+    tid, run_id = _claimed_card_with_writer(conn, writer, "review reopen")
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET status = 'review' WHERE id = ?", (tid,),
+        )
+    state = _state(conn, tid)
+    assert state["status"] == "review"
+    assert state["claim_lock"] is not None and state["worker_pid"] == writer.pid
+    return tid, run_id
+
+
+def _release_reopen_review(conn, tid, **kw):
+    return kb.reopen_review_task(conn, tid, **kw)
+
+
+# --- invalidate_descendants_for_parent_reopen ------------------------------
+
+
+def _setup_running_descendant(conn, writer):
+    """A running child whose ancestor is about to be reopened."""
+    parent = kb.create_task(conn, title="ancestor", assignee="planner")
+    assert kb.complete_task(conn, parent) is True
+    tid = kb.create_task(
+        conn, title="running descendant", assignee="worker", parents=[parent],
+    )
+    kb.recompute_ready(conn)
+    claimed = kb.claim_task(conn, tid)
+    assert claimed is not None and claimed.status == "running"
+    kb._set_worker_pid(conn, tid, writer.pid)
+    row = conn.execute(
+        "SELECT current_run_id FROM tasks WHERE id = ?", (tid,),
+    ).fetchone()
+    return tid, int(row["current_run_id"])
+
+
+def _release_ancestor_reopen(conn, tid, **kw):
+    parent = conn.execute(
+        "SELECT parent_id FROM task_links WHERE child_id = ?", (tid,),
+    ).fetchone()["parent_id"]
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET status = 'todo', completed_at = NULL "
+            "WHERE id = ?",
+            (parent,),
+        )
+    result = kb.invalidate_descendants_for_parent_reopen(
+        conn, parent, author="operator", **kw
+    )
+    assert [t[0] for t in result["terminations"]] == [tid]
+    return True
+
+
+# --- archive_task ----------------------------------------------------------
+
+
+def _release_archive(conn, tid, **kw):
+    return kb.archive_task(conn, tid, **kw)
+
+
 # (id, setup, release, expected landing status)
 VARIANTS = [
     ("block_plain", _setup_plain, _release_block_plain, "blocked"),
@@ -280,7 +350,21 @@ VARIANTS = [
     ("reclaim", _setup_plain, _release_reclaim, "ready"),
     ("reassign", _setup_plain, _release_reassign, "ready"),
     ("schedule", _setup_plain, _release_schedule, "scheduled"),
+    ("reopen_review", _setup_review_held, _release_reopen_review, "ready"),
+    (
+        "ancestor_reopen",
+        _setup_running_descendant,
+        _release_ancestor_reopen,
+        "todo",
+    ),
+    ("archive", _setup_plain, _release_archive, "archived"),
 ]
+
+# Releases that REFUSE (return False) when the worker survives termination:
+# reclaim/reassign because a second profile must not inherit a live
+# workspace, archive because the workspace would be reaped underneath a live
+# writer.
+REFUSE_ON_SURVIVAL = {"reclaim", "reassign", "archive"}
 
 _IDS = [v[0] for v in VARIANTS]
 
@@ -374,9 +458,10 @@ def test_release_beside_a_surviving_worker_holds_the_card(
     ok = variant["release"](conn, tid, signal_fn=_noop_signal)
     released_at = time.time()
 
-    # reclaim/reassign report the failed containment by refusing; block and
-    # schedule still land the transition but must hold the claim.
-    if variant["name"] in ("reclaim", "reassign"):
+    # reclaim/reassign/archive report the failed containment by refusing;
+    # block, schedule and the reopen paths still land the transition but must
+    # hold the claim.
+    if variant["name"] in REFUSE_ON_SURVIVAL:
         assert ok is False, (
             f"{variant['name']} must refuse when containment failed"
         )
@@ -561,3 +646,137 @@ def test_dependency_block_still_routes_to_todo_without_a_worker(conn) -> None:
     ) is True
     assert _state(conn, tid)["status"] == "todo"
     assert _events(conn, tid, "dependency_wait")[-1]["kind"] == "dependency"
+
+
+# ---------------------------------------------------------------------------
+# archive_task: archiving beside a live writer REFUSES rather than reaping the
+# workspace underneath it.
+# ---------------------------------------------------------------------------
+
+
+def _give_scratch_workspace(conn, tid: str, name: str) -> Path:
+    # Must live under the board's managed workspaces root, otherwise
+    # ``_cleanup_workspace`` refuses to remove it (#28818 containment guard)
+    # and the "reaped" half of the proof would be vacuous.
+    path = kb.workspaces_root() / name
+    path.mkdir(parents=True, exist_ok=True)
+    (path / "artifact.txt").write_text("work in progress")
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET workspace_kind = 'scratch', workspace_path = ? "
+            "WHERE id = ?",
+            (str(path), tid),
+        )
+    return path
+
+
+def test_archive_after_verified_termination_archives_and_reaps(
+    conn, writers, tmp_path,
+) -> None:
+    writer = writers("archive_ok")
+    tid, _run_id = _claimed_card_with_writer(conn, writer, "archive me")
+    ws = _give_scratch_workspace(conn, tid, "ws_archived")
+
+    assert kb.archive_task(conn, tid) is True
+    archived_at = time.time()
+
+    assert _state(conn, tid)["status"] == "archived"
+    assert _wait_gone(writer.pid, timeout=10), "worker tree must be terminated"
+    time.sleep(1.5)
+    assert writer.writes_after(archived_at) == 0
+    assert not ws.exists(), "verified-dead worker: workspace must be reaped"
+
+
+def test_archive_beside_a_surviving_worker_refuses_and_keeps_everything(
+    conn, writers, tmp_path,
+) -> None:
+    """The decided semantics: refuse, hold, do NOT reap."""
+    writer = writers("archive_refused")
+    tid, _run_id = _claimed_card_with_writer(conn, writer, "do not archive me")
+    ws = _give_scratch_workspace(conn, tid, "ws_live")
+
+    assert kb.archive_task(conn, tid, signal_fn=_noop_signal) is False
+    refused_at = time.time()
+
+    time.sleep(1.0)
+    assert writer.alive(), (
+        "precondition not established: the sabotaged termination killed the "
+        "writer, so this is not a survival case"
+    )
+    assert writer.writes_after(refused_at) > 0
+
+    state = _state(conn, tid)
+    assert state["status"] != "archived", (
+        "card was archived beside a live writer"
+    )
+    assert state["status"] == "running", state
+    assert state["claim_lock"] is not None
+    assert state["worker_pid"] == writer.pid
+    assert not _claimable(conn, tid)
+
+    assert ws.exists() and (ws / "artifact.txt").exists(), (
+        "workspace was reaped underneath a live writer"
+    )
+
+    payload = _events(conn, tid, "archive_refused")[-1]
+    assert payload["held"] is True
+    assert payload["reverted_to"] == "running"
+    assert payload["terminated"] is False
+
+    kb.recompute_ready(conn)
+    assert kb.claim_task(conn, tid) is None, (
+        "a SECOND worker could claim a card whose archive was refused"
+    )
+
+
+def test_self_archive_is_never_signalled(conn, writers, tmp_path) -> None:
+    writer = writers("archive_self")
+    tid, run_id = _claimed_card_with_writer(conn, writer, "archive my own run")
+    seen: list[tuple] = []
+
+    assert kb.archive_task(
+        conn, tid, expected_run_id=run_id,
+        signal_fn=lambda p, s: seen.append((p, s)),
+    ) is True
+    released_at = time.time()
+
+    assert seen == [], f"a self archive attempted to signal: {seen}"
+    time.sleep(1.0)
+    assert writer.alive()
+    assert writer.writes_after(released_at) > 0
+    assert _state(conn, tid)["status"] == "archived"
+
+
+# ---------------------------------------------------------------------------
+# reopen_review_task: return-value semantics are unchanged by the containment.
+# ---------------------------------------------------------------------------
+
+
+def test_reopen_review_return_semantics_are_unchanged(conn, writers) -> None:
+    writer = writers("reopen_review_semantics")
+    tid, run_id = _setup_review_held(conn, writer)
+
+    assert kb.reopen_review_task(conn, tid, expected_run_id=run_id) is True
+    assert _state(conn, tid)["status"] == "ready"
+    # Not in review any more: a second reopen is a no-op, as before.
+    assert kb.reopen_review_task(conn, tid) is False
+    assert writer.alive(), "the self reopen killed the caller's own worker"
+
+
+def test_ancestor_reopen_holds_a_surviving_descendant_worker(
+    conn, writers,
+) -> None:
+    writer = writers("ancestor_reopen_survive")
+    tid, _run_id = _setup_running_descendant(conn, writer)
+
+    _release_ancestor_reopen(conn, tid, signal_fn=_noop_signal)
+
+    time.sleep(1.0)
+    assert writer.alive(), "precondition: the writer must have survived"
+    state = _state(conn, tid)
+    assert state["claim_lock"] is not None, (
+        "invalidated descendant left claimable beside a live writer"
+    )
+    assert state["worker_pid"] == writer.pid
+    kb.recompute_ready(conn)
+    assert kb.claim_task(conn, tid) is None
