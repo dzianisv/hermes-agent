@@ -5369,6 +5369,7 @@ def complete_task(
     created_cards: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
     fire_lifecycle_hook: bool = True,
+    signal_fn=None,
 ) -> bool:
     """Transition ``running|ready|blocked|review -> done`` and record ``result``.
 
@@ -5401,8 +5402,26 @@ def complete_task(
     Any suspected phantom references are recorded as a
     ``suspected_hallucinated_references`` event. This pass is advisory
     and never blocks.
+
+    Like the review handoffs (:func:`request_review`), a completion driven by
+    someone OTHER than the current worker also terminates that worker: the
+    UPDATE below NULLs ``claim_lock``/``claim_expires``/``worker_pid``, which
+    is the row's only handle on a process that may still be writing in the
+    card's workspace. The kill happens strictly AFTER the transaction commits
+    (audit trail first) and, critically, BEFORE :func:`_cleanup_workspace`
+    runs — deleting the scratch tree out from under a live writer is how a
+    half-written deliverable gets produced. A worker completing its OWN run
+    (``expected_run_id == current_run_id``) is never signalled.
+
+    Asymmetry worth recording: :func:`reclaim_task` updates
+    ``status IN ('running', 'ready', 'blocked')``, so reclaim IS the
+    sanctioned containment path for a *blocked* card left beside a live
+    writer, but NOT for a *done* one — a done card is outside every claim and
+    recovery path, which is exactly why :func:`reopen_done_task` exists.
     """
     now = int(time.time())
+    terminate_pid: Optional[int] = None
+    terminate_lock: Optional[str] = None
     # Fail before validating cards or staging artifacts; re-check inside the
     # final write transaction below to close the parent-reopen race.
     if not _parents_satisfied(conn, task_id):
@@ -5444,8 +5463,11 @@ def complete_task(
         # ``review`` or ``running``.
         if not _parents_satisfied(conn, task_id):
             return False
+        # Capture the claim handle BEFORE the UPDATE NULLs it — post-commit
+        # termination has no other way back to the worker.
         prior = conn.execute(
-            "SELECT status FROM tasks WHERE id = ?",
+            "SELECT status, claim_lock, worker_pid, current_run_id "
+            "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         prior_status = prior["status"] if prior else None
@@ -5486,6 +5508,13 @@ def complete_task(
             )
         if cur.rowcount != 1:
             return False
+        # Ownership guard: a worker completing its own run must never be
+        # signalled mid-call. Any other caller just orphaned a live writer.
+        if prior is not None and not _caller_is_current_worker(
+            expected_run_id, prior["current_run_id"]
+        ):
+            terminate_pid = prior["worker_pid"]
+            terminate_lock = prior["claim_lock"]
         if isinstance(metadata, dict):
             _persist_scratch_completion_artifacts(conn, task_id, metadata)
             for stored_path in metadata.pop("_staged_artifacts", []):
@@ -5559,6 +5588,19 @@ def complete_task(
             completed_payload,
             run_id=run_id,
         )
+    # Post-commit, and deliberately ahead of _cleanup_workspace below: the
+    # events are durable before anything is signalled, and the workspace is
+    # only torn down once the previous writer is dead (or the release is held
+    # because it survived).
+    _terminate_released_worker(
+        conn,
+        task_id,
+        terminate_pid,
+        terminate_lock,
+        "done",
+        reason="completed_worker_alive",
+        signal_fn=signal_fn,
+    )
     # Prose-scan the summary + result for t_<hex> references that do
     # not resolve. Advisory — does not block the completion. Runs in
     # its own txn so the completion itself is already durable by the
@@ -6260,9 +6302,74 @@ def block_task(
     reason: Optional[str] = None,
     kind: Optional[str] = None,
     expected_run_id: Optional[int] = None,
+    signal_fn=None,
 ) -> bool:
     """Transition ``running``/``ready`` → ``blocked`` (or route elsewhere).
 
+    Thin wrapper around :func:`_block_task_txn` so the worker termination can
+    happen strictly AFTER the transaction commits on every branch (the
+    ``dependency`` branch returns from inside the txn). Behaviour and return
+    contract are unchanged.
+
+    Like the review handoffs (:func:`request_review`), a block driven by
+    someone OTHER than the current worker terminates that worker: every branch
+    NULLs ``claim_lock``/``claim_expires``/``worker_pid``, dropping the row's
+    only handle on a process that may still be writing in the card's
+    workspace. A worker blocking its OWN run (``expected_run_id ==
+    current_run_id``) is never signalled.
+
+    The landing status is taken from the branch that actually ran — ``todo``
+    for ``kind='dependency'``, ``triage`` for the loop breaker, ``blocked``
+    otherwise — so a hold (when the worker survives the kill) is re-asserted
+    onto the row as it really landed. ``todo`` is the sharp one: it is
+    immediately re-claimable, so releasing it beside a live writer is what
+    would spawn a second writer into the same workspace.
+
+    Asymmetry worth recording: :func:`reclaim_task` updates
+    ``status IN ('running', 'ready', 'blocked')``, so reclaim IS a sanctioned
+    containment path for a blocked card — but NOT for a ``done`` one, which is
+    why :func:`reopen_done_task` exists for that side.
+    """
+    released: dict[str, Any] = {}
+    ok = _block_task_txn(
+        conn,
+        task_id,
+        reason=reason,
+        kind=kind,
+        expected_run_id=expected_run_id,
+        released=released,
+    )
+    if ok:
+        # Post-commit (events precede the kill, mirroring the handoff paths).
+        _terminate_released_worker(
+            conn,
+            task_id,
+            released.get("worker_pid"),
+            released.get("claim_lock"),
+            released.get("landed_status"),
+            reason="blocked_worker_alive",
+            signal_fn=signal_fn,
+        )
+    return ok
+
+
+def _block_task_txn(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reason: Optional[str] = None,
+    kind: Optional[str] = None,
+    expected_run_id: Optional[int] = None,
+    released: Optional[dict] = None,
+) -> bool:
+    """Transactional body of :func:`block_task` — see there for semantics.
+
+    ``released`` is an out-parameter: on success it receives the claim handle
+    captured before the UPDATE NULLed it (``worker_pid``, ``claim_lock``) plus
+    the ``landed_status`` of the branch that ran, so the caller can terminate
+    the released worker post-commit.
+
+    ``running``/``ready`` → ``blocked`` (or routed elsewhere):
     ``kind`` (one of :data:`VALID_BLOCK_KINDS`, or ``None`` for a legacy
     un-typed block) drives routing instead of every block landing in one
     undifferentiated ``blocked`` bucket:
@@ -6293,13 +6400,23 @@ def block_task(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
         )
     recurrences = 0
+    released = {} if released is None else released
     with write_txn(conn):
         cur_row = conn.execute(
-            "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?",
+            "SELECT status, block_kind, block_recurrences, "
+            "claim_lock, worker_pid, current_run_id FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if cur_row is None:
             return False
+        # Ownership guard: a worker blocking its own run must never be
+        # signalled mid-call. Captured BEFORE the UPDATE NULLs the columns.
+        if _caller_is_current_worker(expected_run_id, cur_row["current_run_id"]):
+            captured_pid: Optional[int] = None
+            captured_lock: Optional[str] = None
+        else:
+            captured_pid = cur_row["worker_pid"]
+            captured_lock = cur_row["claim_lock"]
         source_status = (
             _retry_status_for_run(conn, task_id)
             if cur_row["status"] == "running"
@@ -6334,6 +6451,11 @@ def block_task(
             )
             if cur.rowcount != 1:
                 return False
+            released.update(
+                worker_pid=captured_pid,
+                claim_lock=captured_lock,
+                landed_status="todo",
+            )
             run_id = _end_run(
                 conn, task_id,
                 outcome="blocked", status="blocked",
@@ -6392,6 +6514,11 @@ def block_task(
             )
             if cur.rowcount != 1:
                 return False
+            released.update(
+                worker_pid=captured_pid,
+                claim_lock=captured_lock,
+                landed_status="triage",
+            )
             run_id = _end_run(
                 conn, task_id,
                 outcome="blocked", status="blocked",
@@ -6446,6 +6573,11 @@ def block_task(
                 )
             if cur.rowcount != 1:
                 return False
+            released.update(
+                worker_pid=captured_pid,
+                claim_lock=captured_lock,
+                landed_status="blocked",
+            )
             run_id = _end_run(
                 conn, task_id,
                 outcome="blocked", status="blocked",
@@ -7076,6 +7208,142 @@ def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
             payload if payload != {"status": "ready"} else None,
         )
         return True
+
+
+def reopen_done_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    actor: str,
+    reason: Optional[str] = None,
+    expected_run_id: Optional[int] = None,
+    signal_fn=None,
+) -> tuple[bool, Optional[str]]:
+    """Transition ``done``/``archived`` -> ``ready`` (or ``todo``) for rework.
+
+    The missing terminal-reopen route. :func:`reopen_review_task` is
+    ``WHERE status = 'review'`` and :func:`promote_task` accepts only
+    ``todo``/``blocked``, so a *done* card that is later verified bad (work
+    never pushed, no PR, no independent review) had no supported way back —
+    the only remaining option was direct persistence mutation, which is
+    forbidden. This is that route.
+
+    Why it cannot simply reuse reclaim: :func:`reclaim_task` updates
+    ``status IN ('running', 'ready', 'blocked')``, so it IS the sanctioned
+    containment path for a *blocked* card left beside a live writer, but a
+    ``done`` card is outside every claim, sweep and recovery path.
+
+    Invariants, each inherited rather than re-implemented:
+
+    * **Terminate before release.** The row's claim handle is captured
+      BEFORE the UPDATE NULLs it, and the worker is signalled strictly
+      post-commit (audit trail first) via
+      :func:`_terminate_released_worker`. The landing status here is
+      ``ready``/``todo`` — immediately claimable — so releasing beside a
+      live writer is exactly how a second writer lands in the same
+      workspace. A caller that proved it owns the current run
+      (``expected_run_id``) is never signalled.
+    * **Self-healing hold.** When the worker survives the kill the release
+      is held instead, and the hold lands on a non-running row that
+      :func:`_release_stale_handoff_holds` already sweeps by SHAPE, so it
+      cannot become a permanent dispatch stall.
+    * **Descendant retraction** is delegated to
+      :func:`invalidate_descendants_for_parent_reopen` — the single domain
+      implementation, whose docstring requires every done-reopen surface to
+      route through it. It composes under this transaction, so the
+      ancestor flip and the retractions commit atomically; its worker
+      terminations are drained here post-commit.
+    * ``consecutive_failures`` is reset to 0, following that same
+      function's operator-reset rule and deliberately the OPPOSITE of
+      :func:`reopen_review_task`'s preserve rule: an operator retracting a
+      verified-bad completion is an explicit reset signal, not the
+      autonomous review loop laundering its own failure streak.
+
+    Returns ``(True, new_status)`` on success, ``(False, reason)`` otherwise.
+    """
+    now = int(time.time())
+    terminate_pid: Optional[int] = None
+    terminate_lock: Optional[str] = None
+    landed_status: Optional[str] = None
+    descendant_terminations: list[tuple[Optional[int], Optional[str]]] = []
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, claim_lock, worker_pid, current_run_id "
+            "FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return False, f"task {task_id} not found"
+        prior_status = row["status"]
+        if prior_status not in ("done", "archived"):
+            return False, (
+                f"task {task_id} is {prior_status!r}; reopen-done only applies "
+                f"to 'done' or 'archived'"
+            )
+        _reclaim_dangling_run(
+            conn, task_id, statuses=("done", "archived"), now=now,
+            note="invariant recovery on done reopen",
+        )
+        new_status = _landing_status_after_parents(conn, task_id)
+        cur = conn.execute(
+            "UPDATE tasks SET status = ?, completed_at = NULL, "
+            "current_run_id = NULL, claim_lock = NULL, claim_expires = NULL, "
+            "worker_pid = NULL, consecutive_failures = 0 "
+            "WHERE id = ? AND status = ?",
+            (new_status, task_id, prior_status),
+        )
+        if cur.rowcount != 1:
+            return False, "task changed during reopen"
+        # Ownership guard: captured before the UPDATE NULLed the columns.
+        if not _caller_is_current_worker(expected_run_id, row["current_run_id"]):
+            terminate_pid = row["worker_pid"]
+            terminate_lock = row["claim_lock"]
+        landed_status = new_status
+        descendants = invalidate_descendants_for_parent_reopen(
+            conn, task_id, author=actor,
+        )
+        descendant_terminations = descendants["terminations"]
+        _append_event(
+            conn,
+            task_id,
+            "done_reopened",
+            {
+                "prior_status": prior_status,
+                "status": new_status,
+                "actor": actor,
+                "reason": reason,
+                "invalidated_descendants": [
+                    d["id"] for d in descendants["invalidated"]
+                ],
+            },
+        )
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (
+                task_id,
+                actor,
+                (
+                    f"Reopened from '{prior_status}' to '{new_status}' for "
+                    f"rework"
+                    + (f": {reason}" if reason else ".")
+                ),
+                now,
+            ),
+        )
+    # Post-commit: the audit trail is durable, so it is safe to signal.
+    _terminate_released_worker(
+        conn,
+        task_id,
+        terminate_pid,
+        terminate_lock,
+        landed_status,
+        reason="done_reopened_worker_alive",
+        signal_fn=signal_fn,
+    )
+    for pid, claim_lock in descendant_terminations:
+        _terminate_reclaimed_worker(pid, claim_lock, signal_fn=signal_fn)
+    return True, landed_status
 
 
 def invalidate_descendants_for_parent_reopen(
