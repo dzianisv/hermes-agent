@@ -4973,6 +4973,11 @@ def release_stale_claims(
 
     Returns the number of stale claims actually reclaimed (live-pid
     extensions don't count). Safe to call often.
+
+    A second sweep (:func:`_release_stale_handoff_holds`) clears expired
+    claim holds parked on already-landed cards by the review-handoff
+    paths. Those releases change no status and end no run, so they are not
+    counted as reclaims.
     """
     now = int(time.time())
     reclaimed = 0
@@ -5108,6 +5113,11 @@ def release_stale_claims(
                 heartbeat_stale=bool(heartbeat_stale),
                 retry_status=retry_status,
             )
+    # Second sweep: claim HOLDS parked on already-landed (non-running) cards
+    # by the review-handoff paths. Those rows are invisible to every other
+    # recovery path, so without this they never self-heal (see
+    # _release_stale_handoff_holds).
+    _release_stale_handoff_holds(conn, signal_fn=signal_fn)
     return reclaimed
 
 
@@ -9181,6 +9191,147 @@ def _hold_released_task_for_live_worker(
         }
         payload.update(termination)
         _append_event(conn, task_id, "reclaim_deferred", payload, run_id=run_id)
+
+
+def _release_stale_handoff_holds(
+    conn: sqlite3.Connection,
+    *,
+    signal_fn=None,
+) -> int:
+    """Clear expired claim holds left on already-landed (non-running) cards.
+
+    :func:`_hold_released_task_for_live_worker` re-asserts ``claim_lock`` /
+    ``claim_expires`` / ``worker_pid`` on a card that has ALREADY landed in
+    its post-handoff status (``review`` from :func:`request_review`, whatever
+    :func:`_landing_status_after_parents` returned from
+    :func:`request_changes`). Its sibling ``_defer_reclaim_for_live_worker``
+    holds a ``running`` row, which every tick re-examines; a landed row is
+    invisible to all of them — ``release_stale_claims``'s main sweep,
+    ``detect_crashed_workers`` and ``reconcile_orphaned_running`` all select
+    ``status = 'running'``, and ``reclaim_task`` only updates
+    ``running``/``ready``/``blocked``. So once the held worker finally died,
+    the hold stayed forever and the card was permanently unclaimable
+    (``claim_task`` and ``claim_review_task`` both require ``claim_lock IS
+    NULL``) — a silent dispatch stall.
+
+    This sweep makes the hold self-healing without a new sweeper, cron entry
+    or dispatcher hook: it runs inside ``release_stale_claims``, which the
+    dispatcher already calls every tick. It deliberately matches on the
+    SHAPE of a hold (non-running card carrying a host-local claim whose TTL
+    has passed) rather than on a hand-maintained list of landing statuses,
+    so a new handoff landing status can never silently escape it.
+
+    Semantics:
+
+    * worker still alive -> re-terminate it, and if it survives, extend the
+      hold. Never release beside a live writer; that is the whole point of
+      the hold.
+    * worker dead -> clear ``claim_lock``/``claim_expires``/``worker_pid``
+      and append a ``claim_hold_released`` event. The task's STATUS is left
+      untouched (it already landed where it belongs) and no run is started
+      or ended — the run was closed by the handoff transition itself.
+    * non-host-local claim -> skipped. A foreign PID says nothing about
+      liveness here, and holds are only ever created host-local
+      (``_worker_survived_termination`` requires ``host_local``).
+
+    Returns the number of holds actually released.
+    """
+    now = int(time.time())
+    host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
+    released = 0
+    rows = conn.execute(
+        "SELECT id, status, claim_lock, claim_expires, worker_pid "
+        "FROM tasks "
+        "WHERE status IS NOT 'running' "
+        "  AND claim_lock IS NOT NULL "
+        "  AND claim_expires IS NOT NULL "
+        "  AND claim_expires < ? "
+        "  AND worker_pid IS NOT NULL",
+        (now,),
+    ).fetchall()
+    for row in rows:
+        lock = row["claim_lock"] or ""
+        if not lock.startswith(host_prefix):
+            continue
+        pid = int(row["worker_pid"])
+        termination: dict[str, Any] = {}
+        if _pid_alive(pid):
+            termination = _terminate_reclaimed_worker(
+                pid, lock, signal_fn=signal_fn,
+            )
+            if _worker_survived_termination(termination):
+                _extend_hold_for_live_worker(
+                    conn, row["id"], lock, row["status"], now, termination,
+                    reason="handoff_hold_worker_alive",
+                )
+                continue
+        with write_txn(conn):
+            cur = conn.execute(
+                "UPDATE tasks SET claim_lock = NULL, claim_expires = NULL, "
+                "worker_pid = NULL "
+                "WHERE id = ? AND status IS ? AND claim_lock IS ? "
+                "  AND claim_expires IS ?",
+                (row["id"], row["status"], lock, row["claim_expires"]),
+            )
+            if cur.rowcount != 1:
+                continue
+            payload = {
+                "reason": "handoff_hold_worker_gone",
+                "claim_lock": lock,
+                "held_status": row["status"],
+                "worker_pid": pid,
+                "claim_expires": int(row["claim_expires"]),
+                "now": now,
+            }
+            payload.update(termination)
+            _append_event(
+                conn, row["id"], "claim_hold_released", payload,
+                run_id=_current_run_id(conn, row["id"]),
+            )
+            released += 1
+        _log.info(
+            "kanban: released stale handoff hold on task %s "
+            "(status=%s, dead worker_pid=%s)", row["id"], row["status"], pid,
+        )
+    return released
+
+
+def _extend_hold_for_live_worker(
+    conn: sqlite3.Connection,
+    task_id: str,
+    claim_lock: Optional[str],
+    status: Optional[str],
+    now: int,
+    termination: dict,
+    *,
+    reason: str,
+) -> None:
+    """Push an existing handoff hold's TTL out while its worker is still alive.
+
+    The landed-row counterpart of ``_defer_reclaim_for_live_worker``'s TTL
+    extension: the hold already exists (claim columns are populated), so this
+    only moves ``claim_expires`` forward and records the deferral.
+    """
+    grace = now + RECLAIM_DEFER_GRACE_SECONDS
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE tasks SET claim_expires = ? "
+            "WHERE id = ? AND status IS ? AND claim_lock IS ?",
+            (grace, task_id, status, claim_lock),
+        )
+        if cur.rowcount != 1:
+            return
+        payload = {
+            "reason": reason,
+            "claim_lock": claim_lock,
+            "held_status": status,
+            "claim_expires_now": grace,
+        }
+        payload.update(termination)
+        _append_event(
+            conn, task_id, "reclaim_deferred", payload,
+            run_id=_current_run_id(conn, task_id),
+        )
 
 
 def _terminate_released_worker(

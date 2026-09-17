@@ -217,3 +217,153 @@ def test_self_transition_does_not_kill_the_calling_worker(conn, owned_sleeper):
     assert (ok, implementer) == (True, "impl")
     assert signalled == []
     assert reviewer_sleeper.poll() is None
+
+
+# --- the hold must self-heal once the survivor finally dies -----------------
+#
+# The hold parks a claim on a card that has already LANDED (review / ready),
+# which no status='running' recovery path can see. If nothing ever clears it,
+# the card is permanently unclaimable once the held worker dies: a silent
+# dispatch stall. ``release_stale_claims`` — the sweeper the dispatcher
+# already runs every tick — is what heals it.
+
+
+def _expire_hold(conn, tid):
+    """Age the hold's TTL past now, as the dispatcher would observe it."""
+    row = _task_row(conn, tid)
+    assert _held(row), "expected a live hold to expire"
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET claim_expires = ? WHERE id = ?",
+            (int(time.time()) - 1, tid),
+        )
+
+
+def _reap(proc) -> None:
+    """Kill and REAP the test-owned worker (a zombie still reads as alive)."""
+    proc.kill()
+    proc.wait(timeout=5)
+
+
+def _noop_signal(pid, sig):
+    """Swallow the kill so the test keeps owning its own process."""
+
+
+def test_review_hold_is_released_once_the_worker_dies(conn, owned_sleeper):
+    sleeper = owned_sleeper()
+    tid = _running_task_with_worker(conn, sleeper, title="heal-review")
+    assert kb.request_review(
+        conn, tid, reviewer="reviewer", force=True, signal_fn=_noop_signal,
+    ) is True
+    assert _held(_task_row(conn, tid)), "expected the survivor hold"
+
+    _reap(sleeper)
+    _expire_hold(conn, tid)
+
+    kb.release_stale_claims(conn, signal_fn=_noop_signal)
+
+    row = _task_row(conn, tid)
+    assert row["status"] == "review", "the sweep must not move the card"
+    assert not _held(row), "the hold outlived its worker — card is stuck"
+    assert row["worker_pid"] is None
+    assert kb.claim_review_task(conn, tid) is not None, (
+        "card stayed unclaimable after its held worker died"
+    )
+
+
+def test_changes_hold_is_released_once_the_worker_dies(conn, owned_sleeper):
+    sleeper = owned_sleeper()
+    tid = _into_review_run(conn, sleeper, title="heal-changes")
+    ok, _implementer = kb.request_changes(
+        conn, tid, reason="needs rework", signal_fn=_noop_signal,
+    )
+    assert ok is True
+    held_row = _task_row(conn, tid)
+    assert _held(held_row), "expected the survivor hold"
+    landed_status = held_row["status"]
+    assert landed_status == "ready"
+
+    _reap(sleeper)
+    _expire_hold(conn, tid)
+
+    kb.release_stale_claims(conn, signal_fn=_noop_signal)
+
+    row = _task_row(conn, tid)
+    assert row["status"] == landed_status, "the sweep must not move the card"
+    assert not _held(row), "the hold outlived its worker — card is stuck"
+    assert kb.claim_task(conn, tid) is not None, (
+        "card stayed unclaimable after its held worker died"
+    )
+
+
+def test_hold_survives_the_sweep_while_the_worker_is_alive(conn, owned_sleeper):
+    """The sweep must never hand a live writer's card to a second worker."""
+    sleeper = owned_sleeper()
+    tid = _running_task_with_worker(conn, sleeper, title="heal-negative")
+    assert kb.request_review(
+        conn, tid, reviewer="reviewer", force=True, signal_fn=_noop_signal,
+    ) is True
+    assert _held(_task_row(conn, tid))
+
+    _expire_hold(conn, tid)
+    kb.release_stale_claims(conn, signal_fn=_noop_signal)
+
+    assert sleeper.poll() is None, "test-owned worker should still be alive"
+    row = _task_row(conn, tid)
+    assert _held(row), "the sweep released a hold beside a live writer"
+    assert row["status"] == "review"
+    assert kb.claim_review_task(conn, tid) is None
+    assert kb.claim_task(conn, tid) is None
+    # The hold was pushed forward, not left expired, so the next tick still
+    # sees a held card rather than a claimable one.
+    assert int(row["claim_expires"]) > int(time.time())
+
+
+def test_swept_hold_statuses_cover_where_the_handoffs_actually_land(
+    conn, owned_sleeper,
+):
+    """Both handoff landings are shapes the sweep can see.
+
+    The sweep matches on hold SHAPE (non-running card + host-local claim +
+    expired TTL), so this ties that shape to the statuses the two transitions
+    really produce instead of trusting a hand-written status list.
+    """
+    review_sleeper = owned_sleeper()
+    review_tid = _running_task_with_worker(conn, review_sleeper, title="land-a")
+    assert kb.request_review(
+        conn, review_tid, reviewer="reviewer", force=True, signal_fn=_noop_signal,
+    ) is True
+
+    changes_sleeper = owned_sleeper()
+    changes_tid = _into_review_run(conn, changes_sleeper, title="land-b")
+    ok, _impl = kb.request_changes(
+        conn, changes_tid, reason="rework", signal_fn=_noop_signal,
+    )
+    assert ok is True
+
+    landings = {
+        _task_row(conn, review_tid)["status"],
+        _task_row(conn, changes_tid)["status"],
+    }
+    assert "running" not in landings, (
+        "a landed handoff status collided with the main running sweep"
+    )
+
+    for tid, sleeper in ((review_tid, review_sleeper), (changes_tid, changes_sleeper)):
+        _reap(sleeper)
+        _expire_hold(conn, tid)
+
+    kb.release_stale_claims(conn, signal_fn=_noop_signal)
+
+    for tid in (review_tid, changes_tid):
+        row = _task_row(conn, tid)
+        assert not _held(row), f"{row['status']} landing was not swept"
+
+    kinds = {
+        r["kind"]
+        for r in conn.execute(
+            "SELECT kind FROM task_events WHERE task_id IN (?, ?)",
+            (review_tid, changes_tid),
+        ).fetchall()
+    }
+    assert "claim_hold_released" in kinds
