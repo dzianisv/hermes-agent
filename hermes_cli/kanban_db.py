@@ -6497,6 +6497,7 @@ def request_review(
     expected_run_id: Optional[int] = None,
     force: bool = False,
     with_reason: bool = False,
+    signal_fn=None,
 ):
     """Transition implementation work into the first-class review phase.
 
@@ -6513,6 +6514,17 @@ def request_review(
     worker's ``claim_lock``/``worker_pid``. Workers prove ownership by passing
     their own run id as ``expected_run_id`` (unchanged).
 
+    A handoff driven by someone OTHER than the current worker (operator
+    ``force=True``, or any caller not proving ownership with its own run id)
+    also terminates that worker: releasing the claim while the previous writer
+    still runs in the card's workspace is what lets the next dispatcher tick
+    spawn a second writer beside it. The kill happens strictly AFTER the
+    transaction commits so the audit trail exists first, and if the worker
+    survives, the release is held (see
+    :func:`_hold_released_task_for_live_worker`) instead of leaving a claimable
+    task beside a live process. A worker transitioning its OWN run
+    (``expected_run_id == current_run_id``) is never signalled.
+
     Returns ``bool`` by default. With ``with_reason=True`` returns
     ``(ok, reason)`` mirroring :func:`request_changes` — ``reason`` is a
     diagnostic string on failure, ``None`` on success.
@@ -6523,11 +6535,13 @@ def request_review(
 
     summary = redact_review_value(summary)
     metadata = redact_review_value(metadata)
+    terminate_pid: Optional[int] = None
+    terminate_lock: Optional[str] = None
     with write_txn(conn):
         if not _parents_satisfied(conn, task_id):
             return _ret(False, "parent dependencies are not satisfied")
         trow = conn.execute(
-            "SELECT assignee, status, claim_lock, current_run_id "
+            "SELECT assignee, status, claim_lock, worker_pid, current_run_id "
             "FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if trow is None:
@@ -6617,6 +6631,11 @@ def request_review(
                 "task is not in running/ready (or expected_run_id did not "
                 "match the current run)",
             )
+        # Ownership guard: a worker transitioning its own run must never be
+        # signalled. Any other caller just orphaned a live writer.
+        if not _caller_is_current_worker(expected_run_id, trow["current_run_id"]):
+            terminate_pid = trow["worker_pid"]
+            terminate_lock = trow["claim_lock"]
         run_id = _end_run(
             conn,
             task_id,
@@ -6646,6 +6665,16 @@ def request_review(
             },
             run_id=run_id,
         )
+    # Post-commit (events precede the kill, mirroring the reopen path).
+    _terminate_released_worker(
+        conn,
+        task_id,
+        terminate_pid,
+        terminate_lock,
+        "review",
+        reason="review_handoff_worker_alive",
+        signal_fn=signal_fn,
+    )
     return _ret(True)
 
 
@@ -6655,6 +6684,7 @@ def request_changes(
     *,
     reason: str,
     expected_run_id: Optional[int] = None,
+    signal_fn=None,
 ) -> tuple[bool, Optional[str]]:
     """Finish an active review run and route the task back for rework.
 
@@ -6663,14 +6693,22 @@ def request_changes(
     ``review_requested`` event, reapplies parent gating, and emits an auditable
     ``changes_requested`` event.  The second tuple item is the implementer on
     success or a diagnostic reason on failure.
+
+    Like :func:`request_review`, a caller that is not the current worker also
+    terminates it post-commit, and holds the release when that worker survives
+    — the task must never become claimable beside a live writer.
     """
     reason = str(redact_review_value(reason or "")).strip()
     if not reason:
         return False, "reason is required"
 
+    terminate_pid: Optional[int] = None
+    terminate_lock: Optional[str] = None
+    landed_status: Optional[str] = None
     with write_txn(conn):
         task_row = conn.execute(
-            "SELECT status, assignee, current_run_id FROM tasks WHERE id = ?",
+            "SELECT status, assignee, claim_lock, worker_pid, current_run_id "
+            "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if task_row is None:
@@ -6746,6 +6784,10 @@ def request_changes(
         )
         if cur.rowcount != 1:
             return False, "task changed during review handoff"
+        if not _caller_is_current_worker(expected_run_id, current_run_id):
+            terminate_pid = task_row["worker_pid"]
+            terminate_lock = task_row["claim_lock"]
+            landed_status = new_status
         run_id = _end_run(
             conn,
             task_id,
@@ -6765,6 +6807,16 @@ def request_changes(
             },
             run_id=run_id,
         )
+    # Post-commit (events precede the kill, mirroring the reopen path).
+    _terminate_released_worker(
+        conn,
+        task_id,
+        terminate_pid,
+        terminate_lock,
+        landed_status,
+        reason="changes_requested_worker_alive",
+        signal_fn=signal_fn,
+    )
     return True, implementer
 
 
@@ -9070,6 +9122,93 @@ def _defer_reclaim_for_live_worker(
         }
         payload.update(termination)
         _append_event(conn, task_id, "reclaim_deferred", payload, run_id=run_id)
+
+
+def _caller_is_current_worker(
+    expected_run_id: Optional[int],
+    current_run_id: Optional[int],
+) -> bool:
+    """True when the caller proved it owns the task's current run.
+
+    Workers prove ownership by passing their own run id; anything else
+    (operator ``force=True``, a reviewer, the dashboard) is a third party
+    releasing somebody else's live claim.
+    """
+    if expected_run_id is None or current_run_id is None:
+        return False
+    return int(expected_run_id) == int(current_run_id)
+
+
+def _hold_released_task_for_live_worker(
+    conn: sqlite3.Connection,
+    task_id: str,
+    claim_lock: Optional[str],
+    worker_pid: Optional[int],
+    status: Optional[str],
+    now: int,
+    termination: dict,
+    *,
+    reason: str,
+) -> None:
+    """Re-assert a claim hold on a task released beside a surviving worker.
+
+    Sibling of :func:`_defer_reclaim_for_live_worker` for the review-handoff
+    paths. There the release transaction has already committed (the audit
+    trail must precede the kill), so the task is no longer ``running`` and its
+    claim columns are NULL. Restoring ``claim_lock``/``claim_expires``/
+    ``worker_pid`` keeps both :func:`claim_task` and :func:`claim_review_task`
+    (each requires ``claim_lock IS NULL``) from spawning a second writer into
+    the card's workspace while the previous one lives, and records a
+    ``reclaim_deferred`` event so the hold is visible in ``hermes kanban tail``.
+    """
+    if not status:
+        return
+    grace = now + RECLAIM_DEFER_GRACE_SECONDS
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE tasks SET claim_lock = ?, claim_expires = ?, worker_pid = ? "
+            "WHERE id = ? AND status = ? AND claim_lock IS NULL",
+            (claim_lock, grace, worker_pid, task_id, status),
+        )
+        if cur.rowcount != 1:
+            return
+        run_id = _current_run_id(conn, task_id)
+        payload = {
+            "reason": reason,
+            "claim_lock": claim_lock,
+            "held_status": status,
+            "claim_expires_now": grace,
+        }
+        payload.update(termination)
+        _append_event(conn, task_id, "reclaim_deferred", payload, run_id=run_id)
+
+
+def _terminate_released_worker(
+    conn: sqlite3.Connection,
+    task_id: str,
+    worker_pid: Optional[int],
+    claim_lock: Optional[str],
+    status: Optional[str],
+    *,
+    reason: str,
+    signal_fn=None,
+) -> None:
+    """Post-commit worker termination for the review-handoff transitions.
+
+    Called AFTER the releasing transaction committed, so the events are
+    durable before anything is signalled. When the worker survives, the
+    release is held rather than left claimable beside a live writer.
+    """
+    if not worker_pid or not claim_lock:
+        return
+    termination = _terminate_reclaimed_worker(
+        worker_pid, claim_lock, signal_fn=signal_fn,
+    )
+    if _worker_survived_termination(termination):
+        _hold_released_task_for_live_worker(
+            conn, task_id, claim_lock, worker_pid, status,
+            int(time.time()), termination, reason=reason,
+        )
 
 
 def heartbeat_worker(
