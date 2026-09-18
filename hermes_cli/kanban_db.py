@@ -90,6 +90,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
+from sqlite_schema_text import strip_sql_line_comments
 from toolsets import get_toolset_names
 
 _log = logging.getLogger(__name__)
@@ -2471,7 +2472,7 @@ def connect(
                     # process are cheap. The lock prevents same-process dispatcher
                     # threads from racing through the additive ALTER TABLE pass with
                     # stale PRAGMA snapshots during gateway startup.
-                    conn.executescript(SCHEMA_SQL)
+                    conn.executescript(strip_sql_line_comments(SCHEMA_SQL))
                     _migrate_add_optional_columns(conn)
                     _INITIALIZED_PATHS.add(resolved)
         except Exception:
