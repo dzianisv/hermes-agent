@@ -333,6 +333,7 @@ def test_reopening_parent_retracts_review_and_blocks_approval(client):
             child_id,
             summary="ready",
             expected_run_id=implementation.current_run_id,
+            reviewer="reviewer",
         )
         active_review = kb.claim_review_task(conn, child_id)
         assert active_review is not None
@@ -438,6 +439,7 @@ def test_dashboard_reclaim_of_active_review_preserves_review_phase(client):
             task_id,
             summary="ready",
             expected_run_id=implementation.current_run_id,
+            reviewer="reviewer",
         )
         review = kb.claim_review_task(conn, task_id)
         assert review is not None
@@ -1230,3 +1232,60 @@ def test_specify_happy_path(client, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+
+
+# ---------------------------------------------------------------------------
+# Dashboard review handoff uses the shared reviewer resolver
+# ---------------------------------------------------------------------------
+
+
+def test_dashboard_blank_assignee_review_uses_the_shared_resolver(
+    client, kanban_home, monkeypatch,
+):
+    """A board-driven 'move to review' with a blank assignee must resolve the
+    configured default reviewer through the same path as the worker tool —
+    not blank the assignee out (which left the review lane unroutable) and
+    not silently leave the implementer in place (self-review)."""
+    (kanban_home / "profiles" / "reviewer").mkdir(parents=True, exist_ok=True)
+    import hermes_cli.config as config_mod
+    cfg = {"kanban": {"default_reviewer": "reviewer"}}
+    monkeypatch.setattr(config_mod, "load_config_readonly", lambda: cfg)
+    monkeypatch.setattr(config_mod, "load_config", lambda: cfg)
+
+    tid = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "impl", "assignee": "builder"},
+    ).json()["task"]["id"]
+
+    r = client.patch(
+        f"/api/plugins/kanban/tasks/{tid}",
+        json={"status": "review", "assignee": "", "summary": "ready"},
+    )
+    assert r.status_code == 200, r.text
+    task = r.json()["task"]
+    assert task["status"] == "review"
+    assert task["assignee"] == "reviewer"
+
+
+def test_dashboard_review_fails_closed_without_a_default_reviewer(
+    client, kanban_home, monkeypatch,
+):
+    import hermes_cli.config as config_mod
+    cfg = {"kanban": {"default_reviewer": ""}}
+    monkeypatch.setattr(config_mod, "load_config_readonly", lambda: cfg)
+    monkeypatch.setattr(config_mod, "load_config", lambda: cfg)
+
+    tid = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "impl", "assignee": "builder"},
+    ).json()["task"]["id"]
+
+    r = client.patch(
+        f"/api/plugins/kanban/tasks/{tid}",
+        json={"status": "review", "assignee": "", "summary": "ready"},
+    )
+    assert r.status_code == 409, r.text
+    with kb.connect() as conn:
+        after = kb.get_task(conn, tid)
+        assert after.status == "ready"
+        assert after.assignee == "builder"

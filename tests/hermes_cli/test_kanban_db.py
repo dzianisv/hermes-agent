@@ -1641,7 +1641,8 @@ def _park_review_card(conn, *, wake_at=None, title="review park"):
     kb.claim_task(conn, tid)
     run_id = kb.get_task(conn, tid).current_run_id
     assert kb.request_review(conn, tid, summary="please review",
-                             expected_run_id=run_id) is True
+                             expected_run_id=run_id,
+                             reviewer="reviewer") is True
     assert kb.get_task(conn, tid).status == "review"
     assert kb.schedule_task(
         conn, tid, reason="waiting on CI", wake_at=wake_at,

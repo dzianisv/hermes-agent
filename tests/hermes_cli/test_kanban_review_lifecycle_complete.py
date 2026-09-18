@@ -125,6 +125,7 @@ def test_same_card_review_supports_changes_and_approval_without_block_loop(conn)
         task_id,
         summary="Fallback regression added.",
         expected_run_id=implementation_2.current_run_id,
+        reviewer="reviewer",
     )
     awaiting_rereview = kb.get_task(conn, task_id)
     assert awaiting_rereview is not None
@@ -258,6 +259,7 @@ def test_parent_reopen_blocks_request_review_until_parent_is_done(conn) -> None:
         task_id,
         summary="must wait",
         expected_run_id=implementation.current_run_id,
+        reviewer="reviewer",
     )
     still_running = kb.get_task(conn, task_id)
     assert still_running is not None
@@ -268,6 +270,7 @@ def test_parent_reopen_blocks_request_review_until_parent_is_done(conn) -> None:
         task_id,
         summary="parent stable",
         expected_run_id=implementation.current_run_id,
+        reviewer="reviewer",
     )
 
 
@@ -542,7 +545,7 @@ def test_goal_run_status_is_bound_to_original_run(conn) -> None:
 
 def test_parked_review_approval_without_evidence_still_creates_audit_run(conn) -> None:
     task_id = kb.create_task(conn, title="Manual approval", assignee="reviewer")
-    assert kb.request_review(conn, task_id, summary="implementation handoff")
+    assert kb.request_review(conn, task_id, summary="implementation handoff", reviewer="reviewer")
     assert kb.complete_task(conn, task_id)
     completed_event = _event(kb.list_events(conn, task_id), "completed")
     assert completed_event.run_id is not None
@@ -681,6 +684,7 @@ def test_review_transitions_preserve_consecutive_failures(conn) -> None:
     assert kb.request_review(
         conn, task_id, summary="v2",
         expected_run_id=retry.current_run_id,
+        reviewer="reviewer",
     )
     assert _failures(conn, task_id) == 1  # full re-review cycle: still 1
 

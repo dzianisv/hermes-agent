@@ -6658,6 +6658,67 @@ def redact_review_value(value: Any) -> Any:
     return value
 
 
+def configured_default_reviewer() -> Optional[str]:
+    """Return ``kanban.default_reviewer`` from config, or None when unset.
+
+    Single shared read so every ``request_review`` entry point (worker tool,
+    CLI, dashboard) agrees on what the board's default reviewer is.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+        raw = (load_config_readonly() or {}).get("kanban", {}).get(
+            "default_reviewer"
+        )
+    except Exception:
+        return None
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    return raw.strip()
+
+
+def resolve_reviewer(implementer: Optional[str]) -> tuple[Optional[str], Optional[str]]:
+    """Resolve the reviewer for an omitted ``reviewer=`` argument.
+
+    Returns ``(reviewer, None)`` on success or ``(None, reason)`` when the
+    board has no usable default. Fails closed on purpose: a review request
+    that cannot name a distinct reviewer must NOT fall back to the
+    implementer, because the review dispatcher would then hand the card back
+    to the profile that wrote the code (silent self-review).
+    """
+    raw = configured_default_reviewer()
+    if raw is None:
+        return None, (
+            "no reviewer was supplied and kanban.default_reviewer is unset; "
+            "set kanban.default_reviewer to a distinct reviewer profile or "
+            "pass reviewer= explicitly"
+        )
+    try:
+        candidate = _canonical_assignee(raw)
+    except ValueError:
+        return None, (
+            f"kanban.default_reviewer ({raw!r}) is not a valid profile name; "
+            "set it to an installed reviewer profile or pass reviewer= "
+            "explicitly"
+        )
+    if implementer is not None and candidate == _canonical_assignee(implementer):
+        return None, (
+            f"kanban.default_reviewer ({candidate!r}) is the same profile as "
+            "the implementer — that would be self-review; configure a "
+            "distinct reviewer profile or pass reviewer= explicitly"
+        )
+    try:
+        from hermes_cli.profiles import profile_exists
+        exists = profile_exists(candidate)
+    except Exception:
+        exists = True
+    if not exists:
+        return None, (
+            f"kanban.default_reviewer profile {candidate!r} does not exist; "
+            "install it or pass reviewer= explicitly"
+        )
+    return candidate, None
+
+
 def request_review(
     conn: sqlite3.Connection,
     task_id: str,
@@ -6756,6 +6817,13 @@ def request_review(
                         "malformed); pass reviewer= explicitly",
                     )
                 reviewer = prior_reviewer
+            if reviewer is None:
+                # No caller reviewer and no re-review provenance: resolve the
+                # board default, or fail closed. Never leave the implementer
+                # assigned in the review lane (self-review).
+                reviewer, resolve_reason = resolve_reviewer(implementer)
+                if reviewer is None:
+                    return _ret(False, resolve_reason)
         reviewer = _canonical_assignee(reviewer) if reviewer is not None else None
         assignee_sql = ", assignee = ?" if reviewer is not None else ""
         params: tuple[Any, ...]
