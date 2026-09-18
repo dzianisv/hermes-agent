@@ -39,7 +39,7 @@ jobs:
   os-tests:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 30
+    timeout-minutes: ${{ github.repository == 'NousResearch/hermes-agent' && 30 || 120 }}
     strategy:
       fail-fast: false
       matrix:
@@ -48,7 +48,9 @@ jobs:
             runner: macos-latest
             marker: macos_only
           - name: Windows-only tests
-            runner: windows-latest-32-core
+            # Forks have no larger-runner pool, so a bare
+            # windows-latest-32-core request there queues forever.
+            runner: ${{ github.repository == 'NousResearch/hermes-agent' && 'windows-latest-32-core' || 'windows-latest' }}
             marker: windows_only
     steps:
       - name: Checkout code

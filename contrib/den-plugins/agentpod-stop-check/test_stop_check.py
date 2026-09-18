@@ -50,6 +50,11 @@ PLUGIN_SRC = Path(__file__).resolve().parent
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
+# Config round-trips go through the canonical raw primitive (the ONLY legal
+# raw read for read-modify-write), not a bare yaml.safe_load of config.yaml —
+# see tests/hermes_cli/test_config_read_guard.py.
+from hermes_cli.config import read_user_config_raw  # noqa: E402
+
 SESSION = "sess-agentpod-supervisor"
 OTHER_SESSION = "sess-somebody-else"
 QUIET = "Checked the board — no material change since the last sweep."
@@ -896,7 +901,7 @@ def test_19_quiet_paraphrases_and_hook_order_cannot_bypass_enforcement(home):
         "def register(ctx):\n"
         "    ctx.register_hook('transform_llm_output', t)\n"
     )
-    cfg = yaml.safe_load((home / "config.yaml").read_text())
+    cfg = read_user_config_raw(home / "config.yaml")
     cfg["plugins"]["enabled"] = ["aaa-dummy", "agentpod-stop-check"]
     (home / "config.yaml").write_text(yaml.safe_dump(cfg))
     from hermes_cli import plugins as P
@@ -931,7 +936,7 @@ def test_20_no_edit_turn_really_continues_into_a_tool_call(home, monkeypatch):
     kb.block_task(conn, tid, reason="hold")
     install_runtime(home, extra_cfg={"max_continuations": 1})
 
-    cfg = yaml.safe_load((home / "config.yaml").read_text())
+    cfg = read_user_config_raw(home / "config.yaml")
     cfg["agent"] = {"pre_verify_on_no_edit_turns": True, "max_verify_nudges": 3}
     (home / "config.yaml").write_text(yaml.safe_dump(cfg))
 
@@ -1340,7 +1345,7 @@ def test_29_cap_exhaustion_is_fail_explicit_under_both_plugin_orders(home):
             shutil.rmtree(stale, ignore_errors=True)
         competing_transform(order_name)
         install_runtime(home, extra_cfg={"max_continuations": 2})
-        cfgfile = yaml.safe_load((home / "config.yaml").read_text())
+        cfgfile = read_user_config_raw(home / "config.yaml")
         cfgfile["plugins"] = {"enabled": ["agentpod-stop-check", order_name]}
         (home / "config.yaml").write_text(yaml.safe_dump(cfgfile))
         from hermes_cli import plugins as P
@@ -1531,7 +1536,7 @@ def test_33_continuation_drives_a_real_tool_action_through_real_dispatch(home, m
     tid = kb.create_task(conn, title="unattended", assignee="software-engineer")
     kb.block_task(conn, tid, reason="hold")
     install_runtime(home, extra_cfg={"max_continuations": 1})
-    cfg = yaml.safe_load((home / "config.yaml").read_text())
+    cfg = read_user_config_raw(home / "config.yaml")
     cfg["agent"] = {"pre_verify_on_no_edit_turns": True, "max_verify_nudges": 3}
     (home / "config.yaml").write_text(yaml.safe_dump(cfg))
 
@@ -1688,7 +1693,7 @@ def test_34_post_cap_delivered_answer_is_fail_explicit_in_both_orders(home):
             shutil.rmtree(stale, ignore_errors=True)
         _competing_transform(home, order_name, HOSTILE)
         install_runtime(home, extra_cfg={"max_continuations": 1})
-        cfgfile = yaml.safe_load((home / "config.yaml").read_text())
+        cfgfile = read_user_config_raw(home / "config.yaml")
         cfgfile["plugins"] = {"enabled": ["agentpod-stop-check", order_name]}
         cfgfile["agent"] = {"pre_verify_on_no_edit_turns": True,
                             "max_verify_nudges": 3}
@@ -1748,7 +1753,7 @@ def test_35_the_verdict_is_delivered_once_and_fits_the_budget(home):
 
     def _run() -> str:
         install_runtime(home, extra_cfg={"max_continuations": 1, "max_report_chars": 700})
-        cfgfile = yaml.safe_load((home / "config.yaml").read_text())
+        cfgfile = read_user_config_raw(home / "config.yaml")
         cfgfile["agent"] = {"pre_verify_on_no_edit_turns": True, "max_verify_nudges": 3}
         enabled = ["agentpod-stop-check"]
         if (home / "plugins" / "aaa-footer-plugin").exists():
