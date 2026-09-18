@@ -123,7 +123,11 @@ def test_running_descendant_event_precedes_termination_via_reclaim_helper(
     )
 
     assert kills and kills[0][0] == 424242
-    assert result["terminations"] == kills
+    # The returned drain list carries everything the shared claim-release
+    # primitive needs: (task_id, worker_pid, claim_lock, current_run_id).
+    assert [(t[1], t[2]) for t in result["terminations"]] == kills
+    assert [t[0] for t in result["terminations"]] == [child_id]
+    assert all(t[3] is not None for t in result["terminations"])
     child = kb.get_task(conn, child_id)
     assert child is not None
     assert child.status == "todo"

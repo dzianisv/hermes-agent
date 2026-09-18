@@ -664,11 +664,31 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         ),
     )
 
-    p_schedule = sub.add_parser("schedule", help="Park one or more tasks in Scheduled (waiting on time, not human input)")
+    p_schedule = sub.add_parser(
+        "schedule",
+        help=(
+            "Park one or more tasks in Scheduled (waiting on time, not human "
+            "input). Parks from todo/ready/running/blocked/review; a card "
+            "parked from review resumes back INTO review. With --wake-at the "
+            "dispatcher resumes it automatically at that time; without one it "
+            "waits for an explicit 'kanban unblock'."
+        ),
+    )
     p_schedule.add_argument("task_id")
     p_schedule.add_argument("reason", nargs="*", help="Reason/timing note (also appended as a comment)")
     p_schedule.add_argument("--ids", nargs="+", default=None,
                             help="Additional task ids to schedule with the same reason (bulk mode)")
+    p_schedule.add_argument(
+        "--wake-at",
+        default=None,
+        help=(
+            "When the task should wake: ISO-8601 timestamp "
+            "(2026-01-31T09:00:00, optionally with a timezone; naive values "
+            "are local time) or a unix epoch in seconds. The dispatcher "
+            "resumes the task on the first tick at or after this time. "
+            "Omit to require a manual unblock."
+        ),
+    )
 
     p_unblock = sub.add_parser(
         "unblock",
@@ -2425,10 +2445,40 @@ def _cmd_block(args: argparse.Namespace) -> int:
     return 0 if not failed else 1
 
 
+def _parse_wake_at(value: Optional[str]) -> Optional[int]:
+    """Parse ``--wake-at`` (ISO-8601 or unix seconds) into a unix timestamp.
+
+    Naive ISO values are interpreted as local time, matching what an operator
+    typing a wall-clock time means. Raises ``ValueError`` on anything else so
+    the caller can refuse without parking the card at the wrong time.
+    """
+    if value is None:
+        return None
+    raw = str(value).strip()
+    if not raw:
+        return None
+    if raw.isdigit():
+        return int(raw)
+    import datetime as _dt
+
+    parsed = _dt.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.astimezone()
+    return int(parsed.timestamp())
+
+
 def _cmd_schedule(args: argparse.Namespace) -> int:
     reason = " ".join(args.reason).strip() if args.reason else None
     author = _profile_author()
     ids = [args.task_id] + list(getattr(args, "ids", None) or [])
+    try:
+        wake_at = _parse_wake_at(getattr(args, "wake_at", None))
+    except ValueError:
+        print(
+            "--wake-at must be an ISO-8601 timestamp or a unix epoch in seconds",
+            file=sys.stderr,
+        )
+        return 1
     failed: list[str] = []
     with kb.connect_closing() as conn:
         for tid in ids:
@@ -2439,11 +2489,25 @@ def _cmd_schedule(args: argparse.Namespace) -> int:
                 tid,
                 reason=reason,
                 expected_run_id=_worker_run_id_for(tid),
+                wake_at=wake_at,
             ):
                 failed.append(tid)
                 print(f"cannot schedule {tid}", file=sys.stderr)
             else:
-                print(f"Scheduled {tid}" + (f": {reason}" if reason else ""))
+                # Report where the task actually landed and when it wakes —
+                # a live worker that survived termination leaves the release
+                # held, so the card may not be idle-scheduled yet.
+                landed = kb.get_task(conn, tid)
+                suffix = f": {reason}" if reason else ""
+                when = (
+                    f" (wakes at {wake_at})" if wake_at is not None
+                    else " (waiting for unblock)"
+                )
+                where = landed.status if landed else "scheduled"
+                if where != "scheduled":
+                    print(f"{tid} → {where}{when}{suffix}")
+                else:
+                    print(f"Scheduled {tid}{when}{suffix}")
     return 0 if not failed else 1
 
 
@@ -2558,7 +2622,9 @@ def _cmd_reopen_review(args: argparse.Namespace) -> int:
     failed: list[str] = []
     with kb.connect_closing() as conn:
         for tid in ids:
-            if not kb.reopen_review_task(conn, tid):
+            if not kb.reopen_review_task(
+                conn, tid, expected_run_id=_worker_run_id_for(tid),
+            ):
                 failed.append(tid)
                 print(f"cannot reopen {tid} (not in review?)", file=sys.stderr)
             else:
@@ -2644,7 +2710,9 @@ def _cmd_archive(args: argparse.Namespace) -> int:
                     print(f"Deleted {tid}")
             return 0 if not failed else 1
         for tid in ids:
-            if not kb.archive_task(conn, tid):
+            if not kb.archive_task(
+                conn, tid, expected_run_id=_worker_run_id_for(tid),
+            ):
                 failed.append(tid)
                 print(f"cannot archive {tid}", file=sys.stderr)
             else:

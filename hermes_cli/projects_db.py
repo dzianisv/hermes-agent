@@ -35,6 +35,7 @@ from typing import Iterable, List, Optional
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing, write_txn
 from hermes_constants import get_hermes_home
+from sqlite_schema_text import strip_sql_line_comments
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -170,7 +171,7 @@ def connect(db_path: Optional[Path] = None) -> sqlite3.Connection:
         apply_wal_with_fallback(conn, db_label="projects.db")
         conn.execute("PRAGMA foreign_keys=ON")
         if resolved not in _INITIALIZED_PATHS:
-            conn.executescript(SCHEMA_SQL)
+            conn.executescript(strip_sql_line_comments(SCHEMA_SQL))
             _migrate_add_optional_columns(conn)
             _INITIALIZED_PATHS.add(resolved)
     except Exception:
