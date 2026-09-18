@@ -3155,6 +3155,86 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return normalize_profile_name(assignee)
 
 
+class UnknownAssigneeError(ValueError):
+    """Raised when an assignee does not name a runnable Hermes profile.
+
+    A card owned by a name with no installed profile can never execute: the
+    dispatcher spawns ``hermes -p <assignee>``, which fails at startup. Before
+    this guard existed, such a card looked owned on the board while being
+    structurally incapable of running (``copilot-external``, ``builder``,
+    ``a``). Assignment surfaces raise this instead of writing the row.
+    """
+
+
+def ensure_runnable_assignee(assignee: Optional[str]) -> Optional[str]:
+    """Canonicalize *assignee* and assert it names a runnable profile.
+
+    Returns the canonical profile id, or ``None`` for an explicit
+    unassignment (``None`` / empty / whitespace) — leaving a card unowned is
+    a legitimate state and stays supported.
+
+    The set of acceptable names is DERIVED on every call from the profiles
+    directory on disk (via :func:`hermes_cli.profiles.profile_exists`), never
+    from a hand-maintained list — a profile installed a second ago is
+    immediately assignable, and a name no longer on disk is immediately
+    rejected.
+
+    Raises :class:`UnknownAssigneeError` with an actionable message otherwise.
+    """
+    if assignee is None:
+        return None
+    if not isinstance(assignee, str):
+        assignee = str(assignee)
+    if not assignee.strip():
+        return None
+    canon = _canonical_assignee(assignee)
+    assert canon is not None  # non-blank input always canonicalizes
+    try:
+        from hermes_cli.profiles import profile_exists
+    except Exception:
+        # Profiles module unavailable (exotic embedding). Fail OPEN here
+        # rather than bricking every write: the dispatcher performs the same
+        # check independently and fails CLOSED before spawning, so a bad
+        # assignee still cannot execute.
+        return canon
+    if profile_exists(canon):
+        return canon
+    known = ", ".join(_runnable_assignee_candidates()) or "(none installed)"
+    raise UnknownAssigneeError(
+        f"assignee {canon!r} is not a runnable Hermes profile: no profile "
+        f"directory is installed for it, so a task owned by it can never be "
+        f"dispatched. Installed profiles: {known}. "
+        f"Create it with `hermes -p {canon} setup`, pick an installed "
+        f"profile, or pass 'none' to leave the task unassigned."
+    )
+
+
+def _runnable_assignee_candidates() -> list[str]:
+    """Names that :func:`ensure_runnable_assignee` would currently ACCEPT.
+
+    Derived by enumerating the profiles directory and filtering through the
+    exact same predicate the validator and the dispatcher use
+    (``profiles.profile_exists``). Enumerating with one rule and accepting
+    with another is how a suggestion list goes stale and starts recommending
+    names that are then rejected — so there is only one rule here.
+    """
+    try:
+        from hermes_cli.profiles import profile_exists
+        from hermes_constants import get_default_hermes_root
+    except Exception:
+        return []
+    names: list[str] = []
+    if profile_exists("default"):
+        names.append("default")
+    try:
+        profiles_dir = get_default_hermes_root() / "profiles"
+        entries = sorted(p.name for p in profiles_dir.iterdir() if p.is_dir())
+    except Exception:
+        entries = []
+    names.extend(n for n in entries if n != "default" and profile_exists(n))
+    return names
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -3228,7 +3308,7 @@ def create_task(
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
     if provider_override and not model_override:
         raise ValueError("provider_override requires a model_override")
-    assignee = _canonical_assignee(assignee)
+    assignee = ensure_runnable_assignee(assignee)
     if not title or not title.strip():
         raise ValueError("title is required")
     if initial_status not in VALID_INITIAL_STATUSES:
@@ -3704,8 +3784,12 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
 
     Refuses to reassign a task that's currently running (claim_lock set).
     Reassign after the current run completes if needed.
+
+    Raises :class:`UnknownAssigneeError` when *profile* is a non-empty name
+    with no installed profile on disk — such a card could never be
+    dispatched. ``None`` (unassign) remains supported.
     """
-    profile = _canonical_assignee(profile)
+    profile = ensure_runnable_assignee(profile)
     with write_txn(conn):
         row = conn.execute(
             "SELECT status, claim_lock, assignee FROM tasks WHERE id = ?", (task_id,)
@@ -7213,7 +7297,7 @@ def specify_triage_task(
     """
     if title is not None and not title.strip():
         raise ValueError("title cannot be blank")
-    assignee = _canonical_assignee(assignee)
+    assignee = ensure_runnable_assignee(assignee)
     with write_txn(conn):
         existing = conn.execute(
             "SELECT title, body, assignee FROM tasks WHERE id = ? AND status = 'triage'",
@@ -10621,6 +10705,60 @@ def _memory_pressure_level(sample: Optional[Mapping[str, Any]] = None) -> str:
         return "unknown"
 
 
+def _emit_assignee_not_runnable(
+    conn: sqlite3.Connection,
+    task_id: str,
+    assignee: str,
+    lane: str,
+) -> None:
+    """Record a one-shot durable diagnostic for a non-runnable assignee.
+
+    The dispatcher fails CLOSED on legacy cards whose assignee has no
+    installed profile: it refuses to spawn and leaves every field on the row
+    untouched (no reassign, no archive, no claim). Without a durable event
+    that card is indistinguishable from one that is merely waiting, so
+    operators cannot tell placeholder ownership from real work.
+
+    Emitted at most once per (task, assignee): the dispatcher re-evaluates
+    the same row on every tick, and an unbounded event stream would bury the
+    task's real history. Re-emits when the assignee changes, so a card moved
+    from one dead label to another still gets a fresh diagnostic.
+    """
+    try:
+        prior = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? "
+            "AND kind = 'assignee_not_runnable' ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if prior is not None:
+            try:
+                payload = json.loads(prior["payload"]) if prior["payload"] else {}
+            except Exception:
+                payload = {}
+            if payload.get("assignee") == assignee:
+                return
+        with write_txn(conn):
+            _append_event(
+                conn, task_id, "assignee_not_runnable",
+                {
+                    "assignee": assignee,
+                    "lane": lane,
+                    "reason": (
+                        f"assignee {assignee!r} has no installed Hermes "
+                        "profile; the task was NOT spawned and its fields "
+                        "were left unchanged. Reassign it to an installed "
+                        "profile (`hermes kanban assignees`) or create that "
+                        f"profile with `hermes -p {assignee} setup`."
+                    ),
+                },
+            )
+    except Exception:
+        _log.debug(
+            "kanban dispatch: failed to emit assignee_not_runnable for %s",
+            task_id, exc_info=True,
+        )
+
+
 def dispatch_once(
     conn: sqlite3.Connection,
     *,
@@ -10996,6 +11134,8 @@ def _dispatch_once_locked(
             # multi-lane setups where the ready queue is steadily full
             # of human-pulled work.
             result.skipped_nonspawnable.append(row["id"])
+            if not dry_run:
+                _emit_assignee_not_runnable(conn, row["id"], row_assignee, "ready")
             continue
         # Per-profile concurrency cap (#21582): even if there's global
         # headroom, refuse to spawn for an assignee that's already at
@@ -11154,6 +11294,10 @@ def _dispatch_once_locked(
             profile_exists = None  # type: ignore[assignment]
         if profile_exists is not None and not profile_exists(row["assignee"]):
             result.skipped_nonspawnable.append(row["id"])
+            if not dry_run:
+                _emit_assignee_not_runnable(
+                    conn, row["id"], row["assignee"], "review"
+                )
             continue
         if _per_profile_cap is not None:
             current = _per_profile_running.get(row["assignee"], 0)

@@ -626,29 +626,32 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
-        task_id = kanban_db.create_task(
-            conn,
-            title=payload.title,
-            body=payload.body,
-            assignee=payload.assignee,
-            created_by="dashboard",
-            workspace_kind=payload.workspace_kind,
-            workspace_path=payload.workspace_path,
-            tenant=payload.tenant,
-            priority=payload.priority,
-            parents=payload.parents,
-            triage=payload.triage,
-            idempotency_key=payload.idempotency_key,
-            max_runtime_seconds=payload.max_runtime_seconds,
-            skills=payload.skills,
-            goal_mode=payload.goal_mode,
-            goal_max_turns=payload.goal_max_turns,
-            model_override=payload.model_override,
-            provider_override=payload.provider_override,
-            reasoning_effort=payload.reasoning_effort,
-            project_id=payload.project_id,
-            board=board,
-        )
+        try:
+            task_id = kanban_db.create_task(
+                conn,
+                title=payload.title,
+                body=payload.body,
+                assignee=payload.assignee,
+                created_by="dashboard",
+                workspace_kind=payload.workspace_kind,
+                workspace_path=payload.workspace_path,
+                tenant=payload.tenant,
+                priority=payload.priority,
+                parents=payload.parents,
+                triage=payload.triage,
+                idempotency_key=payload.idempotency_key,
+                max_runtime_seconds=payload.max_runtime_seconds,
+                skills=payload.skills,
+                goal_mode=payload.goal_mode,
+                goal_max_turns=payload.goal_max_turns,
+                model_override=payload.model_override,
+                provider_override=payload.provider_override,
+                reasoning_effort=payload.reasoning_effort,
+                project_id=payload.project_id,
+                board=board,
+            )
+        except kanban_db.UnknownAssigneeError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
         task = kanban_db.get_task(conn, task_id)
         body: dict[str, Any] = {"task": _task_dict(task) if task else None}
         # Surface a dispatcher-presence warning so the UI can show a
@@ -875,6 +878,14 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
         task = kanban_db.get_task(conn, task_id)
         if task is None:
             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
+
+        # Reject a non-runnable owner BEFORE any other field of the patch is
+        # applied: a combined {assignee, status} patch must not half-land.
+        if payload.assignee is not None:
+            try:
+                kanban_db.ensure_runnable_assignee(payload.assignee)
+            except kanban_db.UnknownAssigneeError as exc:
+                raise HTTPException(status_code=400, detail=str(exc))
 
         review_assignee_deferred = (
             payload.status == "review" and payload.assignee is not None
@@ -1324,6 +1335,15 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
     ids = [i for i in (payload.ids or []) if i]
     if not ids:
         raise HTTPException(status_code=400, detail="ids is required")
+    # Validate the shared assignee ONCE, up front. Per-task iteration is
+    # independent by design, but a bad assignee is a property of the PATCH,
+    # not of any task — letting it through would stamp placeholder ownership
+    # across the whole selection before failing.
+    if payload.assignee is not None:
+        try:
+            kanban_db.ensure_runnable_assignee(payload.assignee)
+        except kanban_db.UnknownAssigneeError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
     results: list[dict] = []
     board = _resolve_board(board)
     conn = _conn(board=board)
@@ -1864,12 +1884,15 @@ def reassign_task_endpoint(
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
-        ok = kanban_db.reassign_task(
-            conn, task_id,
-            payload.profile or None,
-            reclaim_first=bool(payload.reclaim_first),
-            reason=payload.reason,
-        )
+        try:
+            ok = kanban_db.reassign_task(
+                conn, task_id,
+                payload.profile or None,
+                reclaim_first=bool(payload.reclaim_first),
+                reason=payload.reason,
+            )
+        except kanban_db.UnknownAssigneeError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
         if not ok:
             raise HTTPException(
                 status_code=409,

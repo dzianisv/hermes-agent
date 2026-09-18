@@ -211,7 +211,19 @@ def test_max_spawn_stays_per_board(kanban_home, all_assignees_spawnable):
 
 
 def _park_in_review(conn: sqlite3.Connection, title: str, assignee: str) -> str:
-    tid = kb.create_task(conn, title=title, assignee=assignee)
+    """Seed a task parked in the ``review`` lane under *assignee*.
+
+    *assignee* may name a lane with no installed profile (a human review
+    queue, or a legacy placeholder). ``create_task`` now refuses to WRITE
+    such an owner (card t_e36115cf), so the row is created under a runnable
+    owner and its assignee is then set directly — which is exactly how the
+    legacy rows this lane must tolerate already exist in real boards. Going
+    through the validated path here would test the validator, not the
+    dispatcher budget these tests are about.
+    """
+    tid = kb.create_task(conn, title=title)
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET assignee = ? WHERE id = ?", (assignee, tid))
     _set_task_status(conn, tid, "review")
     return tid
 

@@ -1747,3 +1747,35 @@ def _moa_caches_isolated():
     yield
     moa._preset_cache.clear()
     moa._runtime_cache.clear()
+
+
+@pytest.fixture(autouse=True)
+def _synthetic_assignees_are_runnable(request, monkeypatch):
+    """Pretend every kanban assignee maps to a real Hermes profile.
+
+    Kanban tests across the tree create tasks owned by synthetic assignees
+    ("alice", "bob", "worker") that have no profile directory on disk. Two
+    guards reject those against a real filesystem:
+
+    * the dispatcher's profile-exists gate (PR #20105), which routes such
+      tasks into ``skipped_nonspawnable`` instead of spawning;
+    * ``kanban_db.ensure_runnable_assignee``, which refuses to WRITE a task
+      owned by a name that has no installed profile (card t_e36115cf).
+
+    This lives in the ROOT conftest on purpose. A per-directory copy only
+    covers the directories someone remembered to copy it into, so a kanban
+    test in any other suite (``tests/tools/``, a future directory) fails
+    against the real predicate for reasons unrelated to what it asserts.
+
+    Tests that need the REAL predicate — the guards' own tests — opt out with
+    ``@pytest.mark.real_profile_gate``. Tests that want a specific subset
+    re-patch ``profile_exists`` themselves; their monkeypatch runs after this
+    one and wins.
+    """
+    if request.node.get_closest_marker("real_profile_gate"):
+        return
+    try:
+        from hermes_cli import profiles
+        monkeypatch.setattr(profiles, "profile_exists", lambda name: True)
+    except Exception:
+        return
