@@ -3166,6 +3166,31 @@ class UnknownAssigneeError(ValueError):
     """
 
 
+def _assignee_profile_exists(name: str) -> bool:
+    """Kanban's own seam onto :func:`hermes_cli.profiles.profile_exists`.
+
+    Every kanban consumer of the profile-exists predicate — the validator, the
+    suggestion list, the dispatcher's fail-closed admission and the health
+    telemetry — goes through THIS function rather than importing
+    ``profiles.profile_exists`` directly.
+
+    The reason is test scoping. Kanban tests across the tree own tasks with
+    synthetic assignees ("alice", "worker") that were never installed, so the
+    suite needs a gate that makes those resolve. Patching the shared
+    ``profiles.profile_exists`` to do that reaches web_server profile scoping,
+    cron profile validation, session_search and gateway resolution as well,
+    which either breaks their negative-path tests or — worse — makes them pass
+    vacuously. A kanban-local seam gives the gate a surface with a kanban-sized
+    blast radius.
+
+    Returns False when the profiles module cannot be imported at all; callers
+    that must fail OPEN check importability separately.
+    """
+    from hermes_cli.profiles import profile_exists
+
+    return bool(profile_exists(name))
+
+
 def ensure_runnable_assignee(assignee: Optional[str]) -> Optional[str]:
     """Canonicalize *assignee* and assert it names a runnable profile.
 
@@ -3190,14 +3215,14 @@ def ensure_runnable_assignee(assignee: Optional[str]) -> Optional[str]:
     canon = _canonical_assignee(assignee)
     assert canon is not None  # non-blank input always canonicalizes
     try:
-        from hermes_cli.profiles import profile_exists
+        from hermes_cli.profiles import profile_exists  # noqa: F401
     except Exception:
         # Profiles module unavailable (exotic embedding). Fail OPEN here
         # rather than bricking every write: the dispatcher performs the same
         # check independently and fails CLOSED before spawning, so a bad
         # assignee still cannot execute.
         return canon
-    if profile_exists(canon):
+    if _assignee_profile_exists(canon):
         return canon
     known = ", ".join(_runnable_assignee_candidates()) or "(none installed)"
     raise UnknownAssigneeError(
@@ -3219,19 +3244,21 @@ def _runnable_assignee_candidates() -> list[str]:
     names that are then rejected — so there is only one rule here.
     """
     try:
-        from hermes_cli.profiles import profile_exists
+        from hermes_cli.profiles import profile_exists  # noqa: F401
         from hermes_constants import get_default_hermes_root
     except Exception:
         return []
     names: list[str] = []
-    if profile_exists("default"):
+    if _assignee_profile_exists("default"):
         names.append("default")
     try:
         profiles_dir = get_default_hermes_root() / "profiles"
         entries = sorted(p.name for p in profiles_dir.iterdir() if p.is_dir())
     except Exception:
         entries = []
-    names.extend(n for n in entries if n != "default" and profile_exists(n))
+    names.extend(
+        n for n in entries if n != "default" and _assignee_profile_exists(n)
+    )
     return names
 
 
@@ -10459,12 +10486,12 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
     if not rows:
         return False
     try:
-        from hermes_cli.profiles import profile_exists  # local import: avoids cycle
+        from hermes_cli.profiles import profile_exists  # noqa: F401  (import guard)
     except Exception:
         # Can't introspect — assume spawnable, preserve legacy behavior.
         return True
     for row in rows:
-        if profile_exists(row["assignee"]):
+        if _assignee_profile_exists(row["assignee"]):
             return True
     return False
 
@@ -10485,11 +10512,11 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
     if not rows:
         return False
     try:
-        from hermes_cli.profiles import profile_exists  # local import: avoids cycle
+        from hermes_cli.profiles import profile_exists  # noqa: F401  (import guard)
     except Exception:
         return True
     for row in rows:
-        if profile_exists(row["assignee"]):
+        if _assignee_profile_exists(row["assignee"]):
             return True
     return False
 
@@ -11016,13 +11043,14 @@ def _dispatch_once_locked(
         if not review_rows:
             return False
         try:
-            from hermes_cli.profiles import profile_exists as _rpe
+            from hermes_cli.profiles import profile_exists as _rpe  # noqa: F401
         except Exception:
             # Profiles module unavailable (test stubs, exotic envs) —
             # assume spawnable, matching the review loop's own fallback.
             return any(row["assignee"] for row in review_rows)
         return any(
-            row["assignee"] and _rpe(row["assignee"]) for row in review_rows
+            row["assignee"] and _assignee_profile_exists(row["assignee"])
+            for row in review_rows
         )
 
     ready_budget = spawn_budget
@@ -11056,8 +11084,10 @@ def _dispatch_once_locked(
     _default_assignee_resolved = False
     if _default_assignee:
         try:
-            from hermes_cli.profiles import profile_exists as _pe
-            _default_assignee_resolved = bool(_pe(_default_assignee))
+            from hermes_cli.profiles import profile_exists as _pe  # noqa: F401
+            _default_assignee_resolved = bool(
+                _assignee_profile_exists(_default_assignee)
+            )
         except Exception:
             # Profiles module not importable (test stubs, exotic envs).
             # Trust the operator's config and try the assignment; the
@@ -11126,7 +11156,7 @@ def _dispatch_once_locked(
             from hermes_cli.profiles import profile_exists  # local import: avoids cycle
         except Exception:
             profile_exists = None  # type: ignore[assignment]
-        if profile_exists is not None and not profile_exists(row_assignee):
+        if profile_exists is not None and not _assignee_profile_exists(row_assignee):
             # Bucket separately from skipped_unassigned: the operator
             # cannot fix this by assigning a profile (the assignee IS the
             # intended owner — a terminal lane). Health telemetry uses
@@ -11292,7 +11322,7 @@ def _dispatch_once_locked(
             from hermes_cli.profiles import profile_exists
         except Exception:
             profile_exists = None  # type: ignore[assignment]
-        if profile_exists is not None and not profile_exists(row["assignee"]):
+        if profile_exists is not None and not _assignee_profile_exists(row["assignee"]):
             result.skipped_nonspawnable.append(row["id"])
             if not dry_run:
                 _emit_assignee_not_runnable(

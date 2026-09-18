@@ -16,8 +16,15 @@ def all_assignees_spawnable(monkeypatch):
 
 
 def _patch_profile_exists(monkeypatch):
-    from hermes_cli import profiles
-    monkeypatch.setattr(profiles, "profile_exists", lambda name: True)
+    """Patch kanban's profile-exists seam, not the shared predicate.
+
+    See ``_synthetic_assignees_are_runnable`` in the root conftest: stubbing
+    ``profiles.profile_exists`` reaches web_server/cron/gateway validation.
+    """
+    from hermes_cli import kanban_db
+    monkeypatch.setattr(
+        kanban_db, "_assignee_profile_exists", lambda name: True
+    )
 
 
 @pytest.fixture(autouse=True)

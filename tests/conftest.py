@@ -1767,15 +1767,26 @@ def _synthetic_assignees_are_runnable(request, monkeypatch):
     test in any other suite (``tests/tools/``, a future directory) fails
     against the real predicate for reasons unrelated to what it asserts.
 
+    It patches ``kanban_db._assignee_profile_exists`` — kanban's own seam —
+    and NOT the shared ``hermes_cli.profiles.profile_exists``. The shared
+    predicate is consumed by web_server profile scoping, cron profile
+    validation, ``session_search`` and gateway resolution; stubbing it
+    tree-wide turned ``test_unknown_profile_returns_404`` and
+    ``test_cron_profile_validation_errors`` red and would have made every
+    other "unknown profile is rejected" assertion pass vacuously. A
+    kanban-sized gate needs a kanban-sized blast radius.
+
     Tests that need the REAL predicate — the guards' own tests — opt out with
     ``@pytest.mark.real_profile_gate``. Tests that want a specific subset
-    re-patch ``profile_exists`` themselves; their monkeypatch runs after this
-    one and wins.
+    re-patch the seam themselves; their monkeypatch runs after this one and
+    wins.
     """
     if request.node.get_closest_marker("real_profile_gate"):
         return
     try:
-        from hermes_cli import profiles
-        monkeypatch.setattr(profiles, "profile_exists", lambda name: True)
+        from hermes_cli import kanban_db
+        monkeypatch.setattr(
+            kanban_db, "_assignee_profile_exists", lambda name: True
+        )
     except Exception:
         return
