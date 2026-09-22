@@ -660,7 +660,7 @@ def test_dispatch_text_and_daemon_stuck_warning_name_guard_reason(
             on_tick(res)
 
     monkeypatch.setattr(kanban_ops.kbd, "run_daemon", _fake_daemon)
-    monkeypatch.setattr(kanban_ops.kbd, "has_spawnable_ready", lambda conn: True)
+    monkeypatch.setattr(kanban_ops.kbd, "has_spawnable_ready", lambda conn, exclude_ids=None: True)
     monkeypatch.setattr(kanban_ops.kb, "init_db", lambda *a, **k: None)
     assert kanban_ops._cmd_daemon(
         SimpleNamespace(force=True, interval=5, max=None, failure_limit=2, verbose=False, pidfile=None)

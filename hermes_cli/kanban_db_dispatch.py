@@ -607,20 +607,67 @@ def _defer_reclaim_for_live_worker(
         _kb._append_event(conn, task_id, "reclaim_deferred", payload, run_id=run_id)
 
 
+# Heartbeat outcome kinds. ``ok`` is self-explanatory; the two failure kinds are
+# what a bare ``False`` collapsed together and which the worker-facing tool must
+# be able to tell apart (see HeartbeatResult).
+HEARTBEAT_OK = "ok"
+HEARTBEAT_UNKNOWN_TASK = "unknown_task"
+HEARTBEAT_SUPERSEDED = "superseded"
+
+
+@dataclass(frozen=True)
+class HeartbeatResult:
+    """Structured outcome of :func:`heartbeat_worker`.
+
+    ``heartbeat_worker`` used to return a bare ``bool``, which made "you typed an
+    id that does not exist" indistinguishable from "your run was superseded —
+    stop working". A live worker whose run had been closed by ``block_task`` and
+    whose card was then unblocked kept running for 4h45m against a card it no
+    longer owned (card t_6a6ac2d3), because the only signal it ever got was the
+    generic ``unknown id or not running``.
+
+    Truthiness is preserved (``__bool__`` -> ``ok``) so every existing
+    ``if not heartbeat_worker(...)`` call site keeps working unchanged.
+    """
+
+    ok: bool
+    kind: str
+    task_status: Optional[str] = None
+    expected_run_id: Optional[int] = None
+    current_run_id: Optional[int] = None
+
+    def __bool__(self) -> bool:
+        return self.ok
+
+    @property
+    def superseded(self) -> bool:
+        return self.kind == HEARTBEAT_SUPERSEDED
+
+    @property
+    def unknown_task(self) -> bool:
+        return self.kind == HEARTBEAT_UNKNOWN_TASK
+
+
 def heartbeat_worker(
     conn: sqlite3.Connection,
     task_id: str,
     *,
     note: Optional[str] = None,
     expected_run_id: Optional[int] = None,
-) -> bool:
+) -> HeartbeatResult:
     """Record a ``heartbeat`` event + touch ``last_heartbeat_at``.
 
     Liveness signal orthogonal to the PID check: a worker whose forked child
     (train loop, crawl) is stuck can still have a live Python process.
-    Returns False if the task is not running or its claim expired.
+
+    Returns a :class:`HeartbeatResult` — falsy when the task is not running or
+    its claim expired (so legacy ``bool`` callers are unaffected), with ``kind``
+    distinguishing ``ok``, ``unknown_task`` (no such task row at all) and
+    ``superseded`` (the task exists but this run no longer owns it). Only the
+    superseded case means "stop and exit".
     """
     now = int(time.time())
+    held_run = int(expected_run_id) if expected_run_id is not None else None
     with _kb.write_txn(conn):
         sql = "UPDATE tasks SET last_heartbeat_at = ? WHERE id = ? AND status = 'running'"
         params: tuple = (now, task_id)
@@ -629,7 +676,22 @@ def heartbeat_worker(
             params += (int(expected_run_id),)
         cur = conn.execute(sql, params)
         if cur.rowcount != 1:
-            return False
+            row = conn.execute(
+                "SELECT status, current_run_id FROM tasks WHERE id = ?", (task_id,),
+            ).fetchone()
+            if row is None:
+                return HeartbeatResult(
+                    ok=False, kind=HEARTBEAT_UNKNOWN_TASK, expected_run_id=held_run,
+                )
+            return HeartbeatResult(
+                ok=False,
+                kind=HEARTBEAT_SUPERSEDED,
+                task_status=row["status"],
+                expected_run_id=held_run,
+                current_run_id=(
+                    int(row["current_run_id"]) if row["current_run_id"] else None
+                ),
+            )
         run_id = (
             int(expected_run_id)
             if expected_run_id is not None
@@ -642,7 +704,13 @@ def heartbeat_worker(
             {"note": note} if note else None,
             run_id=run_id,
         )
-    return True
+    return HeartbeatResult(
+        ok=True,
+        kind=HEARTBEAT_OK,
+        task_status="running",
+        expected_run_id=held_run,
+        current_run_id=run_id,
+    )
 
 
 def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str]:
@@ -1488,10 +1556,85 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
         )
 
 
+# Event kinds that constitute a DELIBERATE re-queue of a card: somebody
+# (operator, dependency promotion, recovery path, reviewer) put the task back
+# into a dispatchable phase on purpose.
+#
+# Consumed by exactly ONE predicate, ``_deliberate_requeue_after``, which every
+# respawn-guard rule is run through. It deliberately does NOT get copied into
+# individual rules: rule 4 (``active_pr``) carried its own private bypass and an
+# operator ``unblock`` was missing from it, which deadlocked card t_6a6ac2d3 for
+# 4h45m (~170 ``respawn_guarded {"reason":"active_pr"}`` events, zero spawns).
+# One definition, applied uniformly, is the fix.
+_REQUEUE_EVENT_KINDS = (
+    "status",           # operator dragged the card between columns
+    "promoted",         # dependency graph opened the card up
+    "unblocked",        # operator / EM cleared a block
+    "reclaimed",        # recovery path put the card back in its lane
+    "review_reopened",  # reviewer sent the card back to the implementer
+)
+
+
+def _deliberate_requeue_after(
+    conn: sqlite3.Connection, task_id: str, evidence_at: Optional[int],
+) -> bool:
+    """True when a deliberate re-queue landed at/after ``evidence_at``.
+
+    ``evidence_at`` is the timestamp of the thing a guard rule is deferring on —
+    the completed run's ``ended_at``, the PR comment's ``created_at``. Comparing
+    per-rule (rather than against one global "last re-queue" timestamp) is
+    load-bearing: an unblock that PREDATES the PR comment says nothing about
+    that comment and must not bypass ``active_pr``.
+
+    ``evidence_at is None`` means the rule has no timestamped evidence to
+    supersede (``blocker_auth``) or opts out on purpose (the two cooldowns,
+    which are timers rather than stale evidence) — the answer is always False.
+
+    ``>=`` rather than ``>``: this is rule 3's pre-existing comparison, kept
+    byte-for-byte in behaviour. The strictly-after fail-closed tie belongs to
+    ``_is_handoff_event``'s own lookup inside rule 4, which is untouched.
+    """
+    if evidence_at is None:
+        return False
+    placeholders = ",".join("?" * len(_REQUEUE_EVENT_KINDS))
+    return conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id = ? AND created_at >= ? "
+        f"AND kind IN ({placeholders}) LIMIT 1",
+        (task_id, int(evidence_at), *_REQUEUE_EVENT_KINDS),
+    ).fetchone() is not None
+
+
 def check_respawn_guard(
     conn: sqlite3.Connection, task_id: str, *, lane: str = "ready",
 ) -> Optional[str]:
     """Return a guard reason if ``task_id`` should NOT be re-spawned, else None.
+
+    Thin wrapper over :func:`_respawn_guard_rules`, which yields the applicable
+    ``(reason, evidence_at)`` candidates in priority order. This function applies
+    the ONE shared re-queue bypass (``_deliberate_requeue_after``) to each of
+    them and returns the first reason that survives it; a bypassed rule falls
+    through to the next one exactly as rule 3's inline bypass used to. A rule
+    added later inherits the bypass by construction: it cannot report a reason
+    without also naming the evidence it defers on.
+    """
+    for reason, evidence_at in _respawn_guard_rules(conn, task_id, lane=lane):
+        if _deliberate_requeue_after(conn, task_id, evidence_at):
+            # Somebody deliberately re-queued this card AFTER the evidence this
+            # rule defers on. That is an explicit "run it again" and it outranks
+            # stale evidence.
+            continue
+        return reason
+    return None
+
+
+def _respawn_guard_rules(
+    conn: sqlite3.Connection, task_id: str, *, lane: str = "ready",
+) -> Iterable[tuple[str, Optional[int]]]:
+    """Yield ``(reason, evidence_at)`` guard candidates in priority order.
+
+    ``evidence_at`` is the unix timestamp of the evidence the rule defers on and
+    is what :func:`check_respawn_guard` compares the card's re-queue events
+    against. ``None`` means "not bypassable", and every such return site says why.
 
     Called per ready/review row before any claim attempt. Priority order:
     ``"infrastructure_cooldown"`` (latest run is a ``spawn_failed`` the host
@@ -1514,7 +1657,7 @@ def check_respawn_guard(
         (task_id,),
     ).fetchone()
     if row is None:
-        return None
+        return
 
     now = int(time.time())
 
@@ -1534,19 +1677,28 @@ def check_respawn_guard(
         if rl_cooldown > 0 and _kb._json_dict(latest_run["metadata"]).get("infrastructure"):
             ended_at = latest_run["ended_at"]
             if ended_at is not None and (now - int(ended_at)) < rl_cooldown:
-                return "infrastructure_cooldown"
+                # evidence_at=None ON PURPOSE: like the rate-limit cooldown this
+                # is a TIMER on a HOST condition, not stale evidence about the
+                # card. Touching the card cannot make the host accept a spawn;
+                # the cooldown expires on its own.
+                yield ("infrastructure_cooldown", None)
+                return
     if latest_run is not None and latest_run["outcome"] == "rate_limited":
         if rl_cooldown <= 0:
             # Cooldown disabled — respawn immediately, skipping blocker_auth so
             # the stamped rate-limit text doesn't re-trap the task.
-            return None
+            return
         ended_at = latest_run["ended_at"]
         if ended_at is not None and (now - int(ended_at)) < rl_cooldown:
-            return "rate_limit_cooldown"
+            # evidence_at=None ON PURPOSE: the cooldown is a TIMER, not stale
+            # evidence. Re-probing a quota wall because somebody touched the
+            # card just hammers a bucket already proven empty.
+            yield ("rate_limit_cooldown", None)
+            return
         # Cooldown elapsed — return early so blocker_auth doesn't catch the
         # stamped rate-limit text; this path intentionally retries forever
         # (spaced by the cooldown) until quota returns or a real run supersedes it.
-        return None
+        return
 
     # 2. Quota / auth blocker: retrying immediately will not help.  A plain
     # crash is different: its persisted error includes the worker's last
@@ -1555,17 +1707,24 @@ def check_respawn_guard(
     err = _kb._lossy_text(row["last_failure_error"])
     latest_outcome = latest_run["outcome"] if latest_run is not None else None
     if err and latest_outcome != "crashed" and _RESPAWN_BLOCKER_RE.search(err):
-        return "blocker_auth"
+        # evidence_at=None: ``last_failure_error`` is an untimestamped column, so
+        # there is nothing for a re-queue to be "after". The consecutive-failures
+        # breaker is what eventually frees the card.
+        yield ("blocker_auth", None)
+        return
 
     # Review-lane spawns stop here: a recent completed run and a fresh PR URL
     # are the canonical *inputs* to a review handoff, not duplicate-work signals.
     if lane == "review":
-        return None
+        return
 
-    # 3. Completed run within guard window. Exception: an explicit re-queue
-    #    AFTER that success (done→ready drag, re-promotion, unblock, reclaim) is
-    #    a deliberate "run it again" — otherwise a manual done→ready would sit
-    #    silently held until the window elapses.
+    # 3. Completed run within guard window. Evidence is the completion's
+    #    ``ended_at``: an explicit re-queue AFTER it (done→ready drag,
+    #    re-promotion, unblock, reclaim) is a deliberate "run it again",
+    #    otherwise a manual done→ready would sit silently held until the window
+    #    elapses. That bypass is NOT implemented here — it lives in
+    #    ``check_respawn_guard`` / ``_deliberate_requeue_after`` and is applied
+    #    to every rule uniformly. A bypassed rule 3 still falls through to rule 4.
     cutoff = now - _RESPAWN_GUARD_SUCCESS_WINDOW
     recent_completed = conn.execute(
         "SELECT ended_at FROM task_runs "
@@ -1574,16 +1733,7 @@ def check_respawn_guard(
         (task_id, cutoff),
     ).fetchone()
     if recent_completed:
-        completed_at = int(recent_completed["ended_at"] or 0)
-        requeued_after = conn.execute(
-            "SELECT 1 FROM task_events "
-            "WHERE task_id = ? AND created_at >= ? "
-            "AND kind IN ('status', 'promoted', 'unblocked', 'reclaimed') "
-            "LIMIT 1",
-            (task_id, completed_at),
-        ).fetchone()
-        if not requeued_after:
-            return "recent_success"
+        yield ("recent_success", int(recent_completed["ended_at"] or 0))
 
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
     #    Exception: a handoff AFTER the newest PR comment (operator reassign,
@@ -1591,6 +1741,12 @@ def check_respawn_guard(
     #    now work on THAT PR — a closer or the implementer finishing it, not a
     #    duplicate implementation (#111910). A crash/reclaim is not a handoff,
     #    so the worker that opened the PR is still not re-spawned against it.
+    #
+    #    The reported evidence is the PR comment's ``created_at``, so a
+    #    deliberate re-queue landing after that comment releases the rule via the
+    #    shared bypass. Comparing against THE COMMENT rather than a single global
+    #    "last re-queue" timestamp is load-bearing: an unblock that predates the
+    #    PR comment says nothing about that PR.
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
     for c in conn.execute(
         "SELECT body, created_at FROM task_comments "
@@ -1608,10 +1764,9 @@ def check_respawn_guard(
             (task_id, int(c["created_at"] or 0)),
         ).fetchall()
         if any(_is_handoff_event(e["kind"], e["payload"]) for e in events):
-            return None
-        return "active_pr"
-
-    return None
+            return
+        yield ("active_pr", int(c["created_at"] or 0))
+        return
 
 
 def _is_handoff_event(kind: str, payload: Optional[str]) -> bool:
@@ -1727,12 +1882,48 @@ def dispatch_profile_allowlist_summary() -> str:
             "profile, or the config could not be read — omit the key to allow any)")
 
 
-def _has_spawnable(conn: sqlite3.Connection, status: str) -> bool:
-    rows = conn.execute(
-        "SELECT DISTINCT assignee FROM tasks "
-        "WHERE status = ? AND assignee IS NOT NULL AND claim_lock IS NULL",
-        (status,),
-    ).fetchall()
+def guard_deferred_ids(results) -> set[str]:
+    """Task ids the respawn guard deliberately deferred in ``results``.
+
+    ``results`` is a :class:`DispatchResult`, an iterable of them, or an iterable
+    of ``(board_slug, DispatchResult)`` pairs (the shape the gateway's
+    multi-board tick produces). ``None`` entries are skipped.
+
+    Health telemetry uses this to answer "did this tick fail to spawn because
+    the dispatcher is broken, or because it deliberately chose not to?". A
+    ``respawn_guarded`` deferral is a healthy dispatcher making a decision —
+    exactly like ``skipped_nonspawnable`` — and must not count as a stuck tick.
+    Defined here, next to the guard, so the gateway watcher and the ``--force``
+    CLI daemon cannot drift.
+    """
+    if results is None:
+        return set()
+    items = [results] if isinstance(results, DispatchResult) else list(results)
+    out: set[str] = set()
+    for item in items:
+        if isinstance(item, tuple):
+            item = item[-1]  # (board_slug, result) pair
+        if item is None:
+            continue
+        for entry in getattr(item, "respawn_guarded", None) or []:
+            out.add(entry[0] if isinstance(entry, tuple) else entry)
+    return out
+
+
+def _has_spawnable(
+    conn: sqlite3.Connection,
+    status: str,
+    exclude_ids: Optional[Iterable[str]] = None,
+) -> bool:
+    skip = set(exclude_ids or ())
+    rows = [
+        row for row in conn.execute(
+            "SELECT id, assignee FROM tasks "
+            "WHERE status = ? AND assignee IS NOT NULL AND claim_lock IS NULL",
+            (status,),
+        ).fetchall()
+        if row["id"] not in skip
+    ]
     if not rows:
         return False
     profile_exists = _profile_exists_fn()
@@ -1742,19 +1933,31 @@ def _has_spawnable(conn: sqlite3.Connection, status: str) -> bool:
     return any(profile_exists(row["assignee"]) for row in rows)
 
 
-def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
+def has_spawnable_ready(
+    conn: sqlite3.Connection, exclude_ids: Optional[Iterable[str]] = None,
+) -> bool:
     """True iff a ready+assigned+unclaimed task maps to a real Hermes profile.
 
     Lets health telemetry tell "stuck" (``0 spawned`` with spawnable work) from
     "correctly idle" (only control-plane lanes waiting on ``claim_task``). Falls
     back to "any assigned" when ``profile_exists`` is unimportable.
+
+    ``exclude_ids`` drops specific task ids from consideration — callers pass the
+    ids the respawn guard deferred this tick (see :func:`guard_deferred_ids`). A
+    guard deferral is a deliberate decision by a healthy dispatcher, so a queue
+    holding ONLY deferred cards is "correctly idle", not stuck. Any other
+    spawnable card still makes the tick bad: the telemetry is narrowed per card,
+    never switched off.
     """
-    return _has_spawnable(conn, "ready")
+    return _has_spawnable(conn, "ready", exclude_ids)
 
 
-def has_spawnable_review(conn: sqlite3.Connection) -> bool:
-    """:func:`has_spawnable_ready` for the review column."""
-    return _has_spawnable(conn, "review")
+def has_spawnable_review(
+    conn: sqlite3.Connection, exclude_ids: Optional[Iterable[str]] = None,
+) -> bool:
+    """:func:`has_spawnable_ready` for the review column; ``exclude_ids`` has the
+    same meaning as there."""
+    return _has_spawnable(conn, "review", exclude_ids)
 
 
 def review_dispatch_enabled() -> bool:

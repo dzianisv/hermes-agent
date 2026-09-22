@@ -47,7 +47,7 @@ def test_gateway_dispatcher_stuck_warning_names_guard_reason(monkeypatch, caplog
         def tick_once(self):
             return [("board", held)]
 
-        def ready_nonempty(self):
+        def ready_nonempty(self, exclude_ids=None):
             return True
 
     ticks = {"n": 0}
