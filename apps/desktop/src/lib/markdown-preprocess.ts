@@ -500,6 +500,61 @@ function escapeCurrencyDollarsPreservingMath(text: string): string {
   return out + text.slice(copiedThrough)
 }
 
+// East Asian script and punctuation ranges: CJK Symbols/Punctuation, Hiragana,
+// Katakana, Han (incl. Extension A and compatibility ideographs), Hangul, and
+// the fullwidth/halfwidth forms. Fullwidth punctuation (（） ， ：) is
+// near-universal in CJK prose and is included so a `$foo（bar）$`-shaped span
+// with no Han glyph in its body still classifies as prose.
+const CJK_RE = /[\u3000-\u303f\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uac00-\ud7af\uff00-\uffef]/u
+
+/**
+ * Escape the opening `$` of any same-line single-dollar span whose body
+ * contains East Asian script or punctuation, so remark-math reads it as a
+ * literal dollar instead of pairing it with the later `$` and typesetting the
+ * intervening prose as one KaTeX inline formula (#103546).
+ *
+ * A bare `$identifier` in CJK prose (written twice in one sentence) is the
+ * classic false positive of `singleDollarTextMath: true`: the whole sentence
+ * renders through KaTeX — CJK glyphs in a serif fallback face at 1.21em, and
+ * copy-out yields per-character math-italic codepoints, not the source text.
+ * CJK prose sets no inter-word spaces and rarely writes `$…$` math around
+ * non-Latin text, so a CJK body is prose with near certainty.
+ *
+ * Escaping only the OPENING `$` is enough: the closing `$` loses its partner
+ * and renders literally. Real math is untouched — its body carries no CJK —
+ * and `$$` display runs are skipped by the same `$$`-run guard the currency
+ * escape uses. The one accepted tradeoff: genuine inline math whose body
+ * names a CJK variable (`$x = 变量$`) renders as literal prose. Losing one
+ * equation is far cheaper than corrupting a sentence's copy-out.
+ */
+function escapeCjkProseDollars(text: string): string {
+  let out = ''
+  let copiedThrough = 0
+
+  for (let cursor = 0; cursor < text.length; cursor += 1) {
+    if (text[cursor] !== '$' || text[cursor - 1] === '$' || isEscapedAt(text, cursor)) {
+      continue
+    }
+
+    const closingIndex = findClosingSingleDollar(text, cursor)
+
+    if (closingIndex === -1) {
+      continue
+    }
+
+    const body = text.slice(cursor + 1, closingIndex)
+
+    if (!CJK_RE.test(body)) {
+      continue
+    }
+
+    out += `${text.slice(copiedThrough, cursor)}\\$`
+    copiedThrough = cursor + 1
+  }
+
+  return out + text.slice(copiedThrough)
+}
+
 /**
  * Moves the `$$` delimiters of a MULTI-LINE display-math block onto their own
  * lines: `$$\begin{aligned}` … `\end{aligned}$$` becomes a `$$`-only line, the
@@ -618,8 +673,9 @@ function normalizeProseMath(text: string): string {
   // `$$\begin{aligned}…\end{aligned}$$`. Running afterwards catches both the
   // hugging math the model emitted and the hugging math the rewrite produced.
   const normalized = splitHuggingDisplayMath(normalizeMathDelimiters(normalizeDisplayMathForMarkdown(text)))
+  const cjkEscaped = escapeCjkProseDollars(normalized)
 
-  return escapeCurrencyDollarsPreservingMath(normalized)
+  return escapeCurrencyDollarsPreservingMath(cjkEscaped)
 }
 
 function extend(out: string[], lines: string[]) {

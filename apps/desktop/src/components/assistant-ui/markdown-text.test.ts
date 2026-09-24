@@ -485,4 +485,50 @@ describe('preprocessMarkdown', () => {
 
     expect(output).toBe('Per the paper, $\\sqrt[3]{8}$ is 2.')
   })
+
+  // #103546: a bare `$identifier` twice in CJK prose is not math. The escape
+  // fires on the OPENING `$` of a span whose body carries East Asian script or
+  // punctuation, so remark-math reads it as a literal dollar and the sentence
+  // renders as prose with recoverable copy-out.
+  it('does not pair two bare dollars around CJK prose as inline math (#103546)', () => {
+    const input = '...的经典嫌疑是 **$connection 被别的写者整包覆盖**（丢了 `isFullscreen` 字段）...搜 `$connection` 的所有写者：'
+
+    const output = preprocessMarkdown(input)
+
+    expect(output).toContain('\\$connection 被别的写者整包覆盖')
+    // The backticked `$connection` is untouched — inline code stays code.
+    expect(output).toContain('`$connection`')
+  })
+
+  it('escapes the opening dollar when both identifiers are bare in CJK prose (#103546)', () => {
+    const output = preprocessMarkdown('搜 $connection 的所有写者，再搜 $session 的读者')
+
+    expect(output).toContain('\\$connection')
+  })
+
+  it('escapes a span whose body is fullwidth punctuation plus Latin (#103546)', () => {
+    const output = preprocessMarkdown('值 $foo（bar）$ 已确认')
+
+    expect(output).toContain('\\$foo（bar）$')
+  })
+
+  it('leaves real inline math in CJK prose untouched (#103546)', () => {
+    const output = preprocessMarkdown('代入 $x^2 + y^2$ 得到结果')
+
+    expect(output).toContain('$x^2 + y^2$')
+    expect(output).not.toContain('\\$x^2')
+  })
+
+  it('leaves real inline math adjacent to CJK untouched (#103546)', () => {
+    const output = preprocessMarkdown('其中 $\\alpha = 1$，所以')
+
+    expect(output).toContain('$\\alpha = 1$')
+    expect(output).not.toContain('\\$\\alpha')
+  })
+
+  it('leaves display math in CJK prose untouched (#103546)', () => {
+    const output = preprocessMarkdown('公式 $$E = mc^2$$ 成立')
+
+    expect(output).toContain('$$E = mc^2$$')
+  })
 })
