@@ -1614,3 +1614,232 @@ def test_bare_connect_does_not_close_on_context_exit(tmp_path):
     # Still usable after with-block exit (the leak).
     conn.execute("SELECT 1").fetchone()
     conn.close()  # explicit close to avoid leaking THIS test
+
+
+# ---------------------------------------------------------------------------
+# Native executor spawn path (`tasks.executor`)
+#
+# A card may name a coding-agent CLI; the dispatcher then runs that CLI
+# directly in the workspace and bridges its exit status into complete/block.
+# `executor IS NULL` must keep producing today's `hermes ... chat -q` argv.
+# ---------------------------------------------------------------------------
+
+
+def _native_task(**overrides):
+    fields = dict(
+        id="t_native",
+        title="Write a file",
+        body="Create hello.txt containing hi.",
+        assignee="coder",
+        status="running",
+        priority=0,
+        created_by=None,
+        created_at=0,
+        started_at=None,
+        completed_at=None,
+        workspace_kind="scratch",
+        workspace_path=None,
+        claim_lock=None,
+        claim_expires=None,
+        tenant=None,
+    )
+    fields.update(overrides)
+    return kb.Task(**fields)
+
+
+class _CapturingPopen:
+    """Popen stub that records argv/env/cwd and reports a fixed pid."""
+
+    calls: list = []
+
+    def __init__(self, cmd, **kwargs):
+        type(self).calls.append({"cmd": list(cmd), **kwargs})
+        self.pid = 4242
+
+
+@pytest.fixture
+def spawn_capture(monkeypatch):
+    _CapturingPopen.calls = []
+    monkeypatch.setattr("subprocess.Popen", _CapturingPopen)
+    return _CapturingPopen.calls
+
+
+def test_null_executor_argv_is_unchanged(kanban_home, tmp_path, monkeypatch, spawn_capture):
+    """A card without an executor produces exactly today's worker argv."""
+    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+    monkeypatch.setattr(kb, "_resolve_worker_cli_toolsets", lambda home: None)
+    ws = tmp_path / "ws"
+    ws.mkdir()
+
+    task = _native_task(id="t_plain", executor=None)
+    pid = kb._default_spawn(task, str(ws))
+
+    assert pid == 4242
+    assert spawn_capture[0]["cmd"] == [
+        "hermes",
+        "-p", "coder",
+        "--cli",
+        "--accept-hooks",
+        "chat",
+        "-q", "work kanban task t_plain",
+    ]
+
+
+def test_native_executor_argv_is_built_from_the_registry(
+    kanban_home, tmp_path, monkeypatch, spawn_capture
+):
+    """`--executor pi` runs the CLI (under a supervisor) with title+body."""
+    monkeypatch.setattr("shutil.which", lambda binary: f"/opt/bin/{binary}")
+    ws = tmp_path / "ws"
+    ws.mkdir()
+
+    task = _native_task(executor="pi", provider_override="acme")
+    pid = kb._default_spawn(task, str(ws))
+
+    assert pid == 4242
+    call = spawn_capture[0]
+    # The PID the board records belongs to the supervising wrapper, so crash
+    # detection and the runtime cap keep working unchanged.
+    assert call["cmd"] == [sys.executable, "-m", "hermes_cli.kanban_native_worker"]
+    assert call["cwd"] == str(ws)
+    env = call["env"]
+    import json as _json
+    assert _json.loads(env["HERMES_KANBAN_NATIVE_ARGV"]) == [
+        "/opt/bin/pi",
+        "--print",
+        "--provider", "acme",
+        "Write a file\n\nCreate hello.txt containing hi.",
+    ]
+    assert env["HERMES_KANBAN_TASK"] == "t_native"
+    assert env["HERMES_KANBAN_EXECUTOR"] == "pi"
+    # The spawn event records the CLI argv, never the environment.
+    assert kb._last_spawn_argv["t_native"][0] == "/opt/bin/pi"
+
+
+def test_native_executor_missing_binary_fails_the_spawn(
+    kanban_home, tmp_path, monkeypatch, spawn_capture
+):
+    """A missing CLI is a spawn failure naming the binary — no doomed process."""
+    monkeypatch.setattr("shutil.which", lambda binary: None)
+    ws = tmp_path / "ws"
+    ws.mkdir()
+
+    task = _native_task(executor="claude")
+    with pytest.raises(RuntimeError) as exc:
+        kb._default_spawn(task, str(ws))
+
+    assert "claude" in str(exc.value)
+    assert spawn_capture == []
+
+
+def test_unknown_executor_is_rejected_at_create_time(kanban_home):
+    from hermes_cli.kanban_executors import executor_names
+
+    with kb.connect_closing() as conn:
+        with pytest.raises(ValueError) as exc:
+            kb.create_task(conn, title="x", executor="totally-not-a-cli")
+    message = str(exc.value)
+    for name in executor_names():
+        assert name in message
+
+
+def _native_supervisor_task(conn, tmp_path, argv, log_path):
+    task_id = kb.create_task(
+        conn, title="Native card", body="do it",
+        assignee="coder", executor="pi", initial_status="running",
+    )
+    import json as _json
+    os.environ["HERMES_KANBAN_TASK"] = task_id
+    os.environ["HERMES_KANBAN_NATIVE_ARGV"] = _json.dumps(argv)
+    os.environ["HERMES_KANBAN_NATIVE_LOG"] = str(log_path)
+    os.environ["HERMES_KANBAN_WORKSPACE"] = str(tmp_path)
+    os.environ["HERMES_KANBAN_EXECUTOR"] = "pi"
+    return task_id
+
+
+def test_native_executor_rc_zero_completes_the_task(kanban_home, tmp_path, monkeypatch):
+    from hermes_cli import kanban_native_worker as nw
+
+    log_path = tmp_path / "worker.log"
+    with kb.connect_closing() as conn:
+        task_id = _native_supervisor_task(
+            conn, tmp_path, [sys.executable, "-c", "raise SystemExit(0)"], log_path
+        )
+    for key in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_NATIVE_ARGV",
+                "HERMES_KANBAN_NATIVE_LOG", "HERMES_KANBAN_WORKSPACE",
+                "HERMES_KANBAN_EXECUTOR"):
+        monkeypatch.setenv(key, os.environ[key])
+
+    assert nw.main() == 0
+    with kb.connect_closing() as conn:
+        assert kb.get_task(conn, task_id).status == "done"
+
+
+def test_native_executor_nonzero_blocks_with_the_log_tail(
+    kanban_home, tmp_path, monkeypatch
+):
+    from hermes_cli import kanban_native_worker as nw
+
+    log_path = tmp_path / "worker.log"
+    script = (
+        "import sys;"
+        f"open({str(log_path)!r}, 'a').write('boom: compile error\\n');"
+        "raise SystemExit(3)"
+    )
+    with kb.connect_closing() as conn:
+        task_id = _native_supervisor_task(
+            conn, tmp_path, [sys.executable, "-c", script], log_path
+        )
+    for key in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_NATIVE_ARGV",
+                "HERMES_KANBAN_NATIVE_LOG", "HERMES_KANBAN_WORKSPACE",
+                "HERMES_KANBAN_EXECUTOR"):
+        monkeypatch.setenv(key, os.environ[key])
+
+    assert nw.main() == 0
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, task_id)
+        assert task.status == "blocked"
+        events = kb.list_events(conn, task_id)
+    reasons = " ".join(str(e.payload) for e in events)
+    assert "exited with code 3" in reasons
+    assert "boom: compile error" in reasons
+
+
+def test_native_clean_exit_is_not_a_protocol_violation(kanban_home, monkeypatch):
+    """rc=0 from a native run is the protocol, not a violation.
+
+    A Hermes worker in the same sweep still gets the violation treatment —
+    the rule is narrowed to native-executor rows only.
+    """
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+    monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
+    host = kb._claimer_id().split(":", 1)[0]
+
+    with kb.connect_closing() as conn:
+        native_id = kb.create_task(
+            conn, title="native", assignee="coder",
+            executor="pi", initial_status="running",
+        )
+        hermes_id = kb.create_task(
+            conn, title="hermes worker", assignee="coder",
+            initial_status="running",
+        )
+        with kb.write_txn(conn):
+            for tid, pid in ((native_id, 991001), (hermes_id, 991002)):
+                conn.execute(
+                    "UPDATE tasks SET status = 'running', worker_pid = ?, "
+                    "claim_lock = ?, started_at = 0 WHERE id = ?",
+                    (pid, f"{host}:1", tid),
+                )
+        kb._record_worker_exit(991001, 0)
+        kb._record_worker_exit(991002, 0)
+
+        kb.detect_crashed_workers(conn)
+
+        native_events = [e.kind for e in kb.list_events(conn, native_id)]
+        hermes_events = [e.kind for e in kb.list_events(conn, hermes_id)]
+
+    assert "protocol_violation" not in native_events
+    assert "crashed" in native_events
+    # The rule is untouched for ordinary Hermes workers.
+    assert "protocol_violation" in hermes_events

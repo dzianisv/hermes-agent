@@ -87,7 +87,7 @@ import time
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Optional
+from typing import Any, Iterable, Mapping, Optional, Sequence
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
@@ -1141,6 +1141,13 @@ class Task:
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
+    # Native coding-agent CLI that executes this card instead of a Hermes
+    # worker (one of ``kanban_executors.EXECUTORS``). NULL — the default and
+    # the behaviour of every pre-existing row — means the classic
+    # ``hermes -p <profile> chat -q ...`` worker. When set, the dispatcher
+    # runs that CLI directly in the workspace with title+body as the prompt
+    # and bridges its exit status to complete/block.
+    executor: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1234,6 +1241,9 @@ class Task:
                 int(row["block_recurrences"])
                 if "block_recurrences" in keys and row["block_recurrences"] is not None
                 else 0
+            ),
+            executor=(
+                row["executor"] if "executor" in keys and row["executor"] else None
             ),
         )
 
@@ -1422,7 +1432,13 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- Native coding-agent CLI that executes this card (see
+    -- hermes_cli/kanban_executors.py). NULL = the classic Hermes worker,
+    -- which is what every pre-existing row keeps. When set, the dispatcher
+    -- runs that CLI in the workspace with the card's title+body as the
+    -- prompt and bridges its exit status into complete/block.
+    executor             TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -2679,6 +2695,11 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "block_recurrences INTEGER NOT NULL DEFAULT 0",
         )
 
+    if "executor" not in cols:
+        # Native coding-agent CLI for this card. NULL on every existing row,
+        # which is exactly the pre-existing behaviour (Hermes worker).
+        _add_column_if_missing(conn, "tasks", "executor", "executor TEXT")
+
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
     # parses each statement in ``executescript`` against the live schema, so a
@@ -3178,6 +3199,7 @@ def create_task(
     reasoning_effort: Optional[str] = None,
     goal_mode: bool = False,
     goal_max_turns: Optional[int] = None,
+    executor: Optional[str] = None,
     initial_status: str = "running",
     session_id: Optional[str] = None,
     board: Optional[str] = None,
@@ -3225,6 +3247,13 @@ def create_task(
     """
     model_override = (model_override or "").strip() or None
     provider_override = (provider_override or "").strip() or None
+    # Validate the executor name at CREATE time (loudly, listing the valid
+    # names) rather than at dispatch time — a card that names an executor
+    # nobody implements can never run, and finding that out on the board is
+    # far worse than finding it out at the prompt.
+    from hermes_cli.kanban_executors import normalize_executor
+
+    executor = normalize_executor(executor)
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
     if provider_override and not model_override:
         raise ValueError("provider_override requires a model_override")
@@ -3497,8 +3526,8 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id, executor
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3524,6 +3553,7 @@ def create_task(
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
+                        executor,
                     ),
                 )
                 for pid in parents:
@@ -3552,6 +3582,7 @@ def create_task(
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
+                        "executor": executor,
                     },
                 )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
@@ -8425,7 +8456,11 @@ def _record_worker_exit(pid: int, raw_status: int) -> None:
             _recent_worker_exits.pop(_pid, None)
 
 
-def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
+def _classify_worker_exit(
+    pid: int,
+    *,
+    native_executor: bool = False,
+) -> "tuple[str, Optional[int]]":
     """Classify a recently-reaped worker by pid.
 
     Returns ``(kind, code)`` where ``kind`` is one of:
@@ -8434,6 +8469,12 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
       task is still ``running`` in the DB, this is a protocol violation
       (worker exited without calling ``kanban_complete`` / ``kanban_block``)
       and should be auto-blocked immediately — retrying will just loop.
+    * ``"native_exit"`` — same as ``clean_exit`` but for a run whose card
+      names a native executor (``native_executor=True``). There the CLI's
+      exit status IS the protocol: the supervising wrapper already drove the
+      task to a terminal state, so rc=0 is never a protocol violation. It
+      only reaches the reclaim path at all when the finalizing write did not
+      land, which is an ordinary retryable failure, not a violation.
     * ``"rate_limited"`` — ``WIFEXITED`` with status
       ``KANBAN_RATE_LIMIT_EXIT_CODE``. The worker bailed because the
       provider rate-limited / exhausted quota, NOT because the task failed.
@@ -8445,9 +8486,9 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
       something else, or died between reap tick and liveness check). Fall
       back to existing crashed-counter behavior.
 
-    ``code`` is the exit status (for ``clean_exit`` / ``rate_limited`` /
-    ``nonzero_exit``) or the signal number (for ``signaled``), or ``None``
-    for ``unknown``.
+    ``code`` is the exit status (for ``clean_exit`` / ``native_exit`` /
+    ``rate_limited`` / ``nonzero_exit``) or the signal number (for
+    ``signaled``), or ``None`` for ``unknown``.
     """
     entry = _recent_worker_exits.get(int(pid))
     if entry is None:
@@ -8457,7 +8498,7 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
         if os.WIFEXITED(raw):
             code = os.WEXITSTATUS(raw)
             if code == 0:
-                return ("clean_exit", 0)
+                return ("native_exit" if native_executor else "clean_exit", 0)
             if code == KANBAN_RATE_LIMIT_EXIT_CODE:
                 return ("rate_limited", code)
             return ("nonzero_exit", code)
@@ -9618,7 +9659,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     exited_hook_payloads: list[dict] = []
     with write_txn(conn):
         rows = conn.execute(
-            "SELECT id, worker_pid, claim_lock, started_at, assignee "
+            "SELECT id, worker_pid, claim_lock, started_at, assignee, executor "
             "FROM tasks "
             "WHERE status = 'running' AND worker_pid IS NOT NULL"
         ).fetchall()
@@ -9640,9 +9681,33 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 continue
 
             pid = int(row["worker_pid"])
-            kind, code = _classify_worker_exit(pid)
+            row_keys = set(row.keys())
+            native = bool(
+                "executor" in row_keys and (row["executor"] or "").strip()
+            )
+            kind, code = _classify_worker_exit(pid, native_executor=native)
             rate_limited_exit = False
-            if kind == "clean_exit":
+            if kind == "native_exit":
+                # Native-executor run: the supervising wrapper turns the CLI's
+                # exit status into complete/block, so a task still ``running``
+                # here means that finalizing write never landed (DB error,
+                # killed supervisor). Retryable failure — explicitly NOT a
+                # protocol violation: the CLI never had a kanban protocol to
+                # violate. The violation rule for Hermes workers is untouched.
+                protocol_violation = False
+                error_text = (
+                    f"native executor run (pid {pid}) exited rc=0 but the task "
+                    f"was never finalized — requeued"
+                )
+                event_kind = "crashed"
+                event_payload = {
+                    "pid": pid,
+                    "claimer": row["claim_lock"],
+                    "exit_kind": kind,
+                    "exit_code": code,
+                    "executor": row["executor"],
+                }
+            elif kind == "clean_exit":
                 # Worker subprocess returned 0 but its task is still
                 # ``running`` in the DB — it exited without calling
                 # ``kanban_complete`` / ``kanban_block``. Overwhelmingly the
@@ -10082,8 +10147,11 @@ def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
 
     The event's payload carries the pid so a human reading ``hermes kanban
     tail`` can correlate log lines with OS-level traces without opening
-    the drawer.
+    the drawer. When ``_default_spawn`` ran the command it also carries the
+    exact ``argv`` (never the environment — that holds credentials), so the
+    run can be reproduced by hand.
     """
+    argv = _take_spawn_argv(task_id)
     with write_txn(conn):
         conn.execute(
             "UPDATE tasks SET worker_pid = ? WHERE id = ?",
@@ -10095,7 +10163,10 @@ def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
                 "UPDATE task_runs SET worker_pid = ? WHERE id = ?",
                 (int(pid), run_id),
             )
-        _append_event(conn, task_id, "spawned", {"pid": int(pid)}, run_id=run_id)
+        payload: dict = {"pid": int(pid)}
+        if argv:
+            payload["argv"] = argv
+        _append_event(conn, task_id, "spawned", payload, run_id=run_id)
 
 
 def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
@@ -11532,6 +11603,173 @@ def _retag_legacy_worker_sessions(workspaces_root_path: str) -> None:
         _log.debug("kanban worker: legacy session retag skipped (%s)", exc)
 
 
+# Argv of the most recent spawn per task id, consumed by ``_set_worker_pid``
+# when it writes the ``spawned`` event. Keeping it here (rather than widening
+# the ``spawn_fn`` contract) keeps every existing test stub signature valid.
+# Bounded: entries are popped on use and the map is cleared when it grows.
+_last_spawn_argv: "dict[str, list[str]]" = {}
+_LAST_SPAWN_ARGV_MAX = 512
+
+
+def _record_spawn_argv(task_id: str, argv: "Sequence[str]") -> None:
+    """Stash the exact argv that was executed for ``task_id``.
+
+    The ``spawned`` event carries it so a human can reproduce the run
+    verbatim. Only argv — never the environment, which holds credentials.
+    """
+    if len(_last_spawn_argv) > _LAST_SPAWN_ARGV_MAX:
+        _last_spawn_argv.clear()
+    _last_spawn_argv[task_id] = [str(part) for part in argv]
+
+
+def _take_spawn_argv(task_id: str) -> "Optional[list[str]]":
+    return _last_spawn_argv.pop(task_id, None)
+
+
+def native_executor_prompt(task: Task) -> str:
+    """Prompt handed to a native coding-agent CLI: the card's title + body."""
+    title = (task.title or "").strip()
+    body = (task.body or "").strip()
+    if title and body:
+        return f"{title}\n\n{body}"
+    return title or body
+
+
+def _resolve_executor_provider_override(task: Task) -> Optional[str]:
+    """Provider the executor should use, from the card then config.
+
+    Card ``provider_override`` wins; otherwise ``kanban.executors.<name>.
+    provider`` in config.yaml. Both are optional — when neither is set the
+    executor probes readiness at runtime. No provider is pinned in code.
+    """
+    if task.provider_override:
+        return task.provider_override
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config() or {}
+        executors = ((cfg.get("kanban") or {}).get("executors") or {})
+        entry = executors.get(task.executor) or {}
+        value = (entry.get("provider") or "").strip()
+        return value or None
+    except Exception:
+        return None
+
+
+def _spawn_native_executor(
+    task: Task,
+    workspace: str,
+    *,
+    board: Optional[str] = None,
+) -> Optional[int]:
+    """Spawn a native coding-agent CLI for ``task`` under a supervisor.
+
+    The PID returned is the supervisor's (``hermes_cli.kanban_native_worker``),
+    so crash detection, the per-task runtime cap and the concurrency caps all
+    behave exactly as they do for a Hermes worker: the supervisor leads its own
+    process group and the CLI is its child.
+
+    The CLI itself never calls ``kanban_complete``; the supervisor translates
+    its exit status into complete (rc=0) / block (rc!=0, with the log tail).
+    """
+    import subprocess
+
+    from hermes_cli.kanban_executors import build_executor_argv
+
+    prompt = native_executor_prompt(task)
+    if not prompt:
+        raise RuntimeError(
+            f"task {task.id}: native executor {task.executor!r} has no prompt "
+            f"(card title and body are both empty)"
+        )
+    # Raises with the binary name when the CLI is not on PATH, so the
+    # dispatcher records a spawn failure instead of starting a doomed process.
+    cmd = build_executor_argv(
+        task.executor,
+        prompt,
+        provider_override=_resolve_executor_provider_override(task),
+    )
+
+    env = dict(os.environ)
+    from gateway.session_context import _VAR_MAP
+
+    for key in _VAR_MAP:
+        env.pop(key, None)
+    env.pop("HERMES_TUI", None)
+    env["HERMES_KANBAN_TASK"] = task.id
+    env["HERMES_KANBAN_WORKSPACE"] = workspace
+    env["HERMES_KANBAN_EXECUTOR"] = task.executor or ""
+    env["HERMES_KANBAN_DB"] = str(kanban_db_path(board=board))
+    env["HERMES_KANBAN_WORKSPACES_ROOT"] = str(workspaces_root(board=board))
+    env["HERMES_KANBAN_BOARD"] = _normalize_board_slug(board) or get_current_board()
+    if task.tenant:
+        env["HERMES_TENANT"] = task.tenant
+    if task.branch_name:
+        env["HERMES_KANBAN_BRANCH"] = task.branch_name
+    if task.current_run_id is not None:
+        env["HERMES_KANBAN_RUN_ID"] = str(task.current_run_id)
+    if task.claim_lock:
+        env["HERMES_KANBAN_CLAIM_LOCK"] = task.claim_lock
+    if workspace and os.path.isabs(workspace) and os.path.isdir(workspace):
+        env["TERMINAL_CWD"] = workspace
+
+    log_dir = worker_logs_dir(board=board)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / f"{task.id}.log"
+    rotate_bytes, backup_count = worker_log_rotation_config()
+    _rotate_worker_log(log_path, rotate_bytes, backup_count)
+    env["HERMES_KANBAN_NATIVE_LOG"] = str(log_path)
+    # argv travels in the environment, not on the supervisor's command line,
+    # so the card text never shows up in `ps` twice over.
+    env["HERMES_KANBAN_NATIVE_ARGV"] = json.dumps(cmd)
+
+    supervisor = [sys.executable, "-m", "hermes_cli.kanban_native_worker"]
+    # The supervisor runs with cwd=workspace, so the root holding the
+    # ``hermes_cli`` package is not implicitly importable (a source checkout
+    # has no installed package). Pin it on PYTHONPATH so ``-m`` resolves from
+    # any cwd — same motivation as ``_module_hermes_argv`` going through
+    # ``sys.executable``.
+    _pkg_root = str(Path(__file__).resolve().parent.parent)
+    _pythonpath = env.get("PYTHONPATH", "")
+    if _pkg_root not in _pythonpath.split(os.pathsep):
+        env["PYTHONPATH"] = (
+            _pkg_root + os.pathsep + _pythonpath if _pythonpath else _pkg_root
+        )
+
+    log_f = open(log_path, "ab")
+    try:
+        log_f.write(
+            (
+                f"\n=== kanban native executor {task.executor} → "
+                f"{' '.join(cmd)}\n"
+            ).encode("utf-8", errors="replace")
+        )
+        log_f.flush()
+    except Exception:
+        pass
+    try:
+        proc = subprocess.Popen(  # noqa: S603 -- fixed supervisor argv
+            supervisor,
+            cwd=workspace if os.path.isdir(workspace) else None,
+            stdin=subprocess.DEVNULL,
+            stdout=log_f,
+            stderr=subprocess.STDOUT,
+            env=env,
+            start_new_session=True,
+            creationflags=subprocess.CREATE_NO_WINDOW if _IS_WINDOWS else 0,
+        )
+    except OSError as exc:
+        log_f.close()
+        raise RuntimeError(
+            f"could not start the native-executor supervisor for "
+            f"{task.executor}: {exc}"
+        )
+    # Record the CLI argv (not the supervisor's) — that is what a human needs
+    # to reproduce the run by hand.
+    _record_spawn_argv(task.id, cmd)
+    return proc.pid
+
+
 def _default_spawn(
     task: Task,
     workspace: str,
@@ -11553,6 +11791,13 @@ def _default_spawn(
     import subprocess
     if not task.assignee:
         raise ValueError(f"task {task.id} has no assignee")
+
+    if task.executor:
+        # Native coding-agent CLI path. Everything below (profile resolution,
+        # Hermes env, `hermes chat -q` argv) is the Hermes-worker protocol and
+        # does not apply. ``executor IS NULL`` — every pre-existing card —
+        # falls straight through to the unchanged path below.
+        return _spawn_native_executor(task, workspace, board=board)
 
     from hermes_cli.profiles import normalize_profile_name
 
@@ -11739,6 +11984,7 @@ def _default_spawn(
             "`hermes` executable not found on PATH. "
             "Install Hermes Agent or activate its venv before running the kanban dispatcher."
         )
+    _record_spawn_argv(task.id, cmd)
     # NOTE: we intentionally do NOT close log_f here — we want Popen's
     # child process to keep writing after this function returns.  The
     # handle is kept alive by the child's inheritance.  The parent's
