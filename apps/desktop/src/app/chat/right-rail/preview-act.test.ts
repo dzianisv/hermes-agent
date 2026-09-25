@@ -182,9 +182,11 @@ describe('actOnActivePreview (drive_preview tool)', () => {
   /** A driven pane whose post-click focus probe can be answered independently of
    *  the locate and the read-back. The probe is how a type learns whether the
    *  located editable actually became document.activeElement. */
-  const withTypedPane = (focus: { focused: boolean; tag?: string }, onSend?: (event: { type: string }) => void) => {
+  type SentKey = { keyCode?: string; type: string }
+
+  const withTypedPane = (focus: { focused: boolean; tag?: string }, onSend?: (event: SentKey) => void) => {
     const tabId = openBrowserTab()
-    const send = vi.fn((event: { type: string }) => onSend?.(event))
+    const send = vi.fn((event: SentKey) => onSend?.(event))
 
     cleanups.push(
       registerPreviewScriptRunner(tabId, async code => {
