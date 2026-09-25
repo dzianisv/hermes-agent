@@ -459,7 +459,10 @@ def test_crashed_and_timed_out_review_runs_retry_in_review_phase(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
-    monkeypatch.setattr(kb, "_classify_worker_exit", lambda _pid: ("nonzero_exit", 1))
+    monkeypatch.setattr(
+        kb, "_classify_worker_exit",
+        lambda _pid, **_kw: ("nonzero_exit", 1),
+    )
     old = int(time.time()) - 1_000
 
     timed_out_id, timed_out_run = _claimed_review(
