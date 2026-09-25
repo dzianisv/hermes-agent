@@ -32,7 +32,13 @@ _CORRUPT_DB_MARKERS = ("file is not a database", "database disk image is malform
 
 @dataclass
 class _DispatcherSettings:
-    """``kanban.*`` dispatch settings, read once at boot (restart to apply)."""
+    """``kanban.*`` dispatch settings.
+
+    ``interval`` is fixed at gateway boot (changing tick cadence mid-flight is
+    out of scope). Every other field is re-read each tick by
+    :func:`_reread_dispatcher_settings` so an operator edit to a WIP cap takes
+    effect without a restart.
+    """
 
     interval: float
     max_spawn: Any
@@ -44,8 +50,25 @@ class _DispatcherSettings:
     max_in_progress_per_profile: Optional[int]
 
 
-def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any) -> _DispatcherSettings:
-    """Parse and log the dispatcher settings in their established order."""
+_LIVE_CAP_FIELDS = (
+    "max_spawn",
+    "max_in_progress",
+    "max_in_progress_per_profile",
+    "failure_limit",
+    "stale_timeout_seconds",
+    "reconcile_orphans",
+    "default_assignee",
+)
+
+
+def _resolve_dispatcher_settings(
+    kanban_cfg: dict, kb: Any, *, announce: bool = True,
+) -> _DispatcherSettings:
+    """Parse and log the dispatcher settings in their established order.
+
+    ``announce=False`` suppresses info logs for the per-tick re-read. Invalid
+    values still warn.
+    """
     try:
         interval = float(kanban_cfg.get("dispatch_interval_seconds", 60) or 60)
     except (ValueError, TypeError):
@@ -55,15 +78,15 @@ def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any) -> _DispatcherSettin
     interval = max(interval, 1.0)  # sanity floor — tighter than this is a footgun
 
     max_spawn = kanban_cfg.get("max_spawn")
-    if max_spawn is not None:
+    if max_spawn is not None and announce:
         logger.info("kanban dispatcher: max_spawn=%s", max_spawn)
 
     # Cap simultaneously running tasks so slow workers don't pile up and time
     # out. Explicit config wins; otherwise a memory-derived default (unbounded
     # fan-out swap-thrashes small hosts), or None where total memory can't be read.
-    max_in_progress = _positive_int_setting(kanban_cfg, "max_in_progress")
+    max_in_progress = _positive_int_setting(kanban_cfg, "max_in_progress", announce=announce)
     effective_max_in_progress = _kbd().resolve_max_in_progress(max_in_progress)
-    if max_in_progress is None and effective_max_in_progress is not None:
+    if announce and max_in_progress is None and effective_max_in_progress is not None:
         logger.info(
             "kanban dispatcher: kanban.max_in_progress unset; using "
             "memory-derived default max_in_progress=%d "
@@ -98,7 +121,7 @@ def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any) -> _DispatcherSettin
     # (#27145). Empty string (the schema default) means "no fallback, keep skipping" — backward-compatible
     # with existing installs.
     default_assignee = (kanban_cfg.get("default_assignee") or "").strip() or None
-    if default_assignee:
+    if announce and default_assignee:
         logger.info("kanban dispatcher: default_assignee=%r (unassigned ready tasks "
                     "will route to this profile)", default_assignee)
 
@@ -114,8 +137,63 @@ def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any) -> _DispatcherSettin
         default_assignee=default_assignee,
         # Per-profile concurrency cap: no single profile's local model / API
         # quota / browser pool gets overwhelmed by a fan-out.
-        max_in_progress_per_profile=_positive_int_setting(kanban_cfg, "max_in_progress_per_profile"),
+        max_in_progress_per_profile=_positive_int_setting(
+            kanban_cfg, "max_in_progress_per_profile", announce=announce,
+        ),
     )
+
+
+def _reread_dispatcher_settings(
+    load_config, kb: Any, previous: _DispatcherSettings,
+) -> _DispatcherSettings:
+    """Re-read dispatcher caps for one tick. ``interval`` stays boot-resolved.
+
+    Fail-safe, same class as :func:`_resolve_auto_decompose_settings`: a
+    config-read or parse error returns *previous* unchanged. Never fall back
+    to uncapped (``None``) just because the file could not be read — a
+    transient load error must not open the WIP gate the operator already set.
+    A successful read that omits a cap is intentional and is applied.
+    """
+    try:
+        cfg = load_config()
+    except Exception as exc:
+        logger.warning(
+            "kanban dispatcher: config re-read failed (%s); keeping last caps",
+            exc,
+        )
+        return previous
+    if not isinstance(cfg, dict):
+        logger.warning(
+            "kanban dispatcher: config re-read returned %s; keeping last caps",
+            type(cfg).__name__,
+        )
+        return previous
+    kanban_cfg = cfg.get("kanban", {})
+    if not isinstance(kanban_cfg, dict):
+        logger.warning(
+            "kanban dispatcher: kanban config is %s; keeping last caps",
+            type(kanban_cfg).__name__,
+        )
+        return previous
+    try:
+        fresh = _resolve_dispatcher_settings(kanban_cfg, kb, announce=False)
+    except Exception as exc:
+        logger.warning(
+            "kanban dispatcher: cap re-resolve failed (%s); keeping last caps",
+            exc,
+        )
+        return previous
+    fresh.interval = previous.interval
+    changed = [
+        name for name in _LIVE_CAP_FIELDS
+        if getattr(fresh, name) != getattr(previous, name)
+    ]
+    if changed:
+        logger.info(
+            "kanban dispatcher: live cap update: %s",
+            ", ".join(f"{name}={getattr(fresh, name)!r}" for name in changed),
+        )
+    return fresh
 
 
 class _KanbanDispatcher:
