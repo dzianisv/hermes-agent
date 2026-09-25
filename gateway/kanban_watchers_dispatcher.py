@@ -82,16 +82,42 @@ def _resolve_dispatcher_settings(
         logger.info("kanban dispatcher: max_spawn=%s", max_spawn)
 
     # Cap simultaneously running tasks so slow workers don't pile up and time
-    # out. Explicit config wins; otherwise a memory-derived default (unbounded
-    # fan-out swap-thrashes small hosts), or None where total memory can't be read.
-    max_in_progress = _positive_int_setting(kanban_cfg, "max_in_progress", announce=announce)
-    effective_max_in_progress = _kbd().resolve_max_in_progress(max_in_progress)
-    if announce and max_in_progress is None and effective_max_in_progress is not None:
+    # out. The shared board's cap is the most restrictive explicit value across
+    # profiles, not whatever this gateway's own config happens to say (the
+    # dispatcher lock is machine-global; config.yaml is not). When nobody set
+    # one, a memory-derived default applies, or None where total memory can't
+    # be read.
+    from hermes_cli.kanban_dispatch_caps import explicit_dispatch_caps
+    own_max_in_progress = _positive_int_setting(
+        kanban_cfg, "max_in_progress", announce=announce,
+    )
+    own_per_profile = _positive_int_setting(
+        kanban_cfg, "max_in_progress_per_profile", announce=announce,
+    )
+    board_max_in_progress, board_per_profile = explicit_dispatch_caps(
+        own_max_in_progress, own_per_profile,
+    )
+    effective_max_in_progress = _kbd().resolve_max_in_progress(board_max_in_progress)
+    if announce and board_max_in_progress is not None and own_max_in_progress != board_max_in_progress:
+        logger.info(
+            "kanban dispatcher: board-level max_in_progress=%d "
+            "(most restrictive explicit value across profile configs; "
+            "this profile has %s)",
+            board_max_in_progress, own_max_in_progress,
+        )
+    elif announce and board_max_in_progress is None and effective_max_in_progress is not None:
         logger.info(
             "kanban dispatcher: kanban.max_in_progress unset; using "
             "memory-derived default max_in_progress=%d "
             "(set kanban.max_in_progress in config.yaml to override)",
             effective_max_in_progress,
+        )
+    if announce and board_per_profile is not None and own_per_profile != board_per_profile:
+        logger.info(
+            "kanban dispatcher: board-level max_in_progress_per_profile=%d "
+            "(most restrictive explicit value across profile configs; "
+            "this profile has %s)",
+            board_per_profile, own_per_profile,
         )
 
     raw_failure_limit = kanban_cfg.get("failure_limit", kb.DEFAULT_FAILURE_LIMIT)
@@ -136,10 +162,9 @@ def _resolve_dispatcher_settings(
         reconcile_orphans=bool(kanban_cfg.get("reconcile_orphans", True)),
         default_assignee=default_assignee,
         # Per-profile concurrency cap: no single profile's local model / API
-        # quota / browser pool gets overwhelmed by a fan-out.
-        max_in_progress_per_profile=_positive_int_setting(
-            kanban_cfg, "max_in_progress_per_profile", announce=announce,
-        ),
+        # quota / browser pool gets overwhelmed by a fan-out. Board-level, same
+        # cross-profile minimum as max_in_progress (see above).
+        max_in_progress_per_profile=board_per_profile,
     )
 
 
