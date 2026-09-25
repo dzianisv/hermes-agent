@@ -548,14 +548,20 @@ def _still_declared(package, recorded: list[str]) -> list[str]:
     An extra the source removed (``hindsight``) would otherwise ride the ledger
     into every later ``uv sync`` and fail it with "Extra is not defined". Only
     recorded extras are pruned; an explicitly requested unknown extra still fails.
+    Membership uses PEP 685 names (uv matches ``foo_bar`` to ``foo-bar``); the
+    recorded spelling is what reaches uv.
     """
+    import re
     from pm.features import declared_extras
+
+    def normalized(name: str) -> str:
+        return re.sub(r"[-_.]+", "-", name).lower()
 
     root = package.project_root()
     if not (root / "pyproject.toml").is_file():
         return list(recorded)
-    declared = set(declared_extras(root))
-    return [extra for extra in recorded if extra in declared]
+    declared = {normalized(extra) for extra in declared_extras(root)}
+    return [extra for extra in recorded if normalized(extra) in declared]
 
 
 def venv_is_current(*, extras: list[str] | None = None, plugins: Members | Candidates | None = None,
