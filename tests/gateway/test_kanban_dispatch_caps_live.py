@@ -12,8 +12,6 @@ from __future__ import annotations
 
 import asyncio
 
-import pytest
-
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 
@@ -46,7 +44,6 @@ def _drive_two_ticks(monkeypatch, state, after_first):
     cap, not an empty queue, is what must refuse the second claim.
     """
     import gateway.kanban_watchers as watchers
-    from gateway.run import GatewayRunner
     from hermes_cli import kanban_db_dispatch as kbd
 
     seen: list[tuple[dict, object]] = []
@@ -78,7 +75,7 @@ def _drive_two_ticks(monkeypatch, state, after_first):
     monkeypatch.setattr(watchers, "_to_thread_process_service", inline)
     monkeypatch.delenv("HERMES_KANBAN_DISPATCH_IN_GATEWAY", raising=False)
 
-    runner = GatewayRunner.__new__(GatewayRunner)
+    runner = watchers.GatewayKanbanWatchersMixin()
     runner._running = True
     between = {"n": 0}
 
