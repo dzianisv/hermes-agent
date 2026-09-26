@@ -286,7 +286,10 @@ def build_keepalive_http_client(base_url: str = "", *, async_mode: bool = False,
     try:
         import httpx
         proxy = _get_proxy_for_base_url(base_url)
-        limits = httpx.Limits(max_keepalive_connections=20, max_connections=100, keepalive_expiry=20.0)
+        # Many NATs/LBs silently drop an idle TCP flow around 15s without FIN/RST;
+        # httpx will still hand that socket out if it is inside keepalive_expiry.
+        # 10s is under that floor and above normal chat cadence.
+        limits = httpx.Limits(max_keepalive_connections=20, max_connections=100, keepalive_expiry=10.0)
         timeout = httpx.Timeout(connect=15.0, read=None, write=15.0, pool=10.0)  # read=None for SSE streaming
         transport_cls = httpx.AsyncHTTPTransport if async_mode else httpx.HTTPTransport
         client_cls = httpx.AsyncClient if async_mode else httpx.Client
@@ -297,7 +300,7 @@ def build_keepalive_http_client(base_url: str = "", *, async_mode: bool = False,
             # fan-out of concurrently streaming children. (Client-level ``limits`` never reach
             # mounted transports — they used to run on httpx defaults, keepalive_expiry=5s.)
             direct_limits = limits if async_mode else httpx.Limits(
-                max_keepalive_connections=50, max_connections=1000, keepalive_expiry=20.0,
+                max_keepalive_connections=50, max_connections=1000, keepalive_expiry=10.0,
             )
 
             def _build_direct():

@@ -1,6 +1,6 @@
 """Regression guard: _create_openai_client must honor HTTP(S)_PROXY env vars.
 
-The keepalive client now uses ``httpx.Limits(keepalive_expiry=20.0)``
+The keepalive client now uses ``httpx.Limits(keepalive_expiry=10.0)``
 instead of a custom ``httpx.HTTPTransport(socket_options=...)`` to
 prevent CLOSE-WAIT accumulation.  This avoids breaking streaming for
 providers behind reverse proxies (#54049, #12952) while still reaping
