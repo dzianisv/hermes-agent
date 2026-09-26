@@ -15,6 +15,7 @@ import time
 from typing import Dict, Optional, Sequence
 
 from hermes_constants import get_hermes_home
+from sqlite_schema_text import strip_sql_line_comments
 from hermes_state_common import (
     DEFERRED_INDEX_SQL,
     FTS_CJK_STALE_KEY,
@@ -608,6 +609,13 @@ class SessionSchemaMixin:
         import hashlib as _hashlib
         import json as _json
 
+        # Normalise FIRST so the memo key and the text we execute describe the
+        # same schema: the cache is keyed by a hash of the DDL, and hashing the
+        # raw text while executing the stripped text would hand out a cache
+        # entry under the wrong key (and vice versa after a comment edit that
+        # strips away to nothing).
+        schema_sql = strip_sql_line_comments(schema_sql)
+
         cache_path = None
         schema_hash = _hashlib.sha256(schema_sql.encode("utf-8")).hexdigest()
         try:
@@ -950,7 +958,7 @@ class SessionSchemaMixin:
         """
         cursor = self._conn.cursor()
 
-        cursor.executescript(SCHEMA_SQL)
+        cursor.executescript(strip_sql_line_comments(SCHEMA_SQL))
 
         # ── Declarative column reconciliation ──────────────────────────
         # Diff live tables against SCHEMA_SQL and ADD any missing columns.
