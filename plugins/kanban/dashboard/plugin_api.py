@@ -38,6 +38,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import sqlite3
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -854,6 +855,26 @@ class UpdateTaskBody(BaseModel):
     clear_reasoning_effort: bool = False
 
 
+def _worker_run_id_for(task_id: str) -> Optional[int]:
+    """The caller's own run id when this process IS the card's worker.
+
+    Mirrors ``hermes_cli.kanban._worker_run_id_for``. The dashboard is
+    normally an operator surface (a third party to every card's worker), so
+    this returns None and the claim-release primitive contains the worker.
+    It is read from the environment anyway so a dashboard started from
+    inside a worker's own run cannot signal itself.
+    """
+    if os.environ.get("HERMES_KANBAN_TASK") != task_id:
+        return None
+    raw = os.environ.get("HERMES_KANBAN_RUN_ID")
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
 def _reopen_if_review(conn, task_id: str, current) -> Optional[bool]:
     """Route a task leaving the ``review`` lane through ``reopen_review_task``
     (proper transition: stale-run recovery, parent re-gate, ``review_reopened``
@@ -863,7 +884,9 @@ def _reopen_if_review(conn, task_id: str, current) -> Optional[bool]:
     the review-reopen routing can't drift between them.
     """
     if current is not None and getattr(current, "status", None) == "review":
-        return kanban_db.reopen_review_task(conn, task_id)
+        return kanban_db.reopen_review_task(
+            conn, task_id, expected_run_id=_worker_run_id_for(task_id),
+        )
     return None
 
 
@@ -935,7 +958,10 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                     # Direct status write for drag-drop (todo -> ready etc).
                     ok = reopened if reopened is not None else _set_status_direct(conn, task_id, "ready")
             elif s == "archived":
-                ok = kanban_db.archive_task(conn, task_id)
+                ok = kanban_db.archive_task(
+                    conn, task_id,
+                    expected_run_id=_worker_run_id_for(task_id),
+                )
             elif s == "running":
                 raise HTTPException(
                     status_code=400,
@@ -1099,7 +1125,7 @@ def _parents_blocking_ready(
 def _invalidate_descendants_for_parent_reopen(
     conn: sqlite3.Connection,
     parent_id: str,
-    terminations: list[tuple[Optional[int], Optional[str]]],
+    terminations: list[tuple[str, Optional[int], Optional[str], Optional[int], str]],
 ) -> None:
     """Delegate to the domain-layer implementation in :mod:`kanban_db`.
 
@@ -1109,13 +1135,17 @@ def _invalidate_descendants_for_parent_reopen(
     :func:`kanban_db.invalidate_descendants_for_parent_reopen` so every
     reopen surface shares one implementation. We run inside the caller's
     open transaction, so the domain function composes via a savepoint and
-    returns the worker terminations for us to perform post-commit (events
-    must be durable BEFORE the kill).
+    returns the worker terminations for us to drain through the shared
+    claim-release primitive post-commit (events must be durable BEFORE the
+    kill). Invalidated descendants always land in ``todo``.
     """
     result = kanban_db.invalidate_descendants_for_parent_reopen(
         conn, parent_id, author="dashboard",
     )
-    terminations.extend(result["terminations"])
+    terminations.extend(
+        (child_id, pid, lock, run_id, "todo")
+        for child_id, pid, lock, run_id in result["terminations"]
+    )
 
 
 def _set_status_direct(
@@ -1131,7 +1161,9 @@ def _set_status_direct(
     orphaned. ``running -> ready`` via drag-drop is the common case
     (user yanking a stuck worker back to the queue).
     """
-    terminations: list[tuple[Optional[int], Optional[str]]] = []
+    terminations: list[
+        tuple[str, Optional[int], Optional[str], Optional[int], str]
+    ] = []
     effective_status = new_status
     with kanban_db.write_txn(conn):
         # Snapshot current state so we know whether to close a run.
@@ -1198,7 +1230,13 @@ def _set_status_direct(
                 outcome="reclaimed", status="reclaimed",
                 summary=f"status changed to {effective_status} (dashboard/direct)",
             )
-            terminations.append((prev["worker_pid"], prev["claim_lock"]))
+            terminations.append((
+                task_id,
+                prev["worker_pid"],
+                prev["claim_lock"],
+                prev["current_run_id"],
+                effective_status,
+            ))
         conn.execute(
             "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
             "VALUES (?, ?, 'status', ?, ?)",
@@ -1220,8 +1258,20 @@ def _set_status_direct(
                 task_id,
                 terminations,
             )
-    for pid, claim_lock in terminations:
-        kanban_db._terminate_reclaimed_worker(pid, claim_lock)
+    # Post-commit containment through the ONE shared claim-release primitive:
+    # a worker that survives termination gets its claim re-asserted as a hold
+    # instead of leaving the card claimable beside a live writer.
+    for tid, pid, claim_lock, run_id, landing in terminations:
+        kanban_db._terminate_released_worker(
+            conn,
+            tid,
+            pid,
+            claim_lock,
+            landing,
+            reason="dashboard_status_release_worker_alive",
+            expected_run_id=_worker_run_id_for(tid),
+            current_run_id=run_id,
+        )
     # If we re-opened something, children may have gone stale.
     if effective_status in {"done", "ready", "review"}:
         kanban_db.recompute_ready(conn)
@@ -1337,7 +1387,9 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                     results.append(entry)
                     continue
                 if payload.archive:
-                    if not kanban_db.archive_task(conn, tid):
+                    if not kanban_db.archive_task(
+                        conn, tid, expected_run_id=_worker_run_id_for(tid),
+                    ):
                         entry.update(ok=False, error="archive refused")
                 if payload.status is not None and not payload.archive:
                     s = payload.status
