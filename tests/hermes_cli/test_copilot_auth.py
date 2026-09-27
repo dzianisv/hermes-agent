@@ -115,6 +115,50 @@ class TestGhCliTokenCache:
         assert probe.call_count == 2
         self._reset()
 
+    def test_failed_reprobe_keeps_the_token_already_obtained(self, monkeypatch):
+        """Under host load `gh auth token` timed out after a mass resume, and the cached miss made
+        every gateway raise "No usable credentials found for provider 'copilot'" in 5-minute
+        bursts while the token stayed valid (2026-09-26)."""
+        import subprocess
+
+        from hermes_cli import copilot_auth
+        self._reset()
+        for env_var in copilot_auth.COPILOT_ENV_VARS:
+            monkeypatch.delenv(env_var, raising=False)
+        clock = {"now": 1000.0}
+        monkeypatch.setattr(copilot_auth.time, "monotonic", lambda: clock["now"])
+        monkeypatch.setattr(copilot_auth, "_gh_cli_candidates", lambda: ["/fake/gh"])
+        outcomes = iter([
+            subprocess.CompletedProcess([], 0, stdout="gho_good\n", stderr=""),
+            subprocess.TimeoutExpired(cmd="gh", timeout=1),
+            subprocess.CompletedProcess([], 1, stdout="", stderr="error connecting to keyring"),
+        ])
+
+        def _fake_run(*_args, **_kwargs):
+            outcome = next(outcomes)
+            if isinstance(outcome, BaseException):
+                raise outcome
+            return outcome
+
+        monkeypatch.setattr(copilot_auth.subprocess, "run", _fake_run)
+        assert copilot_auth.resolve_copilot_token() == ("gho_good", "gh auth token")
+        for _ in range(2):  # a timeout, then a failing exit — each after the cache expired
+            clock["now"] += copilot_auth._GH_CLI_TOKEN_CACHE_TTL_SECONDS + 1
+            assert copilot_auth.resolve_copilot_token() == ("gho_good", "gh auth token")
+        self._reset()
+
+    def test_cold_miss_is_retried_within_a_minute(self, monkeypatch):
+        """A process that never saw a token must not stay blind for the full success TTL."""
+        from hermes_cli import copilot_auth
+        self._reset()
+        clock = {"now": 1000.0}
+        monkeypatch.setattr(copilot_auth.time, "monotonic", lambda: clock["now"])
+        with patch.object(copilot_auth, "_probe_gh_cli_token", side_effect=[None, "gho_late"]):
+            assert copilot_auth._try_gh_cli_token() is None
+            clock["now"] += 60
+            assert copilot_auth._try_gh_cli_token() == "gho_late"
+        self._reset()
+
 
 class TestRequestHeaders:
     """Copilot API header generation."""

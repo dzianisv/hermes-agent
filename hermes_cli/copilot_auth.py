@@ -71,7 +71,7 @@ def resolve_copilot_token() -> tuple[str, str]:
         logger.warning("Token from %s is not supported: %s", env_var, msg)
     # `gh auth token` fallback ONLY when no Copilot env var was set: an exported GITHUB_TOKEN
     # (even a classic PAT) means the user intends *that* token; skipping also avoids a slow
-    # subprocess (up to 5s on Windows) on every cold start.
+    # subprocess (seconds under load) on every cold start.
     if any_env_var_set:
         logger.debug("Copilot env var(s) set but none held a supported token; skipping `gh auth "
                      "token` fallback to honor explicit env-var intent (and avoid the subprocess "
@@ -99,28 +99,54 @@ def _gh_cli_candidates() -> list[str]:
     return seen
 
 
-# ``gh auth token`` cache (misses too). With no credential store the probe blocks its full 5s on
-# keyring / D-Bus, and provider inventory probes Copilot several times per request — an uncached
-# miss made one settings page a 4×5s stall past Desktop's 15s IPC budget. Short TTL keeps a
-# fresh ``gh auth login`` discoverable.
+# ``gh auth token`` cache (misses too). With no credential store the probe blocks on keyring /
+# D-Bus, and provider inventory probes Copilot several times per request — an uncached miss made
+# one settings page a 4×5s stall past Desktop's 15s IPC budget. Short TTL keeps a fresh
+# ``gh auth login`` discoverable.
 _GH_CLI_TOKEN_CACHE_TTL_SECONDS = 300.0
+# A miss with no earlier token is cached only briefly so a cold process retries soon.
+_GH_CLI_MISS_CACHE_TTL_SECONDS = 30.0
+# gh under launchd takes ~2s idle; host load (mass session resume) pushed it past 5s.
+_GH_CLI_PROBE_TIMEOUT_SECONDS = 15
 _gh_cli_token_cache: tuple[float, Optional[str]] | None = None
+# Last token a probe returned in this process. A later failed/timed-out probe serves it instead of
+# a miss: a slow ``gh`` under load otherwise blackholed Copilot ("No usable credentials") for the
+# whole cache TTL while the token stayed valid (2026-09-26).
+_gh_cli_last_good_token: Optional[str] = None
+_gh_cli_probe_failing = False
 
 
 def _invalidate_gh_cli_token_cache() -> None:
     """Reset the ``gh auth token`` probe cache (used by tests and re-auth flows)."""
-    global _gh_cli_token_cache
+    global _gh_cli_token_cache, _gh_cli_last_good_token, _gh_cli_probe_failing
     _gh_cli_token_cache = None
+    _gh_cli_last_good_token = None
+    _gh_cli_probe_failing = False
 
 
 def _try_gh_cli_token() -> Optional[str]:
-    """Token from ``gh auth token`` when available; the result (incl. a miss) is cached per TTL."""
-    global _gh_cli_token_cache
+    """Token from ``gh auth token`` when available, cached per TTL; a failed probe keeps serving
+    the last token this process obtained, and a cold miss is cached only briefly."""
+    global _gh_cli_token_cache, _gh_cli_last_good_token, _gh_cli_probe_failing
     now = time.monotonic()
     cache = _gh_cli_token_cache
-    if cache is not None and now - cache[0] < _GH_CLI_TOKEN_CACHE_TTL_SECONDS:
-        return cache[1]
+    if cache is not None:
+        ttl = _GH_CLI_TOKEN_CACHE_TTL_SECONDS if cache[1] else _GH_CLI_MISS_CACHE_TTL_SECONDS
+        if now - cache[0] < ttl:
+            return cache[1]
     token = _probe_gh_cli_token()
+    if token:
+        if _gh_cli_probe_failing:
+            logger.info("`gh auth token` lookup recovered")
+        _gh_cli_probe_failing = False
+        _gh_cli_last_good_token = token
+    else:
+        if not _gh_cli_probe_failing:
+            logger.warning("`gh auth token` returned no token (timed out, failed or not logged "
+                           "in); %s", "keeping the token obtained earlier in this process"
+                           if _gh_cli_last_good_token else "Copilot has no gh credential")
+        _gh_cli_probe_failing = True
+        token = _gh_cli_last_good_token
     _gh_cli_token_cache = (now, token)
     return token
 
@@ -138,7 +164,8 @@ def _probe_gh_cli_token() -> Optional[str]:
         cmd = [gh_path, "auth", "token", *host_args]
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8',
-                                    errors='replace', timeout=5, env=clean_env,
+                                    errors='replace', timeout=_GH_CLI_PROBE_TIMEOUT_SECONDS,
+                                    env=clean_env,
                                     stdin=subprocess.DEVNULL, **_popen_kwargs)
         except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
             logger.debug("gh CLI token lookup failed (%s): %s", gh_path, exc)
