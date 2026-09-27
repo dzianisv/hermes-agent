@@ -1718,8 +1718,8 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
 # Disk cache for provider_model_ids() — keeps /model picker fast (otherwise every open re-fetches
 # every authed provider's /v1/models). One JSON file at $HERMES_HOME/provider_models_cache.json;
 # entries keyed by credential fingerprint (rotate OPENAI_API_KEY → entry invalidates); 1h TTL;
-# only NON-EMPTY results are cached so a transient failure is never pinned; any read/write error
-# degrades silently to a live fetch.
+# only NON-EMPTY live results are cached (never a curated fallback) so a transient failure is never
+# pinned; any read/write error degrades silently to a live fetch.
 # ---------------------------------------------------------------------------
 
 _PROVIDER_MODELS_CACHE_TTL = 3600  # 1h
@@ -1741,15 +1741,12 @@ def _cache_entry(fp: str, models: list[str], at: Optional[float] = None) -> dict
     return {"fp": fp, "at": time.time() if at is None else at, "models": list(models)}
 
 
-def _live_result_entry(fp: str, live: list[str], existing: Any, at: Optional[float] = None) -> Optional[dict]:
-    """Row to store for a ``provider_model_ids`` result, or ``None`` to keep *existing*: a curated
-    fallback never replaces the account's real catalog for the same credentials, and when it is
-    stored it is flagged so it expires on the short fallback TTL."""
-    if not isinstance(live, CuratedFallbackModels):
-        return _cache_entry(fp, live, at)
-    if _cache_entry_valid(existing, fp) and not existing.get("fallback"):
-        return None
-    return {**_cache_entry(fp, live, at), "fallback": True}
+def _live_result_entry(fp: str, live: list[str], at: Optional[float] = None) -> Optional[dict]:
+    """Row to store for a ``provider_model_ids`` result, or ``None`` when it must not be stored: a
+    curated fallback is served for display but never persisted, so the disk cache only ever holds
+    catalogs a live fetch returned (#107391). Rows flagged ``fallback`` by older releases are still
+    read with the short fallback TTL."""
+    return None if isinstance(live, CuratedFallbackModels) else _cache_entry(fp, live, at)
 
 
 def _ollama_native_probe_reachable() -> bool:
@@ -1780,7 +1777,7 @@ def _spawn_swr_refresh(cache_key: str, refresh_fn=None) -> None:
         live = provider_model_ids(cache_key, force_refresh=True)
         if live or (cache_key == "ollama" and _ollama_native_probe_reachable()):
             fp = _credential_fingerprint(cache_key)
-            return _live_result_entry(fp, live or [], _load_provider_models_cache().get(cache_key))
+            return _live_result_entry(fp, live or [])
         return None
 
     def _refresh() -> None:
@@ -1941,6 +1938,8 @@ def update_provider_cache_entry(provider: str, models: list[str]) -> None:
         normalized = normalize_provider(provider) or (provider or "")
         if not normalized or not models:
             return
+        if isinstance(models, CuratedFallbackModels):
+            return
         fp = _credential_fingerprint(normalized)
         with _cache_write_lock:
             _store_cache_entry(normalized, _cache_entry(fp, models))
@@ -1999,12 +1998,14 @@ def cached_provider_model_ids(
 
     live = provider_model_ids(normalized, force_refresh=force_refresh)
     if live:
-        fresh = _live_result_entry(fp, live, entry, now)
-        if fresh is None:
+        fresh = _live_result_entry(fp, live, now)
+        if fresh is not None:
+            _store_cache_entry(normalized, fresh, cache)
+        elif _cache_entry_valid(entry, fp) and not entry.get("fallback"):
             # The live fetch degraded to the curated list; the account's real catalog is on disk.
             return _chat_catalog_rows([model for model in entry["models"] if not _model_requires_account_discovery(normalized, model)])
-        _store_cache_entry(normalized, fresh, cache)
-        return _chat_catalog_rows(list(live))
+        # Keep the marker: a caller re-persisting this result (picker prefetch) must still see it.
+        return _chat_catalog_rows((CuratedFallbackModels if fresh is None else list)(live))
 
     if is_ollama:
         if _ollama_native_probe_reachable():

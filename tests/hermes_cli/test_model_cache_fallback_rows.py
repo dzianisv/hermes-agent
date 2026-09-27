@@ -46,20 +46,21 @@ def test_fallback_does_not_overwrite_the_same_credentials_live_row():
     save.assert_not_called()
 
 
-def test_fallback_row_is_recorded_as_fallback_and_never_served_stale():
-    # Cold cache: the curated list is served (the picker must not be empty) but recorded as a
-    # fallback row, which the SWR stale window must not resurrect — a stale fallback re-probes.
+def test_fallback_is_served_but_never_persisted_and_legacy_rows_never_served_stale():
+    # Cold cache: the curated list is served (the picker must not be empty) but not written — only
+    # a live fetch may define the account's catalog on disk.
     cache: dict = {}
     with patch.object(mod, "_load_provider_models_cache", return_value=cache), \
          patch.object(mod, "_credential_fingerprint", return_value="fp"), \
-         patch.object(mod, "_save_provider_models_cache"), \
+         patch.object(mod, "_save_provider_models_cache") as save, \
          patch.object(mod, "provider_model_ids", return_value=mod.CuratedFallbackModels(STATIC)):
         assert mod.cached_provider_model_ids("copilot") == STATIC
-    assert cache["copilot"]["fallback"] is True
+    assert "copilot" not in cache
+    save.assert_not_called()
 
-    # Same row, now past the fallback TTL: the live fetch runs instead of the stale-serve path,
-    # and a real catalog replaces the fallback row.
-    cache["copilot"]["at"] = time.time() - mod._PROVIDER_MODELS_FALLBACK_TTL - 1
+    # A fallback row written by an older release, past the fallback TTL: the live fetch runs instead
+    # of the stale-serve path, and a real catalog replaces it.
+    cache["copilot"] = _row(STATIC, age_seconds=mod._PROVIDER_MODELS_FALLBACK_TTL + 1, fallback=True)
     with patch.object(mod, "_load_provider_models_cache", return_value=cache), \
          patch.object(mod, "_credential_fingerprint", return_value="fp"), \
          patch.object(mod, "_save_provider_models_cache"), \
@@ -70,6 +71,22 @@ def test_fallback_row_is_recorded_as_fallback_and_never_served_stale():
     spawn.assert_not_called()
     assert cache["copilot"]["models"] == LIVE
     assert "fallback" not in cache["copilot"]
+
+
+def test_picker_prefetch_never_persists_the_static_list_as_the_live_catalog(monkeypatch):
+    # 2026-09-26: while Copilot credentials were briefly unavailable, the picker prefetch re-persisted
+    # the curated list as a plain row (the fallback marker was dropped on the way), and the picker
+    # served those 17 built-in ids instead of the account's catalog from then on.
+    from hermes_cli.model_switch_providers import _prefetch_provider_models_parallel
+
+    monkeypatch.setattr(mod, "_resolve_copilot_catalog_api_key", lambda: "gho_test")
+    monkeypatch.setattr(mod, "_fetch_github_models", lambda *_a, **_k: None)
+    _prefetch_provider_models_parallel(["copilot"])
+    assert "copilot" not in mod._load_provider_models_cache()
+
+    monkeypatch.setattr(mod, "_fetch_github_models", lambda *_a, **_k: list(LIVE))
+    _prefetch_provider_models_parallel(["copilot"])
+    assert mod._load_provider_models_cache()["copilot"]["models"] == LIVE
 
 
 def test_copilot_catalog_marks_the_static_list_as_fallback_on_a_failed_live_fetch():
