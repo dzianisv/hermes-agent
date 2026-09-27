@@ -108,6 +108,9 @@ _GH_CLI_TOKEN_CACHE_TTL_SECONDS = 300.0
 _GH_CLI_MISS_CACHE_TTL_SECONDS = 30.0
 # gh under launchd takes ~2s idle; host load (mass session resume) pushed it past 5s.
 _GH_CLI_PROBE_TIMEOUT_SECONDS = 15
+# Attempts per gh binary. A cold exec (pages evicted after idle) costs ~20s on macOS and the very
+# next one <1s, so a lone timeout must not be read as "no credential" (see _probe_gh_cli_token).
+_GH_CLI_PROBE_ATTEMPTS = 2
 _gh_cli_token_cache: tuple[float, Optional[str]] | None = None
 # Last token a probe returned in this process. A later failed/timed-out probe serves it instead of
 # a miss: a slow ``gh`` under load otherwise blackholed Copilot ("No usable credentials") for the
@@ -167,25 +170,34 @@ def _probe_gh_cli_token() -> Optional[str]:
     reasons: list[str] = []
     for gh_path in _gh_cli_candidates():
         cmd = [gh_path, "auth", "token", *host_args]
-        started = time.monotonic()
-        try:
-            result = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8',
-                                    errors='replace', timeout=_GH_CLI_PROBE_TIMEOUT_SECONDS,
-                                    env=clean_env,
-                                    stdin=subprocess.DEVNULL, **_popen_kwargs)
-        except subprocess.TimeoutExpired:
-            reasons.append(f"{gh_path}: timed out after {_GH_CLI_PROBE_TIMEOUT_SECONDS}s")
-            continue
-        except FileNotFoundError:
-            reasons.append(f"{gh_path}: not found")
-            continue
-        if result.returncode == 0 and result.stdout.strip():
-            _gh_cli_last_failure = ""
-            return result.stdout.strip()
-        # gh's stderr on failure is a message ("not logged in ..."), never a token; cap it anyway.
-        err = " ".join((result.stderr or "").split())[:200]
-        reasons.append(f"{gh_path}: exit {result.returncode} after {time.monotonic() - started:.1f}s"
-                       + (f": {err}" if err else ", empty output"))
+        # A COLD gh (binary + keychain pages evicted after minutes idle) takes ~20s on macOS while
+        # the very next exec takes <1s — the first run is what pages it in. One timeout therefore
+        # proves nothing about the credential, and treating it as a miss blackholed Copilot for the
+        # whole cache TTL (measured 2026-09-27: cold 19.6s, warm 0.49s). Retry once: the timed-out
+        # attempt already did the warming, so the retry is cheap when the credential is healthy and
+        # still bounded when gh is genuinely wedged.
+        for attempt in range(_GH_CLI_PROBE_ATTEMPTS):
+            started = time.monotonic()
+            try:
+                result = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8',
+                                        errors='replace', timeout=_GH_CLI_PROBE_TIMEOUT_SECONDS,
+                                        env=clean_env,
+                                        stdin=subprocess.DEVNULL, **_popen_kwargs)
+            except subprocess.TimeoutExpired:
+                reasons.append(f"{gh_path}: timed out after {_GH_CLI_PROBE_TIMEOUT_SECONDS}s"
+                               + (f" (attempt {attempt + 1})" if _GH_CLI_PROBE_ATTEMPTS > 1 else ""))
+                continue  # retry the same binary warm, then fall through to the next candidate
+            except FileNotFoundError:
+                reasons.append(f"{gh_path}: not found")
+                break
+            if result.returncode == 0 and result.stdout.strip():
+                _gh_cli_last_failure = ""
+                return result.stdout.strip()
+            # gh's stderr on failure is a message ("not logged in ..."), never a token; cap it anyway.
+            err = " ".join((result.stderr or "").split())[:200]
+            reasons.append(f"{gh_path}: exit {result.returncode} after {time.monotonic() - started:.1f}s"
+                           + (f": {err}" if err else ", empty output"))
+            break  # a real answer from gh (not logged in, etc.) — retrying won't change it
     _gh_cli_last_failure = "; ".join(reasons) or "no gh binary found"
     return None
 

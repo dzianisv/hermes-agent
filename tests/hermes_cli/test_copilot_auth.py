@@ -103,6 +103,36 @@ class TestGhCliTokenCache:
         self._reset()
 
 
+    def test_cold_exec_timeout_is_retried_warm(self, monkeypatch):
+        """A cold `gh` exec times out, the immediate warm retry succeeds → token, not a miss.
+
+        Measured on macOS 2026-09-27: `gh auth token` after 5 min idle took 19.6s (over the 15s
+        probe timeout) while the very next exec took 0.49s. Reading that lone timeout as "no
+        credential" is what crashed kanban workers with "No usable credentials found for provider
+        'copilot'" while the gh login was perfectly healthy.
+        """
+        import subprocess
+
+        from hermes_cli import copilot_auth
+        self._reset()
+        for env_var in copilot_auth.COPILOT_ENV_VARS:
+            monkeypatch.delenv(env_var, raising=False)
+        monkeypatch.setattr(copilot_auth, "_gh_cli_candidates", lambda: ["/fake/gh"])
+        outcomes = iter([
+            subprocess.TimeoutExpired(cmd="gh", timeout=15),          # cold exec
+            subprocess.CompletedProcess([], 0, stdout="gho_warm\n", stderr=""),  # warm retry
+        ])
+
+        def _fake_run(*_args, **_kwargs):
+            outcome = next(outcomes)
+            if isinstance(outcome, BaseException):
+                raise outcome
+            return outcome
+
+        monkeypatch.setattr(copilot_auth.subprocess, "run", _fake_run)
+        assert copilot_auth.resolve_copilot_token() == ("gho_warm", "gh auth token")
+        self._reset()
+
     def test_ttl_expiry_reprobes(self, monkeypatch):
         from hermes_cli import copilot_auth
         self._reset()
@@ -130,6 +160,9 @@ class TestGhCliTokenCache:
         monkeypatch.setattr(copilot_auth, "_gh_cli_candidates", lambda: ["/fake/gh"])
         outcomes = iter([
             subprocess.CompletedProcess([], 0, stdout="gho_good\n", stderr=""),
+            # Each re-probe now makes up to _GH_CLI_PROBE_ATTEMPTS attempts (a cold-exec timeout is
+            # retried warm), so a failing re-probe consumes two outcomes.
+            subprocess.TimeoutExpired(cmd="gh", timeout=1),
             subprocess.TimeoutExpired(cmd="gh", timeout=1),
             subprocess.CompletedProcess([], 1, stdout="", stderr="error connecting to keyring"),
         ])
