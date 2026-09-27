@@ -114,6 +114,8 @@ _gh_cli_token_cache: tuple[float, Optional[str]] | None = None
 # whole cache TTL while the token stayed valid (2026-09-26).
 _gh_cli_last_good_token: Optional[str] = None
 _gh_cli_probe_failing = False
+# Why the last probe produced no token (timeout / exit code + gh stderr head); never the token.
+_gh_cli_last_failure = ""
 
 
 def _invalidate_gh_cli_token_cache() -> None:
@@ -142,8 +144,9 @@ def _try_gh_cli_token() -> Optional[str]:
         _gh_cli_last_good_token = token
     else:
         if not _gh_cli_probe_failing:
-            logger.warning("`gh auth token` returned no token (timed out, failed or not logged "
-                           "in); %s", "keeping the token obtained earlier in this process"
+            logger.warning("`gh auth token` returned no token (%s); %s",
+                           _gh_cli_last_failure or "unknown",
+                           "keeping the token obtained earlier in this process"
                            if _gh_cli_last_good_token else "Copilot has no gh credential")
         _gh_cli_probe_failing = True
         token = _gh_cli_last_good_token
@@ -160,18 +163,30 @@ def _probe_gh_cli_token() -> Optional[str]:
     clean_env.setdefault("GH_NO_UPDATE_NOTIFIER", "1")
     _popen_kwargs = {"creationflags": windows_hide_flags()} if IS_WINDOWS else {}
     host_args = ["--hostname", hostname] if hostname else []
+    global _gh_cli_last_failure
+    reasons: list[str] = []
     for gh_path in _gh_cli_candidates():
         cmd = [gh_path, "auth", "token", *host_args]
+        started = time.monotonic()
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8',
                                     errors='replace', timeout=_GH_CLI_PROBE_TIMEOUT_SECONDS,
                                     env=clean_env,
                                     stdin=subprocess.DEVNULL, **_popen_kwargs)
-        except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
-            logger.debug("gh CLI token lookup failed (%s): %s", gh_path, exc)
+        except subprocess.TimeoutExpired:
+            reasons.append(f"{gh_path}: timed out after {_GH_CLI_PROBE_TIMEOUT_SECONDS}s")
+            continue
+        except FileNotFoundError:
+            reasons.append(f"{gh_path}: not found")
             continue
         if result.returncode == 0 and result.stdout.strip():
+            _gh_cli_last_failure = ""
             return result.stdout.strip()
+        # gh's stderr on failure is a message ("not logged in ..."), never a token; cap it anyway.
+        err = " ".join((result.stderr or "").split())[:200]
+        reasons.append(f"{gh_path}: exit {result.returncode} after {time.monotonic() - started:.1f}s"
+                       + (f": {err}" if err else ", empty output"))
+    _gh_cli_last_failure = "; ".join(reasons) or "no gh binary found"
     return None
 
 
