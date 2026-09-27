@@ -230,3 +230,81 @@ class TestExchangeFailureFastPath:
         mod._exchange_failure_cache[fp] = time.time() + 999
         evict_cached_exchanged_token("gho_stale")
         assert fp not in mod._exchange_failure_cache
+
+
+class TestPersistedExchangeRejection:
+    """A permanent exchange rejection must survive into fresh processes.
+
+    GitHub's exchange endpoint answered 403 for weeks; every fresh process (kanban workers, cron
+    children) retried it — 8,450 failed attempts on 2026-09-25 — before falling back to the raw
+    token that works.
+    """
+
+    _RAW = "gho_rejected"
+
+    def _http_error(self, code):
+        import urllib.error
+        return urllib.error.HTTPError(
+            url="https://api.github.com/copilot_internal/v2/token",
+            code=code, msg="err", hdrs=None, fp=None,
+        )
+
+    def _ok_response(self):
+        resp = MagicMock()
+        resp.read.return_value = json.dumps(
+            {"token": "tid=ok;exp=1", "expires_at": time.time() + 1800}).encode()
+        resp.__enter__ = MagicMock(return_value=resp)
+        resp.__exit__ = MagicMock(return_value=False)
+        return resp
+
+    def _reject_in_first_process(self, mod):
+        with patch.object(mod, "_urlopen_bounded", side_effect=self._http_error(403)) as net:
+            with pytest.raises(ValueError):
+                mod.exchange_copilot_token(self._RAW)
+        assert net.call_count == 1
+        # Fresh process: in-process state gone, same HERMES_HOME.
+        mod._jwt_cache.clear()
+        mod._exchange_failure_cache.clear()
+
+    @patch("time.sleep")
+    def test_fresh_process_skips_the_network_and_falls_back_to_raw(self, _sleep):
+        import hermes_cli.copilot_auth as mod
+
+        self._reject_in_first_process(mod)
+        with patch.object(mod, "_urlopen_bounded") as net:
+            with pytest.raises(ValueError):
+                mod.exchange_copilot_token(self._RAW)
+            assert mod.get_copilot_api_token(self._RAW) == (self._RAW, None)
+        net.assert_not_called()
+        assert self._RAW not in mod._jwt_disk_path().read_text()
+
+    @patch("time.sleep")
+    def test_rejection_holds_for_hours_then_lifts_on_evict_or_expiry(self, _sleep, monkeypatch):
+        import hermes_cli.copilot_auth as mod
+
+        real_time = time.time
+        offset = {"s": 0.0}
+        monkeypatch.setattr(mod.time, "time", lambda: real_time() + offset["s"])
+
+        self._reject_in_first_process(mod)
+        offset["s"] = 5 * 3600
+        with patch.object(mod, "_urlopen_bounded") as net:
+            with pytest.raises(ValueError):
+                mod.exchange_copilot_token(self._RAW)
+        net.assert_not_called()
+
+        # Forced refresh must really retry, even from a process that only has the disk record.
+        mod._exchange_failure_cache.clear()
+        mod.evict_cached_exchanged_token(self._RAW)
+        with patch.object(mod, "_urlopen_bounded", return_value=self._ok_response()) as net:
+            assert mod.exchange_copilot_token(self._RAW)[0] == "tid=ok;exp=1"
+        assert net.call_count == 1
+
+        # Expiry: a new rejection, then a fresh process past the window hits the network again.
+        mod.evict_cached_exchanged_token(self._RAW)
+        offset["s"] = 0.0
+        self._reject_in_first_process(mod)
+        offset["s"] = 6 * 3600 + 60
+        with patch.object(mod, "_urlopen_bounded", return_value=self._ok_response()) as net:
+            assert mod.exchange_copilot_token(self._RAW)[0] == "tid=ok;exp=1"
+        assert net.call_count == 1

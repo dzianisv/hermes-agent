@@ -274,8 +274,12 @@ def _exchange_lock_for(fp: str) -> threading.Lock:
         return lock
 
 
-_EXCHANGE_FAILURE_TTL_TRANSIENT_SECONDS = 60.0     # network blips: retry soon
-_EXCHANGE_FAILURE_TTL_PERMANENT_SECONDS = 1800.0   # 401/403/404: won't heal
+_EXCHANGE_FAILURE_TTL_TRANSIENT_SECONDS = 60.0     # network blips: retry soon, in-process only
+# 401/403/404 won't heal: also persisted to the JWT store so fresh processes (kanban workers, cron
+# children) skip the doomed request — GitHub answered 403 for weeks and every new process retried
+# it (8,450 failed attempts in one day) before falling back to the raw token.
+_EXCHANGE_FAILURE_TTL_PERMANENT_SECONDS = 6 * 3600.0
+_REJECTED_UNTIL_KEY = "exchange_rejected_until"
 # The token itself is rejected — retrying with backoff just blocks the caller.
 _EXCHANGE_PERMANENT_HTTP_STATUSES = frozenset({401, 403, 404})
 
@@ -333,6 +337,7 @@ def evict_cached_exchanged_token(raw_token: str) -> None:
     # Eviction = "force a fresh exchange": the negative-cache entry must go too.
     _exchange_failure_cache.pop(fp, None)
 
+    # Removing the store entry also drops a persisted exchange rejection for this token.
     def _evict(path, store):
         if store is not None and fp in store:
             del store[fp]
@@ -354,17 +359,40 @@ def _load_jwt_from_disk(fp: str) -> Optional[tuple[str, float, Optional[str]]]:
     return _with_jwt_store("load persisted", _load)
 
 
-def _save_jwt_to_disk(fp: str, api_token: str, expires_at: float, base_url: Optional[str]) -> None:
-    """Persist an exchanged JWT (0o600), pruning expired entries."""
+def _write_store_entry(fp: str, entry: dict, verb: str) -> None:
+    """Replace the store entry for ``fp`` (0o600), pruning entries whose ``expires_at`` passed."""
     def _save(path, store):
         now = time.time()
         kept = {
             k: v for k, v in (store or {}).items()
             if isinstance(v, dict) and float(v.get("expires_at", 0) or 0) > now}
-        kept[fp] = {"api_token": api_token, "expires_at": expires_at, "base_url": base_url}
+        kept[fp] = entry
         atomic_json_write(path, kept, indent=None, mode=0o600)
 
-    _with_jwt_store("persist", _save)
+    _with_jwt_store(verb, _save)
+
+
+def _save_jwt_to_disk(fp: str, api_token: str, expires_at: float, base_url: Optional[str]) -> None:
+    """Persist an exchanged JWT; replacing the entry clears any persisted rejection for ``fp``."""
+    _write_store_entry(fp, {"api_token": api_token, "expires_at": expires_at, "base_url": base_url},
+                       "persist")
+
+
+def _save_exchange_rejection_to_disk(fp: str, until: float) -> None:
+    """Persist "exchange rejected until ``until``" for ``fp``. ``expires_at`` is the prune horizon,
+    so every release's store writer keeps the record until it lapses; with no ``api_token`` no
+    release loads it as a JWT."""
+    _write_store_entry(fp, {_REJECTED_UNTIL_KEY: until, "expires_at": until},
+                       "persist exchange rejection for")
+
+
+def _load_exchange_rejection_from_disk(fp: str) -> float:
+    """Epoch until which ``fp``'s exchange is persisted as rejected (0.0 when none)."""
+    def _load(path, store):
+        entry = (store or {}).get(fp)
+        return float(entry.get(_REJECTED_UNTIL_KEY) or 0) if isinstance(entry, dict) else 0.0
+
+    return _with_jwt_store("load exchange rejection for", _load) or 0.0
 
 
 # urllib's ``timeout`` only bounds socket ops AFTER DNS; getaddrinfo ignores it, so a networkless
@@ -430,9 +458,12 @@ def _fetch_exchange_with_retry(req, timeout: float, fp: str) -> dict:
                 logger.debug("Copilot token exchange attempt %d/%d failed (%s); retrying in %.1fs",
                              attempt, _EXCHANGE_MAX_ATTEMPTS, exc, sleep_s)
                 time.sleep(sleep_s)
-    _exchange_failure_cache[fp] = time.time() + (
+    until = time.time() + (
         _EXCHANGE_FAILURE_TTL_PERMANENT_SECONDS if permanent_failure
         else _EXCHANGE_FAILURE_TTL_TRANSIENT_SECONDS)
+    _exchange_failure_cache[fp] = until
+    if permanent_failure:
+        _save_exchange_rejection_to_disk(fp, until)
     raise ValueError(f"Copilot token exchange failed after {_EXCHANGE_MAX_ATTEMPTS} attempts: "
                      f"{last_exc}") from last_exc
 
@@ -477,8 +508,13 @@ def _exchange_copilot_token_locked(
         if _cache_entry_fresh(cached):
             _jwt_cache[fp] = cached
             return cached
-    # Negative cache: fail fast so provider discovery / picker opens don't block.
+    # Negative cache: fail fast so provider discovery / picker opens don't block. A permanent
+    # rejection recorded by another process counts too.
     _fail_until = _exchange_failure_cache.get(fp, 0.0)
+    if time.time() >= _fail_until:
+        disk_until = _load_exchange_rejection_from_disk(fp)
+        if disk_until > time.time():
+            _exchange_failure_cache[fp] = _fail_until = disk_until
     if time.time() < _fail_until:
         raise ValueError("Copilot token exchange recently failed; skipping re-attempt "
                          f"for another {int(_fail_until - time.time())}s")
