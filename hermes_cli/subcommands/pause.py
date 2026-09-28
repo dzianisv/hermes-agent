@@ -10,18 +10,38 @@ from __future__ import annotations
 import argparse
 
 
+def _parse_pause_for(value: str) -> float:
+    """``--for`` value (``30m``, ``2h``, ``1d``, ``45s``) → seconds; a unit is required."""
+    from hermes_cli.session_filters import parse_duration_seconds
+
+    text = str(value).strip()
+    seconds = None if text.replace(".", "", 1).isdigit() else parse_duration_seconds(text)
+    if not seconds or seconds <= 0:
+        raise argparse.ArgumentTypeError(
+            f"invalid duration {value!r}: use e.g. 30m, 2h, 1d (a unit is required)")
+    return seconds
+
+
 def cmd_pause(args: argparse.Namespace) -> int:
     """Engage the global emergency stop."""
-    from agent.estop import engage, get_state, is_engaged
+    from agent.estop import default_max_seconds, engage, format_remaining, get_state, is_engaged, lifts_phrase
 
     reason = getattr(args, "reason", None)
+    expires_in = getattr(args, "pause_for", None)
     already = is_engaged()
-    path = engage(reason=reason)
+    path = engage(reason=reason, expires_in=expires_in)
     state = get_state() or {}
     verb = "Still paused" if already else "Hermes paused"
     detail = f" — reason: {state['reason']}" if state.get("reason") else ""
     print(f"⏸️  {verb}{detail}")
     print(f"    sentinel: {path}")
+    lifts = lifts_phrase(state)
+    if lifts:
+        source = "--for" if expires_in is not None else (
+            f"estop.default_max_seconds={default_max_seconds()} ({format_remaining(default_max_seconds())})")
+        print(f"    Pause {lifts} [{source}].")
+    else:
+        print("    No expiry: the pause holds until `hermes resume` (estop.default_max_seconds=0).")
     print(
         "    Cron dispatch, kanban dispatch, and new gateway turns are on hold.\n"
         "    In-flight work keeps running. Run `hermes resume` to lift the pause.")
@@ -48,6 +68,10 @@ def build_pause_parser(subparsers) -> None:
             "`hermes resume`. In-flight work is never killed.")
     pause_parser.add_argument(
         "--reason", default=None, help="Optional reason stored in the sentinel and shown to users")
+    pause_parser.add_argument(
+        "--for", dest="pause_for", type=_parse_pause_for, default=None, metavar="DURATION",
+        help="Lift automatically after DURATION (e.g. 30m, 2h). Without it the pause lifts after "
+             "estop.default_max_seconds (default 6h; 0 = never)")
     pause_parser.set_defaults(func=cmd_pause)
 
     resume_parser = subparsers.add_parser(

@@ -1775,6 +1775,14 @@ DEFAULT_CONFIG = {
         "allow_lazy_installs": True,
     },
 
+    # Global emergency stop (`hermes pause` / `/pause`).
+    "estop": {
+        # A pause set without `--for` lifts itself this many seconds after it was engaged (a
+        # WARNING is logged once when it lapses), so a pause whose owner died can't silently
+        # hold every surface for hours. 0 = never auto-lift. `hermes pause --for 2h` overrides.
+        "default_max_seconds": 21600,
+    },
+
     "cron": {
         "catch_up_missed": True,  # False skips recurring misses beyond the local grace window.
         # Let cron-spawned agents use the cronjob toolset (the "cron-librarian" pattern). Off by
@@ -2106,6 +2114,11 @@ DEFAULT_CONFIG = {
         "loop_watchdog_probe_interval_s": 30.0,
         "loop_watchdog_probe_timeout_s": 10.0,
         "loop_watchdog_max_strikes": 3,
+        # While `hermes pause` is engaged, blocked messages get the "Hermes is paused" notice at
+        # most once per chat/thread per this many seconds; the rest are dropped silently (a
+        # repeating event source must never turn a pause into a message flood). <= 0 = once per
+        # pause per chat.
+        "estop_notice_interval_seconds": 900,
         # Allow all users without allowlists (security opt-in).
         "allow_all_users": False,
         # Bot-to-bot loop guard: admitted bot messages per conversation before a cooldown.
