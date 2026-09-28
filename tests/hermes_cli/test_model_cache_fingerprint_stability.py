@@ -11,6 +11,9 @@ from __future__ import annotations
 import json
 import os
 import time
+from unittest.mock import patch
+
+import pytest
 
 
 def _write_auth(home, *, copilot_token: str, request_count: int, mtime_ns: int) -> None:
@@ -60,3 +63,33 @@ def test_copilot_fingerprint_survives_routine_auth_writes_but_tracks_credential_
     _write_auth(tmp_path, copilot_token="gho_pool_b", request_count=7, mtime_ns=3_000_000_000)
     assert mod._credential_fingerprint("copilot") != baseline
 
+
+@pytest.fixture
+def _no_swr_inflight():
+    import hermes_cli.models as mod
+    with mod._swr_refresh_lock:
+        mod._swr_refresh_inflight.clear()
+    yield
+    with mod._swr_refresh_lock:
+        mod._swr_refresh_inflight.clear()
+
+
+def test_cache_only_read_serves_live_row_stored_under_other_credentials(
+        tmp_path, monkeypatch, _no_swr_inflight):
+    import hermes_cli.models as mod
+    from hermes_cli.models_catalog_static import _PROVIDER_MODELS
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    live = ["gpt-5.9-copilot-live-only", *_PROVIDER_MODELS["copilot"][:3]]
+    assert live[0] not in _PROVIDER_MODELS["copilot"]
+    (tmp_path / "provider_models_cache.json").write_text(json.dumps({
+        "copilot": {"fp": "written-under-earlier-credentials", "at": time.time() - 30, "models": live},
+    }), encoding="utf-8")
+
+    with patch.object(mod, "_spawn_swr_refresh") as spawn, \
+         patch.object(mod, "provider_model_ids") as blocking_fetch:
+        served = mod.cached_provider_model_ids("copilot", non_blocking=True)
+
+    assert served == live
+    spawn.assert_called_once_with("copilot")  # the background refresh re-keys the row
+    blocking_fetch.assert_not_called()

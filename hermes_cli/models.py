@@ -2024,8 +2024,9 @@ def cached_provider_model_ids(
     result. Always returns a list.
 
     ``non_blocking`` marks the GUI read path (``model.options``): it NEVER waits on a provider probe.
-    A same-credentials row of any age is served as-is and a daemon thread warms the next open; a
-    cold/mismatched row returns ``[]`` so the caller keeps its curated list. One degraded provider
+    A same-credentials row of any age, or a live row stored under other credentials (see
+    :func:`_servable_foreign_row`), is served as-is and a daemon thread warms the next open; a cold
+    row returns ``[]`` so the caller keeps its curated list. One degraded provider
     (hanging or timing-out ``/v1/models``) therefore delays nothing but itself (#114215)."""
     normalized = _normalized_cache_slug(provider)
     if not normalized:
@@ -2047,9 +2048,11 @@ def cached_provider_model_ids(
     if non_blocking and not force_refresh:
         # Read path: never touch the network in the caller's thread. A same-credentials row past the
         # SWR window is still served (hour-old catalog beats an empty picker) while a daemon thread
-        # warms the next open; a cold row returns [] and the caller falls back to its curated list.
+        # warms the next open; so is a live row stored under other credentials — for display a stale
+        # real catalog beats the curated list, and the refresh re-keys it. A cold row returns [] and
+        # the caller falls back to its curated list.
         _spawn_swr_refresh(normalized)
-        if _cache_entry_valid(entry, fp, allow_empty=is_ollama):
+        if _cache_entry_valid(entry, fp, allow_empty=is_ollama) or _servable_foreign_row(normalized, entry, now):
             return _chat_catalog_rows([
                 model for model in entry["models"]
                 if not _model_requires_account_discovery(normalized, model)])
@@ -2825,6 +2828,23 @@ def _cache_entry_valid(
         and (allow_empty or bool(entry["models"]))
         and isinstance(entry.get("at"), (int, float))
         and not isinstance(entry.get("at"), bool))
+
+
+# Catalogs keyed on an account principal / token state rather than configuration: a mismatch is
+# always a different entitlement boundary, and their no-token fallback rows are persisted too.
+_PRINCIPAL_KEYED_CATALOGS = frozenset({"openai-codex"})
+
+
+def _servable_foreign_row(slug: str, entry: Any, now: float) -> bool:
+    """Whether the cache-only read may serve a row stored under a different fingerprint: a
+    well-formed, non-empty live row (never a legacy ``fallback`` row) inside the stale-serve
+    window. Account-gated models are still filtered by the caller."""
+    return (
+        slug not in _PRINCIPAL_KEYED_CATALOGS
+        and isinstance(entry, dict)
+        and _cache_entry_valid(entry, entry.get("fp"))
+        and not entry.get("fallback")
+        and now - entry["at"] < _PROVIDER_MODELS_STALE_SERVE_MAX)
 
 
 def _disk_serve_tier(entry: Any, fp: str, now: float, *, is_ollama: bool,
