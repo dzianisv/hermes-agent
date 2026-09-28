@@ -15,6 +15,7 @@ import dataclasses
 import json
 import os
 import re
+import threading
 import time
 from contextlib import suppress
 from gateway.config import Platform
@@ -59,6 +60,55 @@ def strip_discord_triggering_note(event: Any, message_text: Any) -> Any:
         return message_text
     prefix = f"{discord_triggering_note(message_id)}\n\n"
     return message_text[len(prefix):] if message_text.startswith(prefix) else message_text
+
+
+class _EstopNoticeThrottle:
+    """At most one "Hermes is paused" notice per (profile, platform, chat, thread) per window.
+
+    Keyed per engagement (the sentinel's ``engaged_at``): a new `hermes pause` re-arms every chat,
+    and seeing the pause lifted clears all state. In-memory, per process."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._engagement: object = None
+        self._sent: Dict[tuple, float] = {}
+
+    def reset(self) -> None:
+        with self._lock:
+            self._engagement = None
+            self._sent.clear()
+
+    def admit(self, key: tuple, engagement: Optional[str], interval: float) -> bool:
+        """True when *key* should get the notice now (and records it)."""
+        now = time.monotonic()
+        with self._lock:
+            if engagement != self._engagement:
+                self._engagement = engagement
+                self._sent.clear()
+            last = self._sent.get(key)
+            if last is not None and (interval <= 0 or now - last < interval):
+                return False
+            self._sent[key] = now
+            return True
+
+
+_estop_notice_throttle = _EstopNoticeThrottle()
+
+
+def _estop_notice_interval() -> float:
+    """``gateway.estop_notice_interval_seconds`` from the raw gateway config (read per call)."""
+    from gateway.run import _load_gateway_config
+    from hermes_cli.config import DEFAULT_CONFIG, cfg_get
+
+    default = float(DEFAULT_CONFIG["gateway"]["estop_notice_interval_seconds"])
+    raw = cfg_get(_load_gateway_config(), "gateway", "estop_notice_interval_seconds", default=None)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        logger.warning("gateway.estop_notice_interval_seconds=%r is not a number; using %s", raw, default)
+        return default
 
 
 class GatewayInboundMixin:
@@ -285,27 +335,35 @@ class GatewayInboundMixin:
         self, event: "MessageEvent", source: SessionSource, is_internal: bool
     ) -> Optional[str]:
         """Global emergency-stop (`hermes pause`) notice when this turn must be blocked, else None.
-        Placed after auth so unauthorized senders can't probe pause state. A synthetic heartbeat gets
-        "" (blocked, nothing sent): nobody typed it, and its tick stays due, so a notice would repeat
-        every poll."""
+        Placed after auth so unauthorized senders can't probe pause state. "" means blocked with
+        nothing sent: a synthetic heartbeat (nobody typed it; its tick stays due) and any chat already
+        told within ``gateway.estop_notice_interval_seconds`` — no event source can turn a pause into
+        a message flood."""
         if is_internal:
             return None
         try:
-            from agent.estop import paused_reply as _estop_paused_reply
+            from agent.estop import get_state as _estop_get_state, paused_reply as _estop_paused_reply
         except ImportError:
             return None
-        _paused_notice = _estop_paused_reply()
-        if _paused_notice is None or self._hm_estop_turn_allowed(event, source):
+        _estop_state = _estop_get_state()
+        if _estop_state is None:
+            _estop_notice_throttle.reset()
+            return None
+        if self._hm_estop_turn_allowed(event, source):
             return None
         if getattr(event, "_heartbeat_session_id", None):
             logger.debug("Heartbeat turn dropped by global emergency stop")
             return ""
-        logger.info(
-            "Gateway turn paused by global emergency stop (platform=%s chat=%s)",
-            getattr(getattr(source, "platform", None), "value", "unknown"),
-            getattr(source, "chat_id", None) or "unknown",
-        )
-        return _paused_notice
+        _platform = getattr(getattr(source, "platform", None), "value", "unknown")
+        _chat = getattr(source, "chat_id", None) or "unknown"
+        _key = (getattr(source, "profile", None) or "", _platform, str(_chat),
+                str(getattr(source, "thread_id", None) or ""))
+        if not _estop_notice_throttle.admit(_key, _estop_state.get("engaged_at"), _estop_notice_interval()):
+            logger.debug("Gateway turn paused by global emergency stop; notice throttled (platform=%s chat=%s)",
+                         _platform, _chat)
+            return ""
+        logger.info("Gateway turn paused by global emergency stop (platform=%s chat=%s)", _platform, _chat)
+        return _estop_paused_reply(_estop_state)
 
     @staticmethod
     def _hm_write_update_response(response_text: str) -> Optional[str]:

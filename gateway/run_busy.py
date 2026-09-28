@@ -967,8 +967,9 @@ class GatewayBusySessionMixin:
             return f"⏸️ Hermes is already paused{suffix}. Use `/pause off` to resume."
         estop.engage(reason=args or None)
         suffix = f" (reason: {args})" if args else ""
+        lifts = estop.lifts_phrase(estop.get_state())
         return (
-            f"⏸️ Paused{suffix}. New cron/kanban/gateway work is on hold; "
+            f"⏸️ Paused{suffix}{f' — {lifts}' if lifts else ''}. New cron/kanban/gateway work is on hold; "
             "in-flight work finishes normally. Use `/pause off` to resume."
         )
 

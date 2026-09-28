@@ -361,3 +361,59 @@ def test_profile_gateway_honors_canonical_root_estop(tmp_path, monkeypatch):
     assert estop.is_engaged() is True  # still held by profile sentinel
     estop.disengage()
     assert estop.is_engaged() is False
+
+
+# ── pause expiry (`--for`, estop.default_max_seconds) ───────────────────────
+
+
+def test_pause_for_lifts_on_expiry_but_corrupt_sentinel_still_holds(hermes_home):
+    """A pause whose owner died must not hold forever (prod: a `hermes pause` stranded by a gateway
+    restart stayed engaged ~6h). Only a well-formed, expired sentinel lapses; a corrupt one fails safe."""
+    from hermes_cli.status import _estop_status_line
+    from hermes_cli.subcommands.pause import build_pause_parser
+
+    parser = argparse.ArgumentParser()
+    build_pause_parser(parser.add_subparsers())
+    args = parser.parse_args(["pause", "--for", "2h", "--reason", "deploy"])
+    assert args.func(args) == 0
+    assert estop.is_engaged() is True
+    assert "lifts automatically" in estop.paused_reply()
+    assert "(in 1h 59m)" in _estop_status_line() or "(in 2h)" in _estop_status_line()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["pause", "--for", "soon"])
+
+    estop.engage(reason="deploy", expires_in=-1)
+    assert estop.is_engaged() is False
+    assert estop.get_state() is None and estop.paused_reply() is None
+    assert not (hermes_home / "ESTOP").exists()
+
+    (hermes_home / "ESTOP").write_text("", encoding="utf-8")
+    assert estop.is_engaged() is True
+    (hermes_home / "ESTOP").write_text("{not json", encoding="utf-8")
+    assert estop.is_engaged() is True
+
+
+def test_default_max_seconds_lapses_old_pause_once(hermes_home, caplog):
+    from datetime import datetime, timedelta, timezone
+
+    def write_sentinel(age):
+        engaged_at = (datetime.now(timezone.utc) - age).isoformat()
+        (hermes_home / "ESTOP").write_text(json.dumps({"engaged_at": engaged_at, "reason": "r"}), encoding="utf-8")
+
+    write_sentinel(timedelta(hours=1))
+    assert estop.is_engaged() is True  # default 6h not reached
+    write_sentinel(timedelta(hours=7))
+    with caplog.at_level("WARNING", logger="agent.estop"):
+        assert estop.is_engaged() is False
+        assert estop.check_paused("cron", estop.logger) is False
+    assert not (hermes_home / "ESTOP").exists()
+    assert len([r for r in caplog.records if "lapsed" in r.getMessage()]) == 1
+
+    (hermes_home / "config.yaml").write_text("estop:\n  default_max_seconds: 0\n", encoding="utf-8")
+    write_sentinel(timedelta(days=3))
+    assert estop.is_engaged() is True  # 0 = never auto-lift
+    assert estop.get_state()["expires_at"] is None
+
+    (hermes_home / "config.yaml").write_text("estop:\n  default_max_seconds: 60\n", encoding="utf-8")
+    write_sentinel(timedelta(minutes=2))
+    assert estop.is_engaged() is False
