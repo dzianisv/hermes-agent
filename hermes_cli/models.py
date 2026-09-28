@@ -1804,10 +1804,65 @@ def _provider_models_cache_path() -> Path:
     return get_hermes_home() / "provider_models_cache.json"
 
 
+# Other tools' credential stores a provider borrows; only that provider's rows key on them (Claude
+# Code refreshing its OAuth file must not re-key the Copilot row). Codex keys on its principal.
+_EXTERNAL_CREDENTIAL_FILES: dict[str, tuple[str, ...]] = {
+    "anthropic": ("~/.claude/.credentials.json",),
+    "copilot": ("~/.config/github-copilot/hosts.json",),
+    "copilot-acp": ("~/.config/github-copilot/hosts.json",),
+    "minimax": ("~/.minimax/credentials.json",),
+    "minimax-cn": ("~/.minimax/credentials.json",),
+    "minimax-oauth": ("~/.minimax/credentials.json",),
+}
+
+# Pool-entry fields that decide WHICH credential a provider sends. Everything else on an entry
+# (request_count, last_status*, last_error*, cooldowns, refresh stamps) changes on routine use.
+_POOL_IDENTITY_KEYS = ("id", "source", "auth_type", "base_url", "inference_base_url",
+                       "access_token", "secret_fingerprint")
+# Routine-use fields dropped from ``providers.<id>`` OAuth state; tokens stay, so a re-login to a
+# different account (or a token refresh) still re-keys the row.
+_AUTH_STATE_VOLATILE_KEYS = frozenset({
+    "request_count", "last_status", "last_status_at", "last_error_code", "last_error_reason",
+    "last_error_message", "last_error_reset_at", "model_cooldowns", "last_refresh", "agent_key",
+    "agent_key_id", "agent_key_expires_at", "agent_key_expires_in", "agent_key_reused",
+    "agent_key_obtained_at"})
+_auth_identity_memo: dict[tuple, tuple[tuple, str]] = {}
+
+
+def _auth_store_credential_identity(provider: str) -> str:
+    """*provider*'s own credentials in ``auth.json`` (profile, then global fallback): its pool
+    entries' identity fields plus its OAuth state. Memoized on the files' (mtime, size) so the
+    picker's per-provider fingerprints parse the store once per write, not once per provider."""
+    from hermes_cli.auth import (
+        _auth_file_path, _global_auth_file_path, get_provider_auth_state, read_credential_pool)
+
+    paths = tuple(str(p) for p in (_auth_file_path(), _global_auth_file_path()) if p is not None)
+    stamps = []
+    for path in paths:
+        try:
+            st = os.stat(path)
+            stamps.append((st.st_mtime_ns, st.st_size))
+        except FileNotFoundError:
+            stamps.append(None)
+    key, stamp = (provider, paths), tuple(stamps)
+    hit = _auth_identity_memo.get(key)
+    if hit is not None and hit[0] == stamp:
+        return hit[1]
+    pool = [{k: entry.get(k) for k in _POOL_IDENTITY_KEYS}
+            for entry in read_credential_pool(provider) or [] if isinstance(entry, dict)]
+    state = get_provider_auth_state(provider)
+    if isinstance(state, dict):
+        state = {k: v for k, v in state.items() if k not in _AUTH_STATE_VOLATILE_KEYS}
+    identity = json.dumps({"pool": pool, "state": state}, sort_keys=True, default=str)
+    _auth_identity_memo[key] = (stamp, identity)
+    return identity
+
+
 def _credential_fingerprint(provider: str) -> str:
     """Short hash of the credentials ``provider_model_ids(provider)`` would see right now.
 
-    API-key providers include their configured values and credential-file mtimes. Codex uses the
+    API-key providers include their configured values, their own ``auth.json`` credentials and the
+    mtimes of external credential files they borrow. Codex uses the
     stable principal selected by its read-only resolver: routine token and pool-state writes must
     not discard an account-scoped catalog, while a real account switch must invalidate it.
     """
@@ -1887,14 +1942,18 @@ def _credential_fingerprint(provider: str) -> str:
 
         parts.append(f"codex_identity={codex_catalog_credential_identity()}")
     else:
+        # auth.json by content, not mtime: the credential pool rewrites it on every request
+        # (counters, status), which re-keyed every provider's row and hid live catalogs.
+        try:
+            parts.append(f"auth_store={_auth_store_credential_identity(provider)}")
+        except Exception:
+            parts.append("auth_store=unreadable")
         try:
             from hermes_constants import get_hermes_home
-            for rel in ("auth.json", "credentials.json"):
-                _mtime_part(rel, get_hermes_home() / rel)
+            _mtime_part("credentials.json", get_hermes_home() / "credentials.json")
         except Exception:
             pass
-        for rel in ("~/.codex/auth.json", "~/.claude/.credentials.json",
-                    "~/.config/github-copilot/hosts.json", "~/.minimax/credentials.json"):
+        for rel in _EXTERNAL_CREDENTIAL_FILES.get(provider, ()):
             path = os.path.expanduser(rel)
             _mtime_part(path, path)
 
