@@ -3354,9 +3354,65 @@ def redact_review_value(value: Any) -> Any:
     return value
 
 
+def _review_origin_snapshot(conn: sqlite3.Connection, task_id: str):
+    row = conn.execute(
+        "SELECT status, current_run_id, completion_contract, workspace_kind, "
+        "workspace_path, result FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return tuple(row)
+
+
+def _review_origin_gate(
+    conn: sqlite3.Connection, task_id: str, *, summary: Optional[str],
+    metadata: Optional[dict], result: Optional[str], expected_run_id: Optional[int],
+    force: bool,
+):
+    """Resolve handoff SHAs before any write.
+
+    Returns ``(snapshot, None)`` when the write may proceed (no SHAs, or every
+    SHA is on the resolved origin) and ``(None, reason)`` when the handoff
+    must be refused with state untouched. ``(None, None)`` defers to the write
+    path so existing refusal text stays stable and no network runs for a call
+    that cannot move the card.
+    """
+    from hermes_cli.kanban_review_origin import (
+        extract_commit_shas, resolve_review_repo, verify_shas,
+    )
+
+    if not _parents_satisfied(conn, task_id):
+        return None, None
+    row = conn.execute(
+        "SELECT assignee, status, claim_lock, current_run_id, worker_pid, "
+        "worker_started_at, completion_contract, workspace_kind, workspace_path, result "
+        "FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return None, None
+    if expected_run_id is None and not force and _claim_is_live(row):
+        return None, None
+    if row["status"] not in ("running", "ready"):
+        return None, None
+    if expected_run_id is not None and row["current_run_id"] != int(expected_run_id):
+        return None, None
+    shas = extract_commit_shas(summary, metadata, result, row["result"])
+    snapshot = _review_origin_snapshot(conn, task_id)
+    if not shas:
+        return snapshot, None
+    repo = resolve_review_repo(row["completion_contract"], row["workspace_kind"], row["workspace_path"])
+    reason = verify_shas(repo, shas)
+    if reason:
+        return None, reason
+    return snapshot, None
+
+
 def request_review(
     conn: sqlite3.Connection, task_id: str, *, summary: Optional[str] = None,
     metadata: Optional[dict] = None, reviewer: Optional[str] = None,
+    result: Optional[str] = None,
     expected_run_id: Optional[int] = None, force: bool = False, with_reason: bool = False,
 ):
     """``running``/``ready`` -> ``review``; never touches block recurrence accounting.
@@ -3385,13 +3441,25 @@ def request_review(
     # Declared (metadata["artifacts"]) and prose-referenced files
     # must be durable BEFORE anything can clean the scratch workspace up: for a
     # review-bound card the reviewer's completion is the cleanup trigger.
-    metadata = _merge_completion_prose_artifacts(conn, task_id, metadata, summary=summary, result=None)
+    metadata = _merge_completion_prose_artifacts(conn, task_id, metadata, summary=summary, result=result)
+    # Commit existence is a network read. It must finish before write_txn so a
+    # 404/422 refusal cannot stage artifacts or append a review event.
+    origin_snapshot, origin_refusal = _review_origin_gate(
+        conn, task_id, summary=summary, metadata=metadata, result=result,
+        expected_run_id=expected_run_id, force=force,
+    )
+    if origin_refusal:
+        return _ret(False, origin_refusal)
     now = int(time.time())
     # Staged copies live outside the txn: a rollback after staging must not
     # leave orphans that make the retry stage ``name_1.ext`` beside them.
     staged_copies: list[Path] = []
     try:
         with write_txn(conn):
+            if origin_snapshot is not None and _review_origin_snapshot(conn, task_id) != origin_snapshot:
+                from hermes_cli.kanban_review_origin import STALE_SNAPSHOT
+
+                return _ret(False, STALE_SNAPSHOT)
             if not _parents_satisfied(conn, task_id):
                 return _ret(False, "parent dependencies are not satisfied")
             trow = conn.execute(

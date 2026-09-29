@@ -552,6 +552,10 @@ class _StatusRejected(Exception):
 _RUNNING_DIRECT_MSG = "Cannot set status to 'running' directly; use the dispatcher/claim path"
 
 
+class _ReviewOriginRejected(Exception):
+    """Handoff commit is not on the task's GitHub origin; card was not moved."""
+
+
 def _drag_to(conn, task_id: str, s: str) -> bool:
     """Drag-drop into ready/todo/triage: blocked/scheduled -> ready re-opens via ``unblock_task``;
     leaving ``review`` goes through ``reopen_review_task`` (stale-run recovery, parent re-gate,
@@ -572,11 +576,28 @@ _STATUS_HANDLERS: dict[str, Any] = {
         conn, tid, result=p.result, summary=p.summary, metadata=p.metadata, force=True),
     "blocked": lambda conn, tid, p: kanban_db.block_task(conn, tid, reason=getattr(p, "block_reason", None)),
     "scheduled": lambda conn, tid, p: kanban_db.schedule_task(conn, tid, reason=getattr(p, "block_reason", None)),
-    "review": lambda conn, tid, p: kanban_db.request_review(
-        conn, tid, summary=p.summary, metadata=p.metadata, reviewer=(p.assignee or None), force=True),
+    "review": lambda conn, tid, p: _status_review(conn, tid, p),
     "ready": lambda conn, tid, p: _drag_to(conn, tid, "ready"),
     "todo": lambda conn, tid, p: _drag_to(conn, tid, "todo"),
     "triage": lambda conn, tid, p: _drag_to(conn, tid, "triage")}
+
+
+def _status_review(conn, task_id: str, payload) -> bool:
+    """Dashboard/bulk review uses the same origin gate as CLI and the tool.
+
+    A push/origin refusal is raised so the HTTP surface can show it; other
+    refusals stay a bare false for the existing conflict text.
+    """
+    from hermes_cli.kanban_review_origin import is_origin_refusal
+
+    ok, reason = kanban_db.request_review(
+        conn, task_id, summary=payload.summary, metadata=payload.metadata,
+        result=getattr(payload, "result", None), reviewer=(payload.assignee or None),
+        force=True, with_reason=True,
+    )
+    if not ok and is_origin_refusal(reason):
+        raise _ReviewOriginRejected(reason)
+    return bool(ok)
 
 
 def _apply_status(conn, task_id: str, s: str, p, unknown_detail: str) -> bool:
@@ -618,8 +639,11 @@ def _patch_status(conn, task_id: str, payload: UpdateTaskBody, review_assignee_d
     if s == "archived":
         ok = kanban_db.archive_task(conn, task_id)
     else:
-        with _map_errors(400, _StatusRejected, ValueError):
-            ok = _apply_status(conn, task_id, s, payload, f"unknown status: {s}")
+        try:
+            with _map_errors(400, _StatusRejected, ValueError):
+                ok = _apply_status(conn, task_id, s, payload, f"unknown status: {s}")
+        except _ReviewOriginRejected as exc:
+            raise _conflict(str(exc)) from None
         if s == "review" and ok and review_assignee_deferred and not payload.assignee:
             ok = kanban_db.assign_task(conn, task_id, None)
     if ok:
@@ -808,8 +832,16 @@ def _bulk_apply_one(conn, tid: str, payload: BulkTaskBody, board: Optional[str],
         entry.update(ok=False, error="archive refused")
     if payload.status is not None and not payload.archive:
         s = payload.status
-        if not _apply_status(conn, tid, s, payload, f"unknown status {s!r}"):
-            entry.update(ok=False, error=_open_parent_refusal(conn, tid, s) or f"transition to {s!r} refused")
+        try:
+            moved = _apply_status(conn, tid, s, payload, f"unknown status {s!r}")
+        except _ReviewOriginRejected as exc:
+            entry.update(ok=False, error=str(exc))
+            moved = False
+        if not moved:
+            entry.update(
+                ok=False,
+                error=entry.get("error") or _open_parent_refusal(conn, tid, s) or f"transition to {s!r} refused",
+            )
     if payload.assignee is not None:
         try:
             ok = (kanban_db.reassign_task(conn, tid, payload.assignee or None, reclaim_first=True) if payload.reclaim_first

@@ -216,7 +216,10 @@ KANBAN_REQUEST_REVIEW_SCHEMA = _schema(
         "summary": _prop("string", (
                 "What was implemented and how it was verified, in one or "
                 "two sentences — shown to the reviewer. Don't paste "
-                "the whole diff; the reviewer has the board and the PR."
+                "the whole diff; the reviewer has the board and the PR. "
+                "Every commit SHA in the summary, metadata, or task result "
+                "must already exist on the task's GitHub origin; a local-only "
+                "SHA is rejected with 'push first' and the card stays put."
         )),
         "reviewer": _prop("string", (
                 "Optional reviewer profile. When provided, the task is "
