@@ -2755,6 +2755,14 @@ def complete_task(
     auditable event. Approving a card out of ``review`` stays exempt.
     """
     now = int(time.time())
+    # Reviewer APPROVED-at-sha is not done: hand the card back for the merge
+    # before the parent gate, which would otherwise refuse a still-open upstream.
+    from hermes_cli.kanban_db_harness import return_approved_to_implementer
+    if return_approved_to_implementer(
+        conn, task_id, summary=summary, result=result, metadata=metadata,
+        expected_run_id=expected_run_id, force=force,
+    ):
+        return True
     # Cheap pre-check; re-checked inside the txn to close the parent-reopen race.
     if not _parents_satisfied(conn, task_id):
         return False
@@ -3238,7 +3246,7 @@ def block_task(
         raise ValueError(f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None")
     with write_txn(conn):
         cur_row = conn.execute(
-            "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?", (task_id,),
+            "SELECT status, assignee, block_kind, block_recurrences FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if cur_row is None:
             return False
@@ -3264,6 +3272,15 @@ def block_task(
                 "kind": kind, "reason": reason, "classified_in_place": True,
             })
             return True
+        # Worker path only. A marker-less block from a gated profile is not a
+        # blocker: return the card to ready and keep loop memory untouched.
+        from hermes_cli.kanban_db_harness import reject_markerless_block
+        rejected = reject_markerless_block(
+            conn, task_id, reason=reason, kind=kind, expected_run_id=expected_run_id,
+            assignee=cur_row["assignee"],
+        )
+        if rejected is not None:
+            return rejected
         source_status = _retry_status_for_run(conn, task_id) if cur_row["status"] == "running" else "ready"
         requested_kind = kind
         rekind_reason = None
@@ -3558,17 +3575,19 @@ def request_changes(
         run_id = _end_run(
             conn, task_id, outcome="changes_requested", status=new_status, summary=reason,
         )
+        changes_payload = {
+            "reason": reason,
+            "implementer": implementer,
+            "reviewer": reviewer,
+            "status": new_status,
+        }
+        from hermes_cli.kanban_db_harness import approval_head_sha
+        head_sha = approval_head_sha(reason)
+        if head_sha:
+            changes_payload["step"] = "merge"
+            changes_payload["head_sha"] = head_sha
         _append_event(
-            conn,
-            task_id,
-            "changes_requested",
-            {
-                "reason": reason,
-                "implementer": implementer,
-                "reviewer": reviewer,
-                "status": new_status,
-            },
-            run_id=run_id,
+            conn, task_id, "changes_requested", changes_payload, run_id=run_id,
         )
     return True, implementer
 

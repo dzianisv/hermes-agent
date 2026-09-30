@@ -782,7 +782,13 @@ def _handle_block(args: dict, **kw) -> str:
                f"the completion judge will evaluate it.")
         ok = kb.block_task(conn, tid, reason=reason, kind=kind, expected_run_id=_worker_run_id(tid))
         _check(ok, f"could not block {tid} (unknown id or not in running/ready)")
-        landed_kind = kb.get_task(conn, tid).block_kind
+        landed = kb.get_task(conn, tid)
+        if landed is not None and landed.status == "ready":
+            from hermes_cli.kanban_db_harness import BLOCK_REJECTED_NOTE
+            return _ok_landed(
+                kb, conn, tid, "ready", block_rejected=True, note=BLOCK_REJECTED_NOTE,
+            )
+        landed_kind = landed.block_kind if landed else None
         extra: dict = {"block_kind": landed_kind}
         if kind == "dependency" and landed_kind != kind:
             # block_task re-kinds a dependency wait that no open parent can satisfy.

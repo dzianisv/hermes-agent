@@ -1939,6 +1939,14 @@ DEFAULT_CONFIG = {
         # On boards that never archive, the notifier GC purges subscriptions for tasks done with no
         # activity for this many days so stale rows aren't scanned forever. 0 = off.
         "done_sub_retention_days": 30,
+        # Worker blocks (expected_run_id set) from these profiles are rejected back to ready
+        # unless the reason has a BLOCKER:HUMAN|EXTERNAL|DEP line. Human CLI blocks are exempt.
+        # Empty list disables the gate. An open dependency parent counts as BLOCKER:DEP.
+        "block_marker_required_profiles": ["software-engineer"],
+        # Reviewer completion that says APPROVED at a head sha returns the card to the
+        # implementer for the sanctioned merge instead of marking it done. metadata.merged
+        # opts out (the merge already happened).
+        "approval_returns_to_implementer": True,
     },
     # Bot Mode cross-connection relay (tools/bot_relay.py): envelopes queued by message_agent for
     # agents on other connections wait in an on-disk outbox until the Desktop drains them.
