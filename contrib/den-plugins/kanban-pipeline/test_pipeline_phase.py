@@ -70,7 +70,7 @@ def _fresh_home(tmp_path_factory, config_yaml=CONFIG_YAML):
         os.environ.pop(v, None)
     for prof in ("reviewer", "software-engineer", "default"):
         os.makedirs(os.path.join(home, "profiles", prof), exist_ok=True)
-    with open(os.path.join(home, "config.yaml"), "w") as fh:
+    with open(os.path.join(home, "config.yaml"), "w", encoding="utf-8") as fh:
         fh.write(config_yaml)
     return home
 
@@ -536,12 +536,12 @@ def test_real_hook_through_complete_task_and_default_transport(tmp_path_factory)
     os.makedirs(plug, exist_ok=True)
     shutil.copy(PLUGIN_SRC, os.path.join(plug, "__init__.py"))
     shutil.copy(PLUGIN_YAML, os.path.join(plug, "plugin.yaml"))
-    with open(os.path.join(home, "config.yaml"), "w") as fh:
+    with open(os.path.join(home, "config.yaml"), "w", encoding="utf-8") as fh:
         fh.write("plugins:\n  enabled: [kanban-pipeline]\n" + CONFIG_YAML)
 
     bindir = str(tmp_path_factory.mktemp("fakebin"))
     ghp = os.path.join(bindir, "gh")
-    with open(ghp, "w") as fh:
+    with open(ghp, "w", encoding="utf-8") as fh:
         fh.write(FAKE_GH)
     os.chmod(ghp, os.stat(ghp).st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
 
@@ -616,11 +616,11 @@ def _install_fake_gh(tmp_path_factory, fixture):
     """Put a fixtured, argv-logging fake `gh` first on PATH. No network."""
     bindir = str(tmp_path_factory.mktemp("fakebin"))
     ghp = os.path.join(bindir, "gh")
-    with open(ghp, "w") as fh:
+    with open(ghp, "w", encoding="utf-8") as fh:
         fh.write(FAKE_GH_FIXTURED)
     os.chmod(ghp, os.stat(ghp).st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
     fxp = os.path.join(bindir, "fixture.json")
-    with open(fxp, "w") as fh:
+    with open(fxp, "w", encoding="utf-8") as fh:
         json.dump(fixture, fh)
     logp = os.path.join(bindir, "argv.jsonl")
     os.environ["KP_FAKE_GH_FIXTURE"] = fxp
@@ -658,7 +658,7 @@ def test_green_push_run_on_another_workflow_is_never_deployment_evidence(env, tm
     assert state["deployed"] is None, state
     assert "UNKNOWN" in state["detail"]
 
-    calls = [json.loads(l) for l in open(log)]
+    calls = [json.loads(l) for l in open(log, encoding="utf-8")]
     api = [c[1] for c in calls if c[:1] == ["api"]]
     assert any("branch=main" in q for q in api), api          # target branch scoped
     assert not any("compare" in q for q in api), api          # ancestry never alone
