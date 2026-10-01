@@ -7,6 +7,8 @@ must require the spawn-time start fingerprint to match, never bare PID existence
 
 import os
 import signal
+import subprocess
+import sys
 import time
 
 import pytest
@@ -169,6 +171,24 @@ def test_unreadable_or_junk_fingerprint_is_recycled(monkeypatch):
     assert kbd._pid_recycled(pid, recorded) is True
 
 
+def test_non_positive_composed_start_parts_are_not_the_same_worker(monkeypatch):
+    """Drift tolerance must not run until both composed start parts are strictly positive.
+
+    ``('0','0')`` and ``('-1','-1')`` compare equal under a bare abs-diff, which would keep a
+    junk fingerprint as "our worker". Empty and non-numeric are the same refusal.
+    """
+    from gateway import status
+
+    pid = os.getpid()
+    live = kbd._process_fingerprint(pid)
+    assert live is not None and "|" in live
+    epoch = live.rsplit("|", 1)[0]
+    for junk in ("0", "-1", "", "not-a-number"):
+        assert kbd._start_parts_match(junk, junk) is False
+        monkeypatch.setattr(status, "get_process_start_time", lambda _pid, value=junk: value)
+        assert kbd._pid_recycled(pid, f"{epoch}|{junk}") is True
+
+
 def test_legacy_integer_fingerprint_tolerates_drift_but_not_junk(monkeypatch):
     """Pre-boot-witness rows store the ×100 start time only. Same tolerance as the composed start
     part; a non-positive reading stays foreign so the kill guard does not signal junk."""
@@ -246,3 +266,94 @@ def test_unverified_fingerprint_capture_never_authorizes_a_signal(board, monkeyp
     monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
     assert kb.release_stale_claims(conn, signal_fn=sig) == 1
     assert killed == [] and kb.get_task(conn, tid2).status == "ready"
+
+
+def _stop_children(procs) -> None:
+    for proc in procs:
+        if proc.poll() is not None:
+            continue
+        proc.terminate()
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=2)
+
+
+def _counting_live_spawn(calls: list, procs: list):
+    """spawn_fn that starts a real child and returns its pid. Counts every call."""
+    def spawn_fn(task, workspace, board=None):
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(120)"],
+            start_new_session=True,
+        )
+        procs.append(proc)
+        calls.append(task.id)
+        return proc.pid
+    return spawn_fn
+
+
+def _dispatch_live_worker(conn, monkeypatch, tmp_path):
+    """One manual tick that spawns a real child and records its fingerprint."""
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
+    calls: list = []
+    procs: list = []
+    tid = kb.create_task(conn, title="drift", assignee="worker")
+    first = kbd.dispatch_once(conn, spawn_fn=_counting_live_spawn(calls, procs))
+    assert calls == [tid], first
+    assert first.crashed == []
+    task = kb.get_task(conn, tid)
+    assert task.status == "running" and task.worker_pid == procs[0].pid
+    assert procs[0].poll() is None
+    recorded = conn.execute(
+        "SELECT worker_started_at FROM tasks WHERE id = ?", (tid,),
+    ).fetchone()["worker_started_at"]
+    assert recorded and "|" in str(recorded) and recorded != kbd.UNVERIFIED_WORKER_FINGERPRINT
+    return tid, calls, procs, recorded
+
+
+def test_dispatch_once_keeps_live_worker_across_macos_start_drift(
+    board, all_assignees_spawnable, monkeypatch, tmp_path,
+):
+    """A later manual tick must not crash/respawn a live child whose start time drifted by 100.
+
+    That is the observed macOS gap (#117505). ``dispatch_once`` reads ``get_process_start_time``
+    via the late import in the dispatch module, so the patch lands on that name.
+    """
+    from gateway.status import START_TIME_DRIFT_TOLERANCE
+
+    conn = board
+    tid, calls, procs, recorded = _dispatch_live_worker(conn, monkeypatch, tmp_path)
+    try:
+        assert 100 <= START_TIME_DRIFT_TOLERANCE
+        _drift_start_time(monkeypatch, -100)
+        second = kbd.dispatch_once(conn, spawn_fn=_counting_live_spawn(calls, procs))
+        assert calls == [tid]
+        assert second.crashed == []
+        task = kb.get_task(conn, tid)
+        assert task.status == "running" and task.worker_pid == procs[0].pid
+        assert procs[0].poll() is None
+        assert "crashed" not in [e.kind for e in kb.list_events(conn, tid)]
+        still = conn.execute(
+            "SELECT worker_started_at, status FROM tasks WHERE id = ?", (tid,),
+        ).fetchone()
+        assert still["status"] == "running" and still["worker_started_at"] == recorded
+    finally:
+        _stop_children(procs)
+
+
+def test_dispatch_once_far_start_drift_detects_recycled_pid(
+    board, all_assignees_spawnable, monkeypatch, tmp_path,
+):
+    """The same tick path must still crash a live pid whose start time is far outside tolerance."""
+    from gateway.status import START_TIME_DRIFT_TOLERANCE
+
+    conn = board
+    tid, calls, procs, _recorded = _dispatch_live_worker(conn, monkeypatch, tmp_path)
+    try:
+        _drift_start_time(monkeypatch, START_TIME_DRIFT_TOLERANCE + 10_000)
+        second = kbd.dispatch_once(conn, spawn_fn=_counting_live_spawn(calls, procs))
+        assert tid in second.crashed
+        assert "crashed" in [e.kind for e in kb.list_events(conn, tid)]
+    finally:
+        _stop_children(procs)
