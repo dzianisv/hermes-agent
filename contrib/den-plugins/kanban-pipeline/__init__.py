@@ -668,7 +668,7 @@ def _chain_lock(kb, board, timeout):
         if path:
             try:
                 import fcntl
-                fh = open(path, "a+")
+                fh = open(path, "a+", encoding="utf-8")
                 while True:
                     try:
                         fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)

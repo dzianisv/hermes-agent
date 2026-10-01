@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Restart both Hermes gateways via launchd KeepAlive, detached from the calling gateway.
 sleep 3
 R=$(launchctl list | awk '/ai.hermes.gateway-reviewer$/{print $1}')
