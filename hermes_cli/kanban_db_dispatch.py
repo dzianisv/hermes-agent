@@ -581,9 +581,29 @@ def _split_composed_fingerprint(fingerprint: str) -> Optional[tuple[str, str]]:
     return epoch, start
 
 
+def _positive_start_part(value: Any) -> Optional[int]:
+    """Strictly positive start-time int, else None.
+
+    ``0``, negatives, empty, and non-numeric are not a worker identity. They must not
+    fall into the drift window, where ``('0','0')`` and ``('-1','-1')`` would otherwise
+    compare equal.
+    """
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
 def _start_parts_match(recorded: Any, current: Any) -> bool:
-    """Same ``get_process_start_time`` reading within drift tolerance. Junk is not a match."""
+    """Same ``get_process_start_time`` reading within drift tolerance.
+
+    Both sides must parse as strictly positive ints before the tolerance comparison.
+    Junk is not a match.
+    """
     from gateway.status import start_time_fingerprints_match
+    if _positive_start_part(recorded) is None or _positive_start_part(current) is None:
+        return False
     try:
         return start_time_fingerprints_match(recorded, current)
     except (TypeError, ValueError):
@@ -596,9 +616,10 @@ def _pid_recycled(pid: Optional[int], started_at) -> bool:
     recycled; the UNVERIFIED marker is always foreign.
 
     A composed fingerprint (``"<epoch>|<start>"``) requires the epoch parts to be equal and the start
-    parts to agree via ``start_time_fingerprints_match``. Exact string equality is wrong: macOS
-    ``get_process_start_time`` drifts ~1s (100 units) between spawn and a later read (#117505), which
-    declared a live worker dead and respawned a duplicate. Unreadable or junk => recycled.
+    parts to parse as strictly positive ints before they agree via ``start_time_fingerprints_match``.
+    Exact string equality is wrong: macOS ``get_process_start_time`` drifts ~1s (100 units) between
+    spawn and a later read (#117505), which declared a live worker dead and respawned a duplicate.
+    ``0``, negatives, empty, non-numeric, or unreadable => recycled, not a tolerance match.
 
     An integer fingerprint (rows written before the boot witness) is the same ×100 start-time scale, so
     it uses that tolerance too. Non-positive values stay foreign — the pre-tolerance guard refused
@@ -614,6 +635,9 @@ def _pid_recycled(pid: Optional[int], started_at) -> bool:
         current_fp = _process_fingerprint(int(pid))
         current = _split_composed_fingerprint(current_fp) if current_fp else None
         if recorded is None or current is None or recorded[0] != current[0]:
+            return True
+        # Positive parse first: the tolerance window must not treat 0/negative/junk as the same worker.
+        if _positive_start_part(recorded[1]) is None or _positive_start_part(current[1]) is None:
             return True
         return not _start_parts_match(recorded[1], current[1])
     from gateway.status import get_process_start_time
