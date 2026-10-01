@@ -115,9 +115,11 @@ worker exit of `KANBAN_TERMINAL_PROVIDER_EXIT_CODE` (78 — credential revoked, 
 worker's own `failure_reason` classification via `cli._TERMINAL_PROVIDER_REASONS`) trips it on
 the first attempt, sticky, because no retry can heal it (#114587).
 Process-identity note: `kanban --preserve-cache` contains "serve" — never classify processes by argv
-substring (root). Worker liveness is `(worker_pid, worker_started_at)` — the start-time fingerprint
-(`gateway.status.get_process_start_time`) recorded at claim time — never bare PID existence, or a
-recycled PID gets killed on reclaim.
+substring (root). Worker liveness is `(worker_pid, worker_started_at)` — the spawn fingerprint
+(`<instantiation epoch>|<get_process_start_time>`). Epoch must match; the start part agrees within
+`gateway.status.START_TIME_DRIFT_TOLERANCE` (macOS readings drift ~1s, #117505), never exact string
+equality and never bare PID existence, or a recycled PID gets killed on reclaim / a live worker is
+respawned beside itself.
 
 - **Notifications leave through the task's owning profile.** `hermes_cli/kanban_db_notify.py`
   subscriptions carry the profile; `gateway/kanban_watchers_notifier.py` delivers via THAT
