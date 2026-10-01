@@ -573,23 +573,81 @@ def _worker_alive(pid: Optional[int], started_at) -> bool:
     return not _pid_recycled(pid, started_at)
 
 
+def _split_composed_fingerprint(fingerprint: str) -> Optional[tuple[str, str]]:
+    """``"<epoch>|<start>"`` split on the last ``|``. ``None`` when the separator is missing."""
+    epoch, sep, start = str(fingerprint).rpartition("|")
+    if not sep:
+        return None
+    return epoch, start
+
+
+def _positive_start_part(value: Any) -> Optional[int]:
+    """Strictly positive start-time int, else None.
+
+    ``0``, negatives, empty, and non-numeric are not a worker identity. They must not
+    fall into the drift window, where ``('0','0')`` and ``('-1','-1')`` would otherwise
+    compare equal.
+    """
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _start_parts_match(recorded: Any, current: Any) -> bool:
+    """Same ``get_process_start_time`` reading within drift tolerance.
+
+    Both sides must parse as strictly positive ints before the tolerance comparison.
+    Junk is not a match.
+    """
+    from gateway.status import start_time_fingerprints_match
+    if _positive_start_part(recorded) is None or _positive_start_part(current) is None:
+        return False
+    try:
+        return start_time_fingerprints_match(recorded, current)
+    except (TypeError, ValueError):
+        return False
+
+
 def _pid_recycled(pid: Optional[int], started_at) -> bool:
     """True when a live ``pid`` is NOT the process fingerprinted at spawn (or the fingerprint can no
     longer be read). Signalling it would hit a stranger. ``None`` fingerprint = legacy row, never
-    recycled; the UNVERIFIED marker is always foreign. An integer fingerprint (rows written before the
-    boot witness was added) compares the start time only."""
+    recycled; the UNVERIFIED marker is always foreign.
+
+    A composed fingerprint (``"<epoch>|<start>"``) requires the epoch parts to be equal and the start
+    parts to parse as strictly positive ints before they agree via ``start_time_fingerprints_match``.
+    Exact string equality is wrong: macOS ``get_process_start_time`` drifts ~1s (100 units) between
+    spawn and a later read (#117505), which declared a live worker dead and respawned a duplicate.
+    ``0``, negatives, empty, non-numeric, or unreadable => recycled, not a tolerance match.
+
+    An integer fingerprint (rows written before the boot witness) is the same ×100 start-time scale, so
+    it uses that tolerance too. Non-positive values stay foreign — the pre-tolerance guard refused
+    them, and a 0/negative reading is not a worker identity — so the kill guard does not gain a new
+    window onto junk.
+    """
     if started_at is None or not pid:
         return False
     if started_at == UNVERIFIED_WORKER_FINGERPRINT:
         return True
     if isinstance(started_at, str) and "|" in started_at:
-        return _process_fingerprint(int(pid)) != started_at
-    from gateway.status import _start_times_agree, get_process_start_time
+        recorded = _split_composed_fingerprint(started_at)
+        current_fp = _process_fingerprint(int(pid))
+        current = _split_composed_fingerprint(current_fp) if current_fp else None
+        if recorded is None or current is None or recorded[0] != current[0]:
+            return True
+        # Positive parse first: the tolerance window must not treat 0/negative/junk as the same worker.
+        if _positive_start_part(recorded[1]) is None or _positive_start_part(current[1]) is None:
+            return True
+        return not _start_parts_match(recorded[1], current[1])
+    from gateway.status import get_process_start_time
     current = get_process_start_time(int(pid))
     if current is None:
         return True
     try:
-        return not _start_times_agree(current, started_at)
+        if int(current) <= 0 or int(started_at) <= 0:
+            return True
+        return not _start_parts_match(started_at, current)
     except (TypeError, ValueError):
         return True
 
