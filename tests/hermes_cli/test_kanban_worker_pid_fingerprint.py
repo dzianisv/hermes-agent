@@ -110,6 +110,103 @@ def test_same_pid_and_start_tick_on_another_boot_is_foreign(board, monkeypatch):
     assert kbd._process_fingerprint(os.getpid()) == live_fingerprint
 
 
+def _drift_start_time(monkeypatch, delta: int):
+    """Later ``get_process_start_time`` reads return the real value plus ``delta`` (same scale)."""
+    from gateway import status
+
+    real = status.get_process_start_time
+
+    def drifted(pid: int):
+        start = real(pid)
+        return None if start is None else start + delta
+
+    monkeypatch.setattr(status, "get_process_start_time", drifted)
+    return real
+
+
+def test_one_second_start_drift_is_still_our_worker(monkeypatch):
+    """macOS start-time readings drift ~1s / 100 units between spawn and a later read (#117505).
+
+    Observed: recorded ``|179088627896``, current ``|179088627796``. Exact equality on the composed
+    fingerprint declared the live worker dead.
+    """
+    pid = os.getpid()
+    recorded = kbd._process_fingerprint(pid)
+    assert recorded is not None and "|" in recorded
+    _drift_start_time(monkeypatch, -100)
+    assert kbd._pid_recycled(pid, recorded) is False
+    assert kbd._worker_alive(pid, recorded) is True
+
+
+def test_large_start_drift_is_recycled(monkeypatch):
+    pid = os.getpid()
+    recorded = kbd._process_fingerprint(pid)
+    assert recorded is not None
+    _drift_start_time(monkeypatch, 10000)
+    assert kbd._pid_recycled(pid, recorded) is True
+    assert kbd._worker_alive(pid, recorded) is False
+
+
+def test_different_epoch_is_recycled_even_when_start_matches(monkeypatch):
+    from gateway import drain_control
+
+    pid = os.getpid()
+    recorded = kbd._process_fingerprint(pid)
+    assert recorded is not None
+    monkeypatch.setattr(drain_control, "current_instantiation_epoch", lambda: "other-boot")
+    assert kbd._pid_recycled(pid, recorded) is True
+    assert kbd._worker_alive(pid, recorded) is False
+
+
+def test_unreadable_or_junk_fingerprint_is_recycled(monkeypatch):
+    from gateway import status
+
+    pid = os.getpid()
+    recorded = kbd._process_fingerprint(pid)
+    assert recorded is not None
+    assert kbd._pid_recycled(pid, recorded.rsplit("|", 1)[0] + "|not-a-number") is True
+    monkeypatch.setattr(status, "get_process_start_time", lambda pid: None)
+    assert kbd._pid_recycled(pid, recorded) is True
+
+
+def test_legacy_integer_fingerprint_tolerates_drift_but_not_junk(monkeypatch):
+    """Pre-boot-witness rows store the ×100 start time only. Same tolerance as the composed start
+    part; a non-positive reading stays foreign so the kill guard does not signal junk."""
+    from gateway import status
+
+    pid = os.getpid()
+    recorded = status.get_process_start_time(pid)
+    assert recorded is not None and int(recorded) > 0
+    _drift_start_time(monkeypatch, -100)
+    assert kbd._pid_recycled(pid, recorded) is False
+    monkeypatch.undo()
+    _drift_start_time(monkeypatch, 10000)
+    assert kbd._pid_recycled(pid, recorded) is True
+    monkeypatch.undo()
+    monkeypatch.setattr(status, "get_process_start_time", lambda _pid: 0)
+    assert kbd._pid_recycled(pid, recorded) is True
+    assert kbd._pid_recycled(pid, 0) is True
+
+
+def test_start_drift_does_not_crash_reclaim_a_live_worker(board, monkeypatch):
+    """Dispatcher crash sweep must not emit ``pid N not alive`` or release a live worker whose
+    start-time reading drifted by 100 — that is the respawn-a-duplicate path."""
+    conn = board
+    pid = os.getpid()
+    recorded = kbd._process_fingerprint(pid)
+    assert recorded is not None
+    tid = _claimed_running(conn, pid=pid, started_at=recorded)
+    _drift_start_time(monkeypatch, -100)
+
+    assert kbd.detect_crashed_workers(conn) == []
+    task = kb.get_task(conn, tid)
+    assert task.status == "running"
+    assert task.worker_pid == pid
+    assert "crashed" not in [e.kind for e in kb.list_events(conn, tid)]
+    row = conn.execute("SELECT worker_started_at, status FROM tasks WHERE id = ?", (tid,)).fetchone()
+    assert row["status"] == "running" and row["worker_started_at"] == recorded
+
+
 def test_unverified_fingerprint_capture_never_authorizes_a_signal(board, monkeypatch):
     """Fingerprint capture fails for a new spawn: the row is NOT a legacy NULL row. A live PID under
     it is never SIGTERM/SIGKILLed by any reclaim/timeout path, and the claim is held (not released
