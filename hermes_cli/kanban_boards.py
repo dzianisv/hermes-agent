@@ -19,7 +19,10 @@ def _dispatch_boards(args: argparse.Namespace) -> int:
     handler = _BOARD_HANDLERS.get(sub)
     if handler is None:
         return _err(f"kanban boards: unknown action {sub!r}", 2)
-    return handler(args)
+    try:
+        return handler(args)
+    except kb.BoardMetadataUnreadable as exc:
+        return _err(f"kanban boards {sub}: {exc}")
 
 
 def _board_task_counts(slug: str) -> dict[str, int]:

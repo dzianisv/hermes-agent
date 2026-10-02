@@ -223,6 +223,7 @@ def test_unreadable_board_json_never_lifts_the_cap(boards, monkeypatch):
     assert _spawned_on(boards, "capped") == []
 
     # A valid cap seen once is kept while the file is torn/unreadable.
+    path.unlink()
     kb.write_board_metadata("capped", max_concurrency=2)
     assert kb.board_max_concurrency("capped") == 2
     path.write_text("{")
@@ -232,6 +233,28 @@ def test_unreadable_board_json_never_lifts_the_cap(boards, monkeypatch):
     for _ in range(2):
         _gateway().tick_once_for_board("capped")
     assert len(_spawned_on(boards, "capped")) == 2
+
+
+def test_metadata_write_refuses_torn_board_json_instead_of_wiping_the_cap(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    assert _cli(["boards", "create", "capped"], home).returncode == 0
+    assert _cli(["boards", "set-concurrency", "capped", "1"], home).returncode == 0
+    path = home / "kanban" / "boards" / "capped" / "board.json"
+    good = path.read_bytes()
+    torn = good[: len(good) // 2]
+    path.write_bytes(torn)
+
+    for args in (["boards", "rename", "capped", "New Name"],
+                 ["boards", "set-concurrency", "capped", "3"]):
+        r = _cli(args, home)
+        assert r.returncode != 0, r.stdout
+        assert "cannot be read" in r.stderr and "Traceback" not in r.stderr
+        assert path.read_bytes() == torn
+
+    path.write_bytes(good)
+    listed = {b["slug"]: b for b in json.loads(_cli(["boards", "list", "--json"], home).stdout)}
+    assert listed["capped"]["max_concurrency"] == 1
 
 
 def test_real_board_flag_parser_routes_dispatch_to_the_capped_board(boards, monkeypatch):

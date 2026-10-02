@@ -549,10 +549,23 @@ def _default_board_display_name(slug: str) -> str:
     return " ".join(part.capitalize() for part in slug.replace("_", "-").split("-") if part) or slug
 
 
+class BoardMetadataUnreadable(ValueError):
+    """``board.json`` exists but cannot be read or parsed; writing would replace
+    its fields (``max_concurrency`` among them) with defaults."""
+
+
 def read_board_metadata(board: Optional[str] = None) -> dict:
     """``board.json`` merged over defaults, plus ``slug`` and ``db_path``. Never
     raises — a missing/malformed file yields the synthesized entry."""
     slug = _slug_or_default(board)
+    try:
+        raw = _read_board_json(slug)
+    except (OSError, ValueError):
+        raw = None
+    return _merge_board_metadata(slug, raw)
+
+
+def _merge_board_metadata(slug: str, raw: Optional[dict]) -> dict:
     meta: dict[str, Any] = {
         "slug": slug,
         "name": _default_board_display_name(slug),
@@ -567,10 +580,6 @@ def read_board_metadata(board: Optional[str] = None) -> dict:
         "created_at": None,
         "archived": False,
     }
-    try:
-        raw = _read_board_json(slug)
-    except (OSError, ValueError):
-        raw = None
     if raw is not None:
         # Never let the metadata file claim a different slug than its
         # directory — trust the filesystem.
@@ -602,10 +611,20 @@ def write_board_metadata(
     """Create/update ``board.json``; unmentioned fields are preserved, ``created_at``
     set on first write. ``project_id``/``default_workdir``/``max_concurrency``:
     ``None`` = unchanged, "" (or 0 for ``max_concurrency``) = clear
-    (``project_id`` is not validated here)."""
+    (``project_id`` is not validated here).
+
+    Raises :class:`BoardMetadataUnreadable` when ``board.json`` exists but
+    cannot be read/parsed, instead of overwriting it with defaults."""
     _assert_not_delegated_child_mutation()
     slug = _slug_or_default(board)
-    meta = read_board_metadata(slug)
+    try:
+        raw = _read_board_json(slug)
+    except (OSError, ValueError) as exc:
+        raise BoardMetadataUnreadable(
+            f"board {slug!r}: {board_metadata_path(slug)} exists but cannot be read "
+            f"({exc}); refusing to overwrite it — fix or remove the file and retry"
+        ) from exc
+    meta = _merge_board_metadata(slug, raw)
     # db_path is derived on every read; never persist it into board.json.
     meta.pop("db_path", None)
     if name is not None:
