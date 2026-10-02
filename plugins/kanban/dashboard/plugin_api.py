@@ -1446,8 +1446,10 @@ def rename_board(slug: str, payload: RenameBoardBody):
                 default_workdir = primary_path
         else:
             project_id = ""  # clear the scope
-    meta = kanban_db.write_board_metadata(
-        normed, default_workdir=default_workdir, project_id=project_id, **_board_display_kwargs(payload))
+    # BoardMetadataUnreadable (a ValueError): board.json is corrupt; refuse rather than 500.
+    with _value_error_400():
+        meta = kanban_db.write_board_metadata(
+            normed, default_workdir=default_workdir, project_id=project_id, **_board_display_kwargs(payload))
     return {"board": _annotate_board_meta(meta)}
 
 

@@ -85,3 +85,13 @@ def test_delete_default_board_is_refused(client):
     r = client.delete("/api/plugins/kanban/boards/default")
     assert r.status_code == 400
     assert "default" in r.json()["detail"]
+
+
+def test_rename_board_with_unreadable_metadata_is_400_and_leaves_file(client):
+    client.post("/api/plugins/kanban/boards", json={"slug": "widget", "name": "Widget"})
+    meta_path = kb.board_metadata_path("widget")
+    meta_path.write_text("{not json", encoding="utf-8")
+
+    r = client.patch("/api/plugins/kanban/boards/widget", json={"name": "Gadget"})
+    assert r.status_code == 400, r.text
+    assert meta_path.read_text(encoding="utf-8") == "{not json"
