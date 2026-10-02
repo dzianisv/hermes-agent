@@ -2560,6 +2560,42 @@ def count_running_tasks(conn: sqlite3.Connection) -> int:
         return 0
 
 
+def count_live_terminal_workers(conn: sqlite3.Connection) -> int:
+    """Host-local worker processes still alive after their run ended.
+
+    ``complete_task`` (and every other terminal transition) clears
+    ``tasks.worker_pid`` and moves the card off ``running`` while the worker
+    may still be finalising — :func:`reap_terminal_workers` deliberately grants
+    ``TERMINAL_WORKER_REAP_GRACE_SECONDS`` before ending it. Those processes
+    still occupy a slot, so the per-board ``max_spawn`` cap counts them. Uses
+    the same evidence and identity rules as the reaper (closed ``task_runs`` row
+    with pid + spawn fingerprint, this host, not recycled); the reaper clears
+    the evidence once the process is gone. Fails open to 0.
+    """
+    try:
+        rows = conn.execute(
+            "SELECT DISTINCT worker_pid, worker_started_at, claim_lock FROM task_runs "
+            "WHERE ended_at IS NOT NULL AND worker_pid IS NOT NULL "
+            "AND worker_started_at IS NOT NULL"
+        ).fetchall()
+    except Exception:
+        return 0
+    host_prefix = _kb._host_prefix()
+    seen: set[int] = set()
+    for row in rows:
+        pid = int(row["worker_pid"])
+        if pid in seen or pid == os.getpid():
+            continue
+        if not str(row["claim_lock"] or "").startswith(host_prefix):
+            continue
+        try:
+            if _worker_alive(pid, row["worker_started_at"]):
+                seen.add(pid)
+        except Exception:
+            continue
+    return len(seen)
+
+
 def count_running_tasks_other_boards(board: Optional[str] = None) -> int:
     """Total ``running`` tasks across every board EXCEPT ``board``.
 
@@ -2893,9 +2929,12 @@ def _tick_spawn_budget(
 
     # Both ready and review loops consume from the same budget.
     if max_spawn is not None:
-        if running_count >= max_spawn:
+        # Per-board cap bounds live worker PROCESSES: a worker whose card already
+        # went terminal but is still exiting holds its slot until it is gone.
+        board_live = running_count + count_live_terminal_workers(conn)
+        if board_live >= max_spawn:
             return False, None
-        spawn_budget = max_spawn - running_count
+        spawn_budget = max_spawn - board_live
 
     if max_in_progress is not None:
         total_running = running_count + count_running_tasks_other_boards(board)

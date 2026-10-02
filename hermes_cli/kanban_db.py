@@ -568,18 +568,29 @@ def read_board_metadata(board: Optional[str] = None) -> dict:
         "archived": False,
     }
     try:
-        p = board_metadata_path(slug)
-        if p.exists():
-            raw = json.loads(p.read_text(encoding="utf-8-sig"))
-            if isinstance(raw, dict):
-                # Never let the metadata file claim a different slug than
-                # its directory — trust the filesystem.
-                raw["slug"] = slug
-                meta.update(raw)
-    except (OSError, json.JSONDecodeError):
-        pass
+        raw = _read_board_json(slug)
+    except (OSError, ValueError):
+        raw = None
+    if raw is not None:
+        # Never let the metadata file claim a different slug than its
+        # directory — trust the filesystem.
+        raw["slug"] = slug
+        meta.update(raw)
     meta["db_path"] = str(kanban_db_path(slug))
     return meta
+
+
+def _read_board_json(slug: str) -> Optional[dict]:
+    """Raw ``board.json`` dict, ``None`` when the file does not exist. Raises
+    ``OSError``/``ValueError`` when it exists but cannot be read or parsed —
+    callers that enforce limits must tell "no file" from "unreadable file"."""
+    p = board_metadata_path(slug)
+    if not p.exists():
+        return None
+    raw = json.loads(p.read_text(encoding="utf-8-sig"))
+    if not isinstance(raw, dict):
+        raise ValueError(f"{p}: board metadata is not a JSON object")
+    return raw
 
 
 def write_board_metadata(
@@ -619,23 +630,47 @@ def write_board_metadata(
         meta["created_at"] = int(time.time())
     path = board_metadata_path(slug)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(meta, indent=2, ensure_ascii=False) + "\n", encoding="utf-8",
-    )
+    # Atomic: a dispatcher tick reading mid-write must never see a torn file
+    # (it would read as "no max_concurrency cap").
+    from utils import atomic_write_text
+    atomic_write_text(path, json.dumps(meta, indent=2, ensure_ascii=False) + "\n")
     meta["db_path"] = str(kanban_db_path(slug))
     return meta
 
 
+# Last valid cap seen per board.json path, so an unreadable file keeps the cap
+# instead of silently lifting it.
+_LAST_BOARD_CAPS: dict[str, int] = {}
+
+
 def board_max_concurrency(board: Optional[str] = None) -> Optional[int]:
-    """The board's ``max_concurrency`` cap, or ``None``. A missing, malformed or
-    non-positive value means "no cap" — never raises, so a hand-edited
-    ``board.json`` cannot crash a dispatcher tick."""
+    """The board's ``max_concurrency`` cap, or ``None``. Never raises, so a
+    hand-edited ``board.json`` cannot crash a dispatcher tick.
+
+    A missing file, a missing key or a malformed/non-positive value (valid JSON)
+    means "no cap". A file that exists but cannot be read or parsed is NOT
+    "no cap": the last valid cap seen for that board in this process is kept,
+    and with no cap seen yet the board is treated as cap 0 (spawn nothing this
+    tick) — an unreadable file must never widen concurrency."""
     try:
-        value = read_board_metadata(board).get("max_concurrency")
+        slug = _slug_or_default(board)
+        key = str(board_metadata_path(slug))
     except Exception:
-        return None
+        return None  # not a valid board name: there is no board.json to cap it
+    try:
+        raw = _read_board_json(slug)
+    except Exception as exc:
+        last = _LAST_BOARD_CAPS.get(key)
+        _log.warning(
+            "kanban: board %r metadata unreadable (%s); %s", board, exc,
+            f"keeping last cap {last}" if last else "spawning nothing this tick",
+        )
+        return last if last else 0
+    value = (raw or {}).get("max_concurrency")
     if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        _LAST_BOARD_CAPS.pop(key, None)
         return None
+    _LAST_BOARD_CAPS[key] = value
     return value
 
 
