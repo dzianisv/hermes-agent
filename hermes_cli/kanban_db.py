@@ -562,6 +562,8 @@ def read_board_metadata(board: Optional[str] = None) -> dict:
         "default_workdir": None,
         # Project scope: new tasks inherit it (deterministic worktree + branch).
         "project_id": None,
+        # Live worker cap for this board only (see board_max_concurrency).
+        "max_concurrency": None,
         "created_at": None,
         "archived": False,
     }
@@ -584,10 +586,12 @@ def write_board_metadata(
     board: Optional[str], *, name: Optional[str] = None, description: Optional[str] = None,
     icon: Optional[str] = None, color: Optional[str] = None, archived: Optional[bool] = None,
     default_workdir: Optional[str] = None, project_id: Optional[str] = None,
+    max_concurrency: Optional[int | str] = None,
 ) -> dict:
     """Create/update ``board.json``; unmentioned fields are preserved, ``created_at``
-    set on first write. ``project_id``/``default_workdir``: ``None`` = unchanged,
-    "" = clear (``project_id`` is not validated here)."""
+    set on first write. ``project_id``/``default_workdir``/``max_concurrency``:
+    ``None`` = unchanged, "" (or 0 for ``max_concurrency``) = clear
+    (``project_id`` is not validated here)."""
     _assert_not_delegated_child_mutation()
     slug = _slug_or_default(board)
     meta = read_board_metadata(slug)
@@ -603,6 +607,14 @@ def write_board_metadata(
     for key, value in (("default_workdir", default_workdir), ("project_id", project_id)):
         if value is not None:
             meta[key] = str(value) if value else None
+    if max_concurrency is not None:
+        if max_concurrency == "" or max_concurrency == 0:
+            meta["max_concurrency"] = None
+        else:
+            cap = int(max_concurrency)
+            if cap < 0:
+                raise ValueError("max_concurrency must be a positive integer (0 clears)")
+            meta["max_concurrency"] = cap or None
     if not meta.get("created_at"):
         meta["created_at"] = int(time.time())
     path = board_metadata_path(slug)
@@ -612,6 +624,28 @@ def write_board_metadata(
     )
     meta["db_path"] = str(kanban_db_path(slug))
     return meta
+
+
+def board_max_concurrency(board: Optional[str] = None) -> Optional[int]:
+    """The board's ``max_concurrency`` cap, or ``None``. A missing, malformed or
+    non-positive value means "no cap" — never raises, so a hand-edited
+    ``board.json`` cannot crash a dispatcher tick."""
+    try:
+        value = read_board_metadata(board).get("max_concurrency")
+    except Exception:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        return None
+    return value
+
+
+def board_capped_max_spawn(max_spawn: Optional[int], board: Optional[str] = None) -> Optional[int]:
+    """Fold the board cap into ``max_spawn`` (already a live running+spawn cap
+    per board). The board cap can only tighten."""
+    cap = board_max_concurrency(board)
+    if cap is None:
+        return max_spawn
+    return cap if max_spawn is None else min(max_spawn, cap)
 
 
 def create_board(

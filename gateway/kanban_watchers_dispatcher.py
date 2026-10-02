@@ -288,6 +288,7 @@ class _KanbanDispatcher:
         try:
             # No explicit init_db(): connect() runs the migration once per
             # process (see the matching note in the notifier collector).
+            kwargs["max_spawn"] = self.kb.board_capped_max_spawn(kwargs.get("max_spawn"), slug)
             conn = _kbc().connect(board=slug)
             return _kbd().dispatch_once(conn, board=slug, **kwargs)
         except Exception as exc:

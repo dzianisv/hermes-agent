@@ -135,6 +135,10 @@ _BOARD_SPECS = [
         _SLUG,
         _arg("path", nargs="?", help="Absolute path to use as default workdir. Omit to clear."),
     ], help="Set the default workspace path for tasks on a board"),
+    _cmd("set-concurrency", [
+        _SLUG,
+        _arg("n", type=int, help="Max workers running on this board at once (0 clears)"),
+    ], help="Cap how many workers run on a board at once"),
     _cmd("export", [
         _arg("slug", nargs="?", help="Board to export (default: the current board)"),
         _arg("-o", "--output", help="Archive path (default: ./<slug>.tar.gz)"),

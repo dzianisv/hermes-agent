@@ -64,7 +64,9 @@ def _cmd_boards_list(args: argparse.Namespace) -> int:
     for b in boards:
         marker = "●" if b["is_current"] else " "
         name = (b.get("name") or "") + (" [archived]" if b.get("archived") else "")
-        print(f"{marker:2s}  {b['slug']:24s}  {name:28s}  {_fmt_counts(b['counts'] or {}, '(empty)')}")
+        cap = kb.board_max_concurrency(b["slug"])
+        cap_txt = f"  [max {cap} at once]" if cap else ""
+        print(f"{marker:2s}  {b['slug']:24s}  {name:28s}  {_fmt_counts(b['counts'] or {}, '(empty)')}{cap_txt}")
     print(f"\nCurrent board: {current}")
     if len(boards) > 1:
         print("Switch boards with `hermes kanban boards switch <slug>`.")
@@ -155,6 +157,20 @@ def _cmd_boards_set_default_workdir(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_boards_set_concurrency(args: argparse.Namespace) -> int:
+    normed, rc = _board_slug_arg(args, "set-concurrency", must_exist=True)
+    if rc:
+        return rc
+    if args.n < 0:
+        return _err("kanban boards set-concurrency: N must be >= 0 (0 clears the cap)", 2)
+    cap = kb.write_board_metadata(normed, max_concurrency=args.n).get("max_concurrency")
+    if cap:
+        print(f"Board {normed!r} now runs at most {cap} worker(s) at once.")
+    else:
+        print(f"Board {normed!r} concurrency cap cleared.")
+    return 0
+
+
 def _cmd_boards_export(args: argparse.Namespace) -> int:
     from hermes_cli import kanban_transfer
     from hermes_cli.sizefmt import format_bytes
@@ -209,6 +225,7 @@ _BOARD_HANDLERS = {
     "show": _cmd_boards_show, "current": _cmd_boards_show,
     "rename": _cmd_boards_rename,
     "set-default-workdir": _cmd_boards_set_default_workdir,
+    "set-concurrency": _cmd_boards_set_concurrency,
     "export": _cmd_boards_export,
     "import": _cmd_boards_import,
 }

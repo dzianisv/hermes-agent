@@ -3676,7 +3676,7 @@ def run_daemon(
             with contextlib.closing(_kbc.connect()) as conn:
                 res = dispatch_once(
                     conn,
-                    max_spawn=max_spawn,
+                    max_spawn=_kb.board_capped_max_spawn(max_spawn, _kb.get_current_board()),
                     max_in_progress=max_in_progress,
                     max_in_progress_per_profile=per_profile,
                     failure_limit=failure_limit,

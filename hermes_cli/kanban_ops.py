@@ -85,6 +85,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
     except Exception:
         default_assignee = max_in_progress_per_profile = max_in_progress = None
         max_spawn = getattr(args, "max", None)
+    max_spawn = kb.board_capped_max_spawn(max_spawn, kb.get_current_board())
     with kbc.connect_closing() as conn:
         res = kbd.dispatch_once(
             conn,
