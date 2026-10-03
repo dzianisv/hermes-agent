@@ -87,7 +87,9 @@ def test_drifted_descendant_is_not_reclaimed(board):
         drifted = _drifted_fingerprint(proc.pid)
         assert kbd._pid_recycled(proc.pid, drifted) is True
         assert kbd._is_dispatcher_descendant(proc.pid) is True
-        assert kbd._worker_alive(proc.pid, drifted) is True
+        # Parentage is not identity; the task token plus ancestry is.
+        assert kbd._worker_alive(proc.pid, drifted) is False
+        assert kbd.is_live_task_worker(proc.pid, tid) is True
         _claim_running(conn, tid, proc.pid, drifted)
 
         sweep = kbd._reclaim_dead_workers(conn)
@@ -149,8 +151,8 @@ def test_dead_worker_still_reclaimed_and_prefix_id_does_not_match(board):
 
 @pytest.mark.platforms("posix")
 @pytest.mark.live_system_guard_bypass  # Kill only the grandchild this test spawned after reparenting.
-def test_expired_reparented_worker_keeps_claim_and_failure_budget(board, all_assignees_spawnable):
-    """TTL reclaim runs before the crash sweep: a drifted orphan still owns its task."""
+def test_reparented_marked_process_is_not_task_liveness(board):
+    """A reparented grandchild is outside this dispatcher's ancestry, so it is not liveness."""
     conn = board
     tid = kb.create_task(conn, title="orphan", assignee="worker")
     # The intermediate process exits, leaving a live grandchild reparented to init.
@@ -164,18 +166,14 @@ def test_expired_reparented_worker_keeps_claim_and_failure_budget(board, all_ass
     parent.wait(timeout=5)
     try:
         assert not kbd._is_dispatcher_descendant(pid)
+        assert kbd.is_live_task_worker(pid, tid) is False
         _claim_running(conn, tid, pid, _drifted_fingerprint(pid))
-        original = kb.get_task(conn, tid)
-        result = kbd.dispatch_once(conn, spawn_fn=lambda *_args, **_kwargs: 9999)
+        # Ancestry is required. A reparented process is not this task's worker,
+        # so a drifted fingerprint follows the normal reclaim path.
+        assert kb.release_stale_claims(conn) == 1
         task = kb.get_task(conn, tid)
-        assert result.reclaimed == 0
-        assert tid not in result.crashed
-        assert task.status == "running"
-        assert task.worker_pid == pid
-        assert task.claim_lock == original.claim_lock
-        assert task.current_run_id == original.current_run_id
-        assert task.claim_expires > int(time.time())
-        assert task.consecutive_failures == 0
+        assert task.status != "running"
+        assert task.worker_pid != pid
         assert kbd._pid_alive(pid)
     finally:
         os.kill(pid, signal.SIGKILL)
@@ -215,10 +213,25 @@ def test_done_reopened_is_dispatchable_even_with_recent_success_and_pr(
     claimed = kb.claim_task(conn, tid)
     assert claimed
     kb.add_comment(conn, tid, author="worker", body="https://github.com/org/repo/pull/123")
-    # Event ordering for the PR rule is strictly after, not same-second.
-    conn.execute("UPDATE task_comments SET created_at = created_at - 10 WHERE task_id = ?", (tid,))
     assert kb.complete_task(conn, tid, result="bad result")
     assert kb.reopen_done_task(conn, tid, actor="operator")[0]
+    # Same second for the PR comment, the completed run, and done_reopened.
+    # Bypass is event-id order, not a strict timestamp.
+    pinned = int(time.time())
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE task_comments SET created_at = ? WHERE task_id = ?",
+            (pinned, tid),
+        )
+        conn.execute(
+            "UPDATE task_events SET created_at = ? "
+            "WHERE task_id = ? AND kind IN ('commented', 'done_reopened')",
+            (pinned, tid),
+        )
+        conn.execute(
+            "UPDATE task_runs SET ended_at = ? WHERE task_id = ? AND outcome = 'completed'",
+            (pinned, tid),
+        )
     monkeypatch.setattr(kbd, "_active_pr_guard_applies", lambda _url: (True, None))
     assert kbd.check_respawn_guard(conn, tid) is None
     # Once the success window elapses, the open-PR guard must also recognize
@@ -230,3 +243,84 @@ def test_done_reopened_is_dispatchable_even_with_recent_success_and_pr(
     result = kbd.dispatch_once(conn, spawn_fn=lambda task, *_args: spawned.append(task.id) or None)
     assert tid in spawned
     assert any(row[0] == tid for row in result.spawned)
+
+
+def test_wrong_task_descendant_is_not_this_task_worker(board):
+    """A child whose argv names another task is not liveness for this task."""
+    conn = board
+    task_a = kb.create_task(conn, title="a", assignee="worker")
+    child = _sleep_with_token("t_task_b")
+    try:
+        assert kbd.is_live_task_worker(child.pid, "t_task_a") is False
+        _claim_running(conn, task_a, child.pid, _drifted_fingerprint(child.pid))
+        assert kb.release_stale_claims(conn) == 1
+        task = kb.get_task(conn, task_a)
+        assert task.status != "running"
+        assert task.worker_pid is None
+    finally:
+        _stop(child)
+
+
+def test_dead_recorded_pid_rebinds_to_other_live_descendant(board, all_assignees_spawnable):
+    """Recorded pid dead, another marked descendant alive: do not reclaim, rebind."""
+    conn = board
+    tid = kb.create_task(conn, title="a", assignee="worker")
+    live = _sleep_with_token(tid)
+    try:
+        _claim_running(conn, tid, _dead_pid(), "1|1")
+        assert kb.release_stale_claims(conn) == 0
+        task = kb.get_task(conn, tid)
+        assert task.status == "running"
+        assert task.consecutive_failures == 0
+        assert task.worker_pid == live.pid
+        run = conn.execute(
+            "SELECT worker_pid FROM task_runs WHERE id = ?", (task.current_run_id,),
+        ).fetchone()
+        assert run["worker_pid"] == live.pid
+
+        dead = _dead_pid()
+        old = int(time.time()) - 3600
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET worker_pid = ?, worker_started_at = ?, claim_expires = ? "
+                "WHERE id = ?",
+                (dead, "1|1", old, tid),
+            )
+            conn.execute(
+                "UPDATE task_runs SET worker_pid = ?, worker_started_at = ? WHERE id = ?",
+                (dead, "1|1", task.current_run_id),
+            )
+        result = kbd.dispatch_once(conn, spawn_fn=lambda *_a, **_k: 9999)
+        task = kb.get_task(conn, tid)
+        assert result.reclaimed == 0
+        assert tid not in result.crashed
+        assert task.status == "running"
+        assert task.consecutive_failures == 0
+        assert task.worker_pid == live.pid
+    finally:
+        _stop(live)
+
+
+def test_same_second_assignment_does_not_bypass_active_pr(board, monkeypatch):
+    """A same-second assign is not a reopen. Fail closed."""
+    conn = board
+    tid = kb.create_task(conn, title="assigned", assignee="worker")
+    kb.add_comment(conn, tid, author="worker", body="https://github.com/org/repo/pull/9")
+    pinned = int(time.time())
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE task_comments SET created_at = ? WHERE task_id = ?", (pinned, tid),
+        )
+        conn.execute(
+            "UPDATE task_events SET created_at = ? WHERE task_id = ? AND kind = 'commented'",
+            (pinned, tid),
+        )
+        kb._append_event(
+            conn, tid, "assigned", {"assignee": "other", "from": "worker"},
+        )
+        conn.execute(
+            "UPDATE task_events SET created_at = ? WHERE task_id = ? AND kind = 'assigned'",
+            (pinned, tid),
+        )
+    monkeypatch.setattr(kbd, "_active_pr_guard_applies", lambda _url: (True, None))
+    assert kbd.check_respawn_guard(conn, tid) == "active_pr"

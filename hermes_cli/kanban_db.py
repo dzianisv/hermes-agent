@@ -2447,6 +2447,12 @@ def release_stale_claims(
     now = int(time.time())
     reclaimed = 0
     host_prefix = _host_prefix()
+    from hermes_cli.kanban_db_dispatch import (
+        _adopt_live_task_worker,
+        _fingerprint_holds_non_descendant,
+        _foreign_descendant,
+        _unsignalled_gone,
+    )
     stale = conn.execute(
         "SELECT id, claim_lock, worker_pid, worker_started_at, claim_expires, last_heartbeat_at, "
         "       assignee "
@@ -2461,17 +2467,23 @@ def release_stale_claims(
         # positively identified task worker is protected even at this age.
         heartbeat_stale = hb is not None and (now - int(hb)) > DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS
         started_at = _row_get(row, "worker_started_at")
-        if row["worker_pid"] and is_live_task_worker(row["worker_pid"], row["id"]):
-            _extend_live_stale_claim(conn, row, now)
+        # Task-wide identity, not the recorded pid. A dead recorded pid with
+        # another live marked descendant is not a reclaim and not a failure.
+        live = _adopt_live_task_worker(conn, row["id"], row["worker_pid"])
+        if live is not None:
+            _extend_live_stale_claim(conn, row, now, worker_pid=live)
             continue
-        if (host_local and row["worker_pid"] and _worker_alive(row["worker_pid"], started_at)
+        if (host_local and _fingerprint_holds_non_descendant(row["worker_pid"], started_at)
                 and not heartbeat_stale):
             _extend_live_stale_claim(conn, row, now)
             continue
 
-        termination = _terminate_reclaimed_worker(
-            row["worker_pid"], row["claim_lock"], signal_fn=signal_fn, started_at=started_at,
-        )
+        if _foreign_descendant(row["worker_pid"], row["id"]):
+            termination = _unsignalled_gone(row["worker_pid"], row["claim_lock"])
+        else:
+            termination = _terminate_reclaimed_worker(
+                row["worker_pid"], row["claim_lock"], signal_fn=signal_fn, started_at=started_at,
+            )
         # A live worker of ours must keep its claim (else a duplicate spawns beside it).
         if _worker_survived_termination(termination):
             _defer_reclaim_for_live_worker(
@@ -2537,11 +2549,17 @@ def _record_reclaim(
     return run_id
 
 
-def _extend_live_stale_claim(conn: sqlite3.Connection, row: sqlite3.Row, now: int) -> None:
+def _extend_live_stale_claim(
+    conn: sqlite3.Connection, row: sqlite3.Row, now: int, *,
+    worker_pid: Optional[int] = None,
+) -> None:
     """TTL-expired claim whose task worker is alive: extend instead of
     reclaiming (``claim_extended`` event). CAS on the same expired lock so a
-    concurrent reclaimer wins cleanly."""
+    concurrent reclaimer wins cleanly. ``worker_pid`` is the live pid when the
+    recorded one was dead and the claim was rebound.
+    """
     new_expires = now + _resolve_claim_ttl_seconds()
+    pid = int(worker_pid if worker_pid is not None else row["worker_pid"])
     with write_txn(conn):
         cur = conn.execute(
             "UPDATE tasks SET claim_expires = ? "
@@ -2557,7 +2575,7 @@ def _extend_live_stale_claim(conn: sqlite3.Connection, row: sqlite3.Row, now: in
             conn, row["id"], "claim_extended",
             {
                 "reason": "pid_alive",
-                "worker_pid": int(row["worker_pid"]),
+                "worker_pid": pid,
                 "claim_lock": row["claim_lock"],
                 "claim_expires_was": int(row["claim_expires"]),
                 "claim_expires_now": new_expires,

@@ -572,16 +572,12 @@ def _worker_alive(pid: Optional[int], started_at) -> bool:
     (a claim is never released beside a possibly-live worker) but ``_terminate_reclaimed_worker``
     refuses to signal it.
 
-    A live descendant of this dispatcher is ours even when the start-time fingerprint disagrees.
-    macOS ``psutil`` create_time drifts by seconds on a healthy worker (#117505); fingerprint
-    mismatch alone then looks like PID recycle and the dispatcher respawns a duplicate beside
-    the worker it already spawned. The fingerprint check stays for non-descendants — that is
-    what keeps a recycled stranger from being signalled.
+    Parentage is not identity. A dispatcher descendant is not "ours" here; task
+    liveness is :func:`find_live_task_worker` (argv/env token AND ancestry).
+    Fingerprint mismatch still means a non-descendant PID was recycled.
     """
     if not _kb._pid_alive(pid):
         return False
-    if _is_dispatcher_descendant(pid):
-        return True
     if started_at == UNVERIFIED_WORKER_FINGERPRINT:
         return True
     return not _pid_recycled(pid, started_at)
@@ -713,45 +709,128 @@ def _live_worker_pids_for_task(task_id: str) -> list[int]:
         return []
 
 
-def is_live_task_worker(pid: Optional[int], task_id: str) -> bool:
-    """A live claimed PID is ours if it descends from this dispatcher OR names this task.
+def find_live_task_worker(task_id: str, *, prefer: Optional[int] = None) -> Optional[int]:
+    """PID of one live worker for ``task_id``, or None.
 
-    The task marker survives reparenting and start-time drift. Scan failures
-    return False rather than vetoing every tick forever for an unreadable (or
-    recycled) PID; only positive identity evidence protects a claim. The global
-    pre-spawn scan likewise fails open, so a probe outage cannot freeze a board.
+    Liveness is a live process whose argv contains ``task_id`` as an exact
+    token, or whose ``HERMES_KANBAN_TASK`` equals it, AND whose parent chain
+    reaches this process. A recorded pid alone is not liveness. A descendant
+    carrying a different task id, or no task id, is not this task's worker.
+    ``prefer`` wins when it is itself a match, so a still-correct claim is not
+    rebound to a sibling. A failed scan yields no pid (reclaim is not frozen).
     """
-    if not _kb._pid_alive(pid):
-        return False
-    if _is_dispatcher_descendant(pid):
-        return True
+    task_id = str(task_id or "").strip()
+    if not task_id:
+        return None
+    matches = [
+        pid for pid in _live_worker_pids_for_task(task_id)
+        if _is_dispatcher_descendant(pid)
+    ]
+    if not matches:
+        return None
     try:
-        import psutil  # type: ignore
-        proc = psutil.Process(int(pid))
-        if _process_status_is_zombie(proc.status()):
-            return False
-        if _argv_has_exact_task_token(proc.cmdline(), task_id):
-            return True
-        try:
-            return proc.environ().get("HERMES_KANBAN_TASK") == task_id
-        except (psutil.AccessDenied, PermissionError, OSError):
-            pass  # argv may still be readable through ps
-    except Exception:
-        pass
-    # Per-PID fallback only: an unreadable process must not keep a claim
-    # frozen indefinitely. The separate pre-spawn scan handles other PIDs.
+        preferred = int(prefer) if prefer is not None else None
+    except (TypeError, ValueError):
+        preferred = None
+    if preferred is not None and preferred in matches:
+        return preferred
+    return matches[0]
+
+
+def is_live_task_worker(pid: Optional[int], task_id: str) -> bool:
+    """True when ``pid`` is :func:`find_live_task_worker` for ``task_id``.
+
+    Descendant alone is not identity. A child whose argv/env names a different
+    task (or none) is not this task's worker, even if the claim recorded its pid.
+    """
     try:
-        proc = subprocess.run(
-            ["ps", "-p", str(int(pid)), "-o", "stat=,command="],
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
-            encoding="utf-8", errors="replace", timeout=1, check=False,
-        )
-        status, _, command = (proc.stdout or "").strip().partition(" ")
-        return proc.returncode == 0 and not _process_status_is_zombie(status) and bool(
-            command and task_id in command.split()
-        )
-    except (OSError, ValueError, subprocess.TimeoutExpired):
+        want = int(pid)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
         return False
+    if want <= 0:
+        return False
+    return find_live_task_worker(task_id, prefer=want) == want
+
+
+def _rebind_running_worker(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
+    """Point the running task and its current run at a live worker pid.
+
+    Caller may already hold the write transaction (crash sweep). Does not
+    touch the claim lock, failure counter, or status.
+    """
+    fingerprint = _process_fingerprint(int(pid)) or UNVERIFIED_WORKER_FINGERPRINT
+
+    def _apply() -> None:
+        cur = conn.execute(
+            "UPDATE tasks SET worker_pid = ?, worker_started_at = ? "
+            "WHERE id = ? AND status = 'running'",
+            (int(pid), fingerprint, task_id),
+        )
+        if cur.rowcount != 1:
+            return
+        run_id = _kb._current_run_id(conn, task_id)
+        if run_id is not None:
+            conn.execute(
+                "UPDATE task_runs SET worker_pid = ?, worker_started_at = ? WHERE id = ?",
+                (int(pid), fingerprint, run_id),
+            )
+
+    if getattr(conn, "in_transaction", False):
+        _apply()
+    else:
+        with _kb.write_txn(conn):
+            _apply()
+
+
+def _adopt_live_task_worker(
+    conn: sqlite3.Connection, task_id: str, recorded_pid,
+) -> Optional[int]:
+    """If a live identity worker exists, rebind the claim to it and return its pid.
+
+    None means no task-identity worker: the caller keeps its existing reclaim
+    behaviour. Never counts a failure.
+    """
+    live = find_live_task_worker(task_id, prefer=recorded_pid)
+    if live is None:
+        return None
+    try:
+        recorded = int(recorded_pid) if recorded_pid is not None else None
+    except (TypeError, ValueError):
+        recorded = None
+    if recorded != live:
+        _rebind_running_worker(conn, task_id, live)
+    return live
+
+
+def _fingerprint_holds_non_descendant(pid, started_at) -> bool:
+    """Existing fingerprint hold for a recorded pid that is not our descendant.
+
+    A descendant is not held by fingerprint or by parentage. Identity for a
+    descendant is :func:`find_live_task_worker` only.
+    """
+    if not pid or _is_dispatcher_descendant(pid):
+        return False
+    return _worker_alive(pid, started_at)
+
+
+def _foreign_descendant(pid, task_id: str) -> bool:
+    """Live child of this dispatcher that does not name ``task_id``.
+
+    Do not signal it (it may be another task's worker) and do not treat it as
+    liveness for ``task_id``.
+    """
+    return bool(pid) and _is_dispatcher_descendant(pid) and not is_live_task_worker(pid, task_id)
+
+
+def _unsignalled_gone(pid, claim_lock) -> dict:
+    """Termination report for a pid we must not signal, so reclaim can proceed."""
+    return {
+        "prev_pid": int(pid) if pid else None,
+        "host_local": bool(claim_lock) and str(claim_lock).startswith(_kb._host_prefix()),
+        "termination_attempted": False,
+        "terminated": True,
+        "sigkill": False,
+    }
 
 
 def _live_worker_pids_psutil(task_id: str, psutil) -> list[int]:
@@ -1635,6 +1714,11 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
         pid = int(row["worker_pid"])
         tid = row["id"]
         started_at = _kb._row_get(row, "worker_started_at")
+        # Another live identity worker owns this task: rebind, do not reclaim,
+        # do not count a failure, and do not signal the recorded pid.
+        live = _adopt_live_task_worker(conn, tid, pid)
+        if live is not None and live != pid:
+            continue
         if started_at == UNVERIFIED_WORKER_FINGERPRINT and _kb._pid_alive(pid):
             # Fingerprint capture failed at spawn: we cannot prove this live PID is our worker, so
             # it is neither signalled nor released beside (duplicate). It is reclaimed once it exits.
@@ -1643,9 +1727,10 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
             continue
         # SIGTERM then SIGKILL after 5 s grace; workers wanting a cleaner
         # shutdown install their own SIGTERM handler. A recycled PID (fingerprint
-        # mismatch) is never signalled: the worker is already gone.
+        # mismatch) is never signalled: the worker is already gone. A descendant
+        # that does not name this task is not signalled either.
         killed = False
-        kill = _kill_fn(signal_fn)
+        kill = None if _foreign_descendant(pid, tid) else _kill_fn(signal_fn)
         if kill is not None and not (_kb._pid_alive(pid) and _pid_recycled(pid, started_at)):
             killpg = signal_fn if signal_fn is not None else None
             # Pre-death snapshot; reused by the SIGKILL escalation.
@@ -1657,9 +1742,10 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
             if _worker_alive(pid, started_at):
                 killed = _sigkill(kill, pid, killpg=killpg, snapshot=tree)
 
-        # A drifted fingerprint can prevent signalling a reparented worker.
-        # Do not release its claim while that task's process still runs.
-        if is_live_task_worker(pid, tid):
+        # Do not release the claim while this task's identity worker still runs.
+        if is_live_task_worker(pid, tid) or find_live_task_worker(tid, prefer=pid) is not None:
+            if find_live_task_worker(tid, prefer=pid) not in (None, pid):
+                _adopt_live_task_worker(conn, tid, pid)
             continue
         error = f"elapsed {int(elapsed)}s > limit {limit}s"
         with _kb.write_txn(conn):
@@ -1752,12 +1838,31 @@ def detect_stale_running(
         tid = row["id"]
         lock = row["claim_lock"] or ""
 
-        termination = _kb._terminate_reclaimed_worker(
-            pid, lock, signal_fn=signal_fn, started_at=_kb._row_get(row, "worker_started_at"))
+        started_at = _kb._row_get(row, "worker_started_at")
+        live = _adopt_live_task_worker(conn, tid, pid)
+        if live is not None:
+            _defer_reclaim_for_live_worker(
+                conn, tid, lock, now,
+                {"prev_pid": int(live), "terminated": False, "host_local": True},
+                reason="heartbeat_stale_worker_alive",
+            )
+            continue
+        if _foreign_descendant(pid, tid):
+            termination = _unsignalled_gone(pid, lock)
+        else:
+            termination = _kb._terminate_reclaimed_worker(
+                pid, lock, signal_fn=signal_fn, started_at=started_at)
 
         # Never release a claim while our own worker is still alive: that would
         # spawn a duplicate beside it. Hold the claim and retry next tick.
-        if is_live_task_worker(pid, tid) or _worker_survived_termination(termination):
+        # A foreign descendant is not that worker (parentage is not identity).
+        if (
+            not _foreign_descendant(pid, tid)
+            and (
+                _worker_survived_termination(termination)
+                or _fingerprint_holds_non_descendant(pid, started_at)
+            )
+        ):
             _defer_reclaim_for_live_worker(
                 conn, tid, lock, now, termination,
                 reason="heartbeat_stale_worker_alive",
@@ -1823,8 +1928,11 @@ def reconcile_orphaned_running(conn: sqlite3.Connection) -> list[str]:
     for row in rows:
         tid = row["id"]
         pid = row["worker_pid"]
-        if pid and (is_live_task_worker(pid, tid)
-                    or _worker_alive(pid, _kb._row_get(row, "worker_started_at"))):
+        if _adopt_live_task_worker(conn, tid, pid) is not None or (
+            pid and _fingerprint_holds_non_descendant(
+                pid, _kb._row_get(row, "worker_started_at"),
+            )
+        ):
             # Never requeue beside a live process. Retry next tick.
             _kb._log.debug(
                 "kanban reconcile: task %s has broken claim bookkeeping but "
@@ -2122,18 +2230,19 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
             started_at = _kb._row_get(row, "started_at")
             if started_at is not None and time.time() - started_at < _kb._resolve_crash_grace_seconds():
                 continue
-            if (is_live_task_worker(row["worker_pid"], row["id"])
-                    or _worker_alive(row["worker_pid"], _kb._row_get(row, "worker_started_at"))):
-                continue
-            # Fingerprint mismatch is not proof the worker exited. A live process
-            # whose argv/env names this task (reparented, or a drifted start time
-            # that also failed the descendant check) must keep the claim.
-            live_pids = _live_worker_pids_for_task(row["id"])
-            if live_pids:
+            live = _adopt_live_task_worker(conn, row["id"], row["worker_pid"])
+            if live is not None:
                 _kb._log.debug(
-                    "kanban dispatch: not reclaiming %s; live worker pids %s",
-                    row["id"], live_pids,
+                    "kanban dispatch: not reclaiming %s; live worker pid %s",
+                    row["id"], live,
                 )
+                continue
+            # No task-identity worker. A non-descendant recorded pid still uses
+            # the fingerprint hold. A descendant that does not name this task
+            # does not.
+            if _fingerprint_holds_non_descendant(
+                row["worker_pid"], _kb._row_get(row, "worker_started_at"),
+            ):
                 continue
 
             pid = int(row["worker_pid"])
@@ -2584,22 +2693,34 @@ def check_respawn_guard(
         return None
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
     for c in conn.execute(
-        "SELECT body, created_at FROM task_comments "
-        "WHERE task_id = ? AND created_at >= ? ORDER BY created_at DESC",
+        "SELECT id, body, created_at FROM task_comments "
+        "WHERE task_id = ? AND created_at >= ? ORDER BY created_at DESC, id DESC",
         (task_id, pr_cutoff),
     ).fetchall():
         body = _kb._lossy_text(c["body"])
         match = _RESPAWN_GUARD_PR_URL_RE.search(body) if body else None
         if not match:
             continue
+        comment_at = int(c["created_at"] or 0)
+        # ``done_reopened`` bypasses on event-id order, not a strict timestamp,
+        # so a reopen that shares the comment's second still wins. Other
+        # handoffs stay strictly after: a same-second ``assigned`` is not a
+        # reopen and must fail closed.
+        anchor = conn.execute(
+            "SELECT id FROM task_events "
+            "WHERE task_id = ? AND kind = 'commented' AND created_at <= ? "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id, comment_at),
+        ).fetchone()
+        anchor_id = int(anchor["id"]) if anchor else int(c["id"])
         events = conn.execute(
-            # Strictly after: a same-second tie stays guarded (fail closed).
             "SELECT kind, payload FROM task_events "
-            "WHERE task_id = ? AND created_at > ? "
-            # ``unblocked``: an operator clearing a block after the PR comment is a
-            # deliberate re-queue (card t_6a6ac2d3 deadlocked ~170 ticks without it).
-            "AND kind IN ('assigned', 'changes_requested', 'review_reopened', 'unblocked', 'done_reopened')",
-            (task_id, int(c["created_at"] or 0)),
+            "WHERE task_id = ? "
+            "AND kind IN ('assigned', 'changes_requested', 'review_reopened', "
+            "'unblocked', 'done_reopened') "
+            "AND (created_at > ? OR ("
+            "kind = 'done_reopened' AND created_at >= ? AND id > ?))",
+            (task_id, comment_at, comment_at, anchor_id),
         ).fetchall()
         if any(_is_handoff_event(e["kind"], e["payload"]) for e in events):
             return None
@@ -3115,16 +3236,16 @@ def _dispatch_lane_task(
         # Force-load sdlc-review; the kanban lifecycle is already in every
         # worker's system prompt via KANBAN_GUIDANCE.
         claimed.skills = list(dict.fromkeys([*(claimed.skills or []), "sdlc-review"]))
-    live_pids = _live_worker_pids_for_task(claimed.id)
-    if live_pids:
+    live = find_live_task_worker(claimed.id)
+    if live is not None:
         # Not a spawn failure: the card did not run, and charging the breaker
         # (or an infrastructure cooldown) would park a task whose worker is fine.
         _kb._log.debug(
-            "kanban dispatch: refusing spawn of %s; live worker pids %s",
-            claimed.id, live_pids,
+            "kanban dispatch: refusing spawn of %s; live worker pid %s",
+            claimed.id, live,
         )
         _release_claim_spawn_refused_live_worker(
-            conn, claimed.id, live_pids,
+            conn, claimed.id, [live],
             run_id=claimed.current_run_id, claim_lock=claimed.claim_lock,
         )
         return False

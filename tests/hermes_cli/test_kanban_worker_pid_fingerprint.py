@@ -284,7 +284,7 @@ def _counting_live_spawn(calls: list, procs: list):
     """spawn_fn that starts a real child and returns its pid. Counts every call."""
     def spawn_fn(task, workspace, board=None):
         proc = subprocess.Popen(
-            [sys.executable, "-c", "import time; time.sleep(120)"],
+            [sys.executable, "-c", "import time; time.sleep(120)", task.id],
             start_new_session=True,
         )
         procs.append(proc)
