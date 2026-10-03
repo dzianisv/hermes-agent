@@ -345,12 +345,18 @@ def test_dispatch_once_keeps_live_worker_across_macos_start_drift(
 def test_dispatch_once_far_start_drift_detects_recycled_pid(
     board, all_assignees_spawnable, monkeypatch, tmp_path,
 ):
-    """The same tick path must still crash a live pid whose start time is far outside tolerance."""
+    """Far start drift still crashes a live pid that is not our descendant.
+
+    A real child is a descendant, and a descendant cannot be a recycled stranger
+    (macOS start-time drift). This pins the non-descendant path: fingerprint
+    mismatch still releases the claim when the pid cannot be proven ours.
+    """
     from gateway.status import START_TIME_DRIFT_TOLERANCE
 
     conn = board
     tid, calls, procs, _recorded = _dispatch_live_worker(conn, monkeypatch, tmp_path)
     try:
+        monkeypatch.setattr(kbd, "_is_dispatcher_descendant", lambda _pid: False)
         _drift_start_time(monkeypatch, START_TIME_DRIFT_TOLERANCE + 10_000)
         second = kbd.dispatch_once(conn, spawn_fn=_counting_live_spawn(calls, procs))
         assert tid in second.crashed

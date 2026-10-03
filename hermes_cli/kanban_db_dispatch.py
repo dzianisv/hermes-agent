@@ -558,6 +558,11 @@ def _process_fingerprint(pid: int) -> Optional[str]:
     return f"{current_instantiation_epoch()}|{start}"
 
 
+# Parent-chain walk bound. A worker is a few forks under the dispatcher; past this
+# the chain is a cycle or a stranger and must not count as ours.
+_PARENT_WALK_LIMIT = 64
+
+
 def _worker_alive(pid: Optional[int], started_at) -> bool:
     """True when ``pid`` is live AND is still the worker we spawned. ``started_at`` is the fingerprint
     recorded by ``_set_worker_pid``; after a reboot (or any PID recycle) an unrelated process can own
@@ -565,12 +570,244 @@ def _worker_alive(pid: Optional[int], started_at) -> bool:
     a fingerprint keeps the existence answer: killing it is the pre-fingerprint behaviour and the row is
     rewritten with a fingerprint on its next spawn. An UNVERIFIED spawn also keeps the existence answer
     (a claim is never released beside a possibly-live worker) but ``_terminate_reclaimed_worker``
-    refuses to signal it."""
+    refuses to signal it.
+
+    A live descendant of this dispatcher is ours even when the start-time fingerprint disagrees.
+    macOS ``psutil`` create_time drifts by seconds on a healthy worker (#117505); fingerprint
+    mismatch alone then looks like PID recycle and the dispatcher respawns a duplicate beside
+    the worker it already spawned. The fingerprint check stays for non-descendants — that is
+    what keeps a recycled stranger from being signalled.
+    """
     if not _kb._pid_alive(pid):
         return False
+    if _is_dispatcher_descendant(pid):
+        return True
     if started_at == UNVERIFIED_WORKER_FINGERPRINT:
         return True
     return not _pid_recycled(pid, started_at)
+
+
+def _is_dispatcher_descendant(pid: Optional[int]) -> bool:
+    """True when a live ``pid``'s parent chain reaches this process.
+
+    A child we spawned cannot be a recycled stranger that inherited the PID.
+    Bounded walk; any error (including an unreadable parent) is False — missing
+    identity is not permission to treat the pid as ours. psutil first, then
+    ``ps -o ppid=`` when psutil cannot be imported.
+    """
+    try:
+        current = int(pid)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return False
+    me = os.getpid()
+    if current <= 0 or current == me or not _kb._pid_alive(current):
+        return False
+    try:
+        import psutil  # type: ignore
+    except ImportError:
+        return _parent_chain_reaches_us_ps(current, me)
+    try:
+        return _parent_chain_reaches_us_psutil(current, me, psutil)
+    except Exception:
+        return False
+
+
+def _parent_chain_reaches_us_psutil(pid: int, me: int, psutil) -> bool:
+    current = pid
+    seen: set[int] = set()
+    for _ in range(_PARENT_WALK_LIMIT):
+        if current in seen:
+            return False
+        seen.add(current)
+        parent = int(psutil.Process(current).ppid())
+        if parent == me:
+            return True
+        if parent <= 1 or parent == current:
+            return False
+        current = parent
+    return False
+
+
+def _parent_chain_reaches_us_ps(pid: int, me: int) -> bool:
+    current = pid
+    seen: set[int] = set()
+    try:
+        for _ in range(_PARENT_WALK_LIMIT):
+            if current in seen:
+                return False
+            seen.add(current)
+            proc = subprocess.run(
+                ["ps", "-o", "ppid=", "-p", str(current)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=1,
+                check=False,
+            )
+            if proc.returncode != 0:
+                return False
+            raw = (proc.stdout or "").strip()
+            if not raw:
+                return False
+            parent = int(raw.split()[0])
+            if parent == me:
+                return True
+            if parent <= 1 or parent == current:
+                return False
+            current = parent
+    except Exception:
+        return False
+    return False
+
+
+def _argv_has_exact_task_token(argv, task_id: str) -> bool:
+    """True when ``task_id`` is a whitespace token of some argv element.
+
+    Exact token, not a prefix: ``t_abc`` must not match ``t_abcd``. A worker's
+    ``-q`` argument is ``work kanban task <id>``, so the id is a token inside
+    a longer element, not always its own element.
+    """
+    for arg in argv or ():
+        if task_id in str(arg).split():
+            return True
+    return False
+
+
+def _process_status_is_zombie(status) -> bool:
+    text = str(status or "").lower()
+    return text == "zombie" or text == "z"
+
+
+def _live_worker_pids_for_task(task_id: str) -> list[int]:
+    """PIDs of live processes that are workers for ``task_id``.
+
+    A match is an exact argv token equal to the task id, or
+    ``HERMES_KANBAN_TASK`` equal to the task id when the environment is
+    readable. This process and zombies are excluded. psutil first;
+    ``ps -axww -o pid=,command=`` when psutil cannot be imported. A failed
+    scan returns ``[]`` so a probe outage cannot freeze reclaim of workers
+    that are actually gone.
+    """
+    task_id = str(task_id or "").strip()
+    if not task_id:
+        return []
+    try:
+        import psutil  # type: ignore
+    except ImportError:
+        psutil = None
+    if psutil is not None:
+        try:
+            return _live_worker_pids_psutil(task_id, psutil)
+        except Exception:
+            _kb._log.debug(
+                "kanban dispatch: psutil worker scan failed for %s", task_id, exc_info=True,
+            )
+    try:
+        return _live_worker_pids_ps(task_id)
+    except Exception:
+        _kb._log.debug(
+            "kanban dispatch: ps worker scan failed for %s", task_id, exc_info=True,
+        )
+        return []
+
+
+def _live_worker_pids_psutil(task_id: str, psutil) -> list[int]:
+    me = os.getpid()
+    found: set[int] = set()
+    zombie = getattr(psutil, "STATUS_ZOMBIE", "zombie")
+    for proc in psutil.process_iter(attrs=["pid", "cmdline", "status"]):
+        try:
+            info = proc.info or {}
+            pid = int(info.get("pid") or 0)
+            if pid <= 0 or pid == me:
+                continue
+            status = info.get("status")
+            if status == zombie or _process_status_is_zombie(status):
+                continue
+            cmdline = info.get("cmdline") or []
+            matched = _argv_has_exact_task_token(cmdline, task_id)
+            if not matched:
+                env = None
+                try:
+                    env = proc.environ()
+                except (psutil.AccessDenied, PermissionError, OSError):
+                    env = None
+                except Exception:
+                    env = None
+                matched = bool(env) and env.get("HERMES_KANBAN_TASK") == task_id
+            if matched and _kb._pid_alive(pid):
+                found.add(pid)
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            continue
+        except Exception:
+            continue
+    return sorted(found)
+
+
+def _live_worker_pids_ps(task_id: str) -> list[int]:
+    proc = subprocess.run(
+        ["ps", "-axww", "-o", "pid=,command="],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=5,
+        check=False,
+    )
+    if proc.returncode != 0:
+        return []
+    me = os.getpid()
+    found: set[int] = set()
+    for line in (proc.stdout or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        pid_text, _, command = line.partition(" ")
+        try:
+            pid = int(pid_text)
+        except ValueError:
+            continue
+        if pid <= 0 or pid == me:
+            continue
+        if task_id not in command.split():
+            continue
+        if _kb._pid_alive(pid):
+            found.add(pid)
+    return sorted(found)
+
+
+def _release_claim_spawn_refused_live_worker(
+    conn: sqlite3.Connection, task_id: str, pids: list[int],
+) -> None:
+    """Put a just-claimed task back because a worker for it is already alive.
+
+    Same claim-clear shape as a spawn refusal (source phase restored, lock and
+    pid wiped, open run closed) but this is not a failure: ``consecutive_failures``
+    and ``last_failure_error`` stay put, and the run outcome is not
+    ``spawn_failed``. The event is the audit trail; the next tick may spawn
+    once those pids are gone.
+    """
+    with _kb.write_txn(conn):
+        retry_status = _kb._retry_status_for_run(conn, task_id)
+        cur = conn.execute(
+            "UPDATE tasks SET status = ?, claim_lock = NULL, "
+            "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL "
+            "WHERE id = ? AND status = 'running'",
+            (retry_status, task_id),
+        )
+        if cur.rowcount != 1:
+            return
+        payload = {"pids": [int(p) for p in pids], "retry_status": retry_status}
+        run_id = _kb._end_run(
+            conn, task_id,
+            outcome="released", status="released", metadata=payload,
+        )
+        _kb._append_event(
+            conn, task_id, "spawn_refused_live_worker", payload, run_id=run_id,
+        )
 
 
 def _split_composed_fingerprint(fingerprint: str) -> Optional[tuple[str, str]]:
@@ -1836,6 +2073,16 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                 continue
             if _worker_alive(row["worker_pid"], _kb._row_get(row, "worker_started_at")):
                 continue
+            # Fingerprint mismatch is not proof the worker exited. A live process
+            # whose argv/env names this task (reparented, or a drifted start time
+            # that also failed the descendant check) must keep the claim.
+            live_pids = _live_worker_pids_for_task(row["id"])
+            if live_pids:
+                _kb._log.debug(
+                    "kanban dispatch: not reclaiming %s; live worker pids %s",
+                    row["id"], live_pids,
+                )
+                continue
 
             pid = int(row["worker_pid"])
             dead = _classify_dead_worker(pid, row["claim_lock"], task_id=row["id"], board=board)
@@ -2816,6 +3063,16 @@ def _dispatch_lane_task(
         # Force-load sdlc-review; the kanban lifecycle is already in every
         # worker's system prompt via KANBAN_GUIDANCE.
         claimed.skills = list(dict.fromkeys([*(claimed.skills or []), "sdlc-review"]))
+    live_pids = _live_worker_pids_for_task(claimed.id)
+    if live_pids:
+        # Not a spawn failure: the card did not run, and charging the breaker
+        # (or an infrastructure cooldown) would park a task whose worker is fine.
+        _kb._log.debug(
+            "kanban dispatch: refusing spawn of %s; live worker pids %s",
+            claimed.id, live_pids,
+        )
+        _release_claim_spawn_refused_live_worker(conn, claimed.id, live_pids)
+        return False
     try:
         pid = _call_spawn_fn(spawn_fn if spawn_fn is not None else _default_spawn, claimed, str(workspace), board)
         if pid:
