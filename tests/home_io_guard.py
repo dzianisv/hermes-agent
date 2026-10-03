@@ -70,6 +70,11 @@ class HomeIOGuard:
                 cwd = os.getcwd() if self._relative_path_entries(path) else None
                 if absolute.parent in self._path_entries(path, cwd):
                     return
+            # PM checks whether a payload manifest exists beside the checkout.
+            # A worktree directly under ~/.hermes probes ~/.hermes/manifest.json;
+            # stat alone reads no home data. An actual open/read remains guarded.
+            if metadata and absolute == Path(__file__).resolve().parent.parent.parent / "manifest.json":
+                return
             # The interpreter's own installation (a PM-managed python under ~/.hermes/tools):
             # stdlib source reads (linecache, traceback) are not Hermes state either, nor is
             # realpath() walking up through its ancestors.

@@ -10,6 +10,7 @@ names the task id is proof a worker is still in flight.
 from __future__ import annotations
 
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -144,3 +145,88 @@ def test_dead_worker_still_reclaimed_and_prefix_id_does_not_match(board):
         assert task.worker_pid is None
     finally:
         _stop(prefix_proc)
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.live_system_guard_bypass  # Kill only the grandchild this test spawned after reparenting.
+def test_expired_reparented_worker_keeps_claim_and_failure_budget(board, all_assignees_spawnable):
+    """TTL reclaim runs before the crash sweep: a drifted orphan still owns its task."""
+    conn = board
+    tid = kb.create_task(conn, title="orphan", assignee="worker")
+    # The intermediate process exits, leaving a live grandchild reparented to init.
+    parent = subprocess.Popen(
+        [sys.executable, "-c", "import os, time\npid = os.fork()\n"
+         "if pid:\n print(pid, flush=True)\n os._exit(0)\n"
+         "os.setsid()\ntime.sleep(120)", tid],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+    )
+    pid = int(parent.stdout.readline().strip())
+    parent.wait(timeout=5)
+    try:
+        assert not kbd._is_dispatcher_descendant(pid)
+        _claim_running(conn, tid, pid, _drifted_fingerprint(pid))
+        original = kb.get_task(conn, tid)
+        result = kbd.dispatch_once(conn, spawn_fn=lambda *_args, **_kwargs: 9999)
+        task = kb.get_task(conn, tid)
+        assert result.reclaimed == 0
+        assert tid not in result.crashed
+        assert task.status == "running"
+        assert task.worker_pid == pid
+        assert task.claim_lock == original.claim_lock
+        assert task.current_run_id == original.current_run_id
+        assert task.claim_expires > int(time.time())
+        assert task.consecutive_failures == 0
+        assert kbd._pid_alive(pid)
+    finally:
+        os.kill(pid, signal.SIGKILL)
+
+
+def test_delayed_spawn_refusal_cannot_release_successor(board):
+    conn = board
+    tid = kb.create_task(conn, title="race", assignee="worker")
+    first = kb.claim_task(conn, tid)
+    assert first and first.current_run_id and first.claim_lock
+    # A is superseded while its process scan is in flight. B now owns the card.
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+            "claim_expires = NULL, current_run_id = NULL WHERE id = ?", (tid,),
+        )
+    successor = kb.claim_task(conn, tid)
+    assert successor and successor.current_run_id != first.current_run_id
+    kbd._release_claim_spawn_refused_live_worker(
+        conn, tid, [12345], run_id=first.current_run_id, claim_lock=first.claim_lock,
+    )
+    task = kb.get_task(conn, tid)
+    assert task.status == "running"
+    assert task.claim_lock == successor.claim_lock
+    assert task.current_run_id == successor.current_run_id
+    run = conn.execute("SELECT status, ended_at FROM task_runs WHERE id = ?",
+                       (successor.current_run_id,)).fetchone()
+    assert run["status"] == "running" and run["ended_at"] is None
+    assert not any(e.kind == "spawn_refused_live_worker" for e in kb.list_events(conn, tid))
+
+
+def test_done_reopened_is_dispatchable_even_with_recent_success_and_pr(
+    board, monkeypatch, all_assignees_spawnable,
+):
+    conn = board
+    tid = kb.create_task(conn, title="rework", assignee="worker")
+    claimed = kb.claim_task(conn, tid)
+    assert claimed
+    kb.add_comment(conn, tid, author="worker", body="https://github.com/org/repo/pull/123")
+    # Event ordering for the PR rule is strictly after, not same-second.
+    conn.execute("UPDATE task_comments SET created_at = created_at - 10 WHERE task_id = ?", (tid,))
+    assert kb.complete_task(conn, tid, result="bad result")
+    assert kb.reopen_done_task(conn, tid, actor="operator")[0]
+    monkeypatch.setattr(kbd, "_active_pr_guard_applies", lambda _url: (True, None))
+    assert kbd.check_respawn_guard(conn, tid) is None
+    # Once the success window elapses, the open-PR guard must also recognize
+    # this deliberate reopen (not mistake it for an accidental duplicate).
+    with kb.write_txn(conn):
+        conn.execute("UPDATE task_runs SET ended_at = ended_at - 7200 WHERE task_id = ?", (tid,))
+    assert kbd.check_respawn_guard(conn, tid) is None
+    spawned = []
+    result = kbd.dispatch_once(conn, spawn_fn=lambda task, *_args: spawned.append(task.id) or None)
+    assert tid in spawned
+    assert any(row[0] == tid for row in result.spawned)

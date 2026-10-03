@@ -433,9 +433,16 @@ def _run_guard(tmp_path: Path, stub_body: str, *, name: str) -> tuple[int, str]:
     stub = bindir / "hermes"
     stub.write_text(stub_body, encoding="utf-8")
     stub.chmod(0o755)
+    # Exercise the shell/CLI handoff, not the real host's global pnpm store
+    # (prune can take minutes) or its /private/tmp (a test must not delete it).
+    pnpm_stub = bindir / "pnpm"
+    pnpm_stub.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    pnpm_stub.chmod(0o755)
     marker = tmp_path / (name + ".calls")
     env = dict(os.environ)
     env.update(
+        PATH=str(bindir) + os.pathsep + env.get("PATH", ""),
+        DISK_GUARD_TMP_AGE="2147483647",
         HOME=str(home),
         DISK_GUARD_HERMES_BIN=str(stub),
         DISK_GUARD_FLOOR_GI="0",

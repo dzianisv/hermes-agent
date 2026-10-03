@@ -2430,23 +2430,19 @@ def release_stale_claims(
     with ``consecutive_failures`` stuck at 0, so the breaker never trips.
     ``reclaim_task`` (operator path) deliberately resets the counter instead.
 
-    A host-local worker that is still alive gets its claim *extended* instead
-    (a slow model can sit longer than the TTL inside one tool-free call, so no
-    heartbeat) — unless ``last_heartbeat_at`` is older than
-    ``DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS`` (wedged; ``_touch_activity``
-    keeps any genuinely active worker fresh). Safe to call often.
+    A positively identified live task worker keeps its claim even if its PID
+    fingerprint drifted or heartbeat is stale. Inactivity and max-runtime
+    policies handle wedged workers separately; TTL expiry alone cannot prove
+    the task has stopped. Safe to call often.
 
     Reclaiming a live worker mid-flight produces the spawn- then-immediately-reclaim loop seen on slow
     models that spend longer than ``DEFAULT_CLAIM_TTL_SECONDS`` inside a single tool-free LLM call (#23025):
     no tool calls means no ``kanban_heartbeat``, even though the subprocess is healthy.
-    Backstop (#29747 gap 3): if the worker's PID is still alive but its ``last_heartbeat_at`` is stale by
-    more than ``DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS`` (1h), the worker has been making no observable
-    progress and we reclaim anyway — even if ``_pid_alive`` is still true. This catches the
-    wedged-in-a-logic-loop case where the process is technically running but accomplishing nothing.
-    ``_touch_activity`` (run_agent.py) bridges chunk-level liveness into ``last_heartbeat_at`` via #31752,
-    so any genuinely active worker keeps its heartbeat fresh as a side effect of normal API traffic.
-    ``enforce_max_runtime`` and ``detect_crashed_workers`` remain the upper bounds for genuinely wedged or
-    dead workers.
+    For unidentified host-local PIDs, a heartbeat older than
+    ``DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS`` remains the wedge backstop.
+    A confirmed task worker cannot be released on TTL expiry alone: the separate
+    inactivity and max-runtime checks own intentional termination, and a failed
+    termination must not spawn a duplicate.
     """
     now = int(time.time())
     reclaimed = 0
@@ -2461,10 +2457,13 @@ def release_stale_claims(
     for row in stale:
         host_local = (row["claim_lock"] or "").startswith(host_prefix)
         hb = row["last_heartbeat_at"]
-        # Backstop: a heartbeat older than the max-stale threshold means no
-        # observable progress — reclaim even if the PID is alive (logic loop).
+        # An unidentified host-local PID with no progress may be wedged; a
+        # positively identified task worker is protected even at this age.
         heartbeat_stale = hb is not None and (now - int(hb)) > DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS
         started_at = _row_get(row, "worker_started_at")
+        if row["worker_pid"] and is_live_task_worker(row["worker_pid"], row["id"]):
+            _extend_live_stale_claim(conn, row, now)
+            continue
         if (host_local and row["worker_pid"] and _worker_alive(row["worker_pid"], started_at)
                 and not heartbeat_stale):
             _extend_live_stale_claim(conn, row, now)
@@ -2539,7 +2538,7 @@ def _record_reclaim(
 
 
 def _extend_live_stale_claim(conn: sqlite3.Connection, row: sqlite3.Row, now: int) -> None:
-    """TTL-expired claim whose host-local worker is alive: extend instead of
+    """TTL-expired claim whose task worker is alive: extend instead of
     reclaiming (``claim_extended`` event). CAS on the same expired lock so a
     concurrent reclaimer wins cleanly."""
     new_expires = now + _resolve_claim_ttl_seconds()
@@ -4609,6 +4608,7 @@ from hermes_cli.kanban_db_dispatch import (  # noqa: E402
     _worker_alive,
     _worker_survived_termination,
     _worker_terminal_timeout_env,
+    is_live_task_worker,
 )
 
 
