@@ -645,3 +645,106 @@ def test_defer_reclaim_does_not_extend_successor_claim(board, tmp_path, monkeypa
         assert not any(e.kind == "reclaim_deferred" for e in kb.list_events(conn, tid))
     finally:
         other.close()
+
+
+# Real ``ps -axww -o command=`` line of a kanban worker. The ``-q`` value is one
+# argv element (``work kanban task <id>``), not four.
+_CAPTURED_WORKER_PS = (
+    "/Users/engineer/.hermes/tools/python-3.14.7+20260901-darwin-arm64/bin/python3 "
+    "-m hermes_cli.main -p software-engineer --cli --accept-hooks --toolsets "
+    "browser,clarify,code_execution,computer_use,connections,cronjob,delegation,"
+    "file,image_gen,memory,notion,session_search,skills,terminal,todo,tradingview,"
+    "tts,vision,web chat -q work kanban task t_7a846ba0"
+)
+
+
+def _psutil_argv_from_ps_line(line: str) -> list[str]:
+    """Whitespace-split ``ps`` line, with the ``-q`` value kept as one element."""
+    parts = line.split()
+    q = parts.index("-q")
+    return parts[: q + 1] + [" ".join(parts[q + 1 :])]
+
+
+def test_task_ids_in_argv_reads_compound_q_not_worktree_path():
+    """One parser: split ``ps`` line and psutil argv both yield the worker id."""
+    assert kbd.task_ids_in_argv(_CAPTURED_WORKER_PS.split()) == {"t_7a846ba0"}
+    psutil_argv = _psutil_argv_from_ps_line(_CAPTURED_WORKER_PS)
+    assert psutil_argv[-1] == "work kanban task t_7a846ba0"
+    assert kbd.task_ids_in_argv(psutil_argv) == {"t_7a846ba0"}
+    assert kbd.task_ids_in_argv(["t_7a846ba0"]) == {"t_7a846ba0"}
+    assert kbd.task_ids_in_argv(["hermes-wt-t_7a846ba0"]) == set()
+    assert kbd.task_ids_in_argv(["/tmp/t_abc12345/x"]) == set()
+
+
+def _compound_other_task_child() -> subprocess.Popen:
+    """Sleeping child whose argv names ``t_bbbbbbbb`` inside the ``-q`` element.
+
+    ``HERMES_KANBAN_TASK`` is absent so identity can only come from argv.
+    """
+    env = os.environ.copy()
+    env.pop("HERMES_KANBAN_TASK", None)
+    return subprocess.Popen(
+        [
+            sys.executable, "-c", "import time; time.sleep(60)",
+            "-q", "work kanban task t_bbbbbbbb",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        env=env,
+    )
+
+
+def test_compound_q_argv_is_other_task_and_not_signalled():
+    """A foreign worker's compound ``-q`` value blocks ``guarded_terminate``."""
+    proc = _compound_other_task_child()
+    signals: list[tuple[int, int]] = []
+    try:
+        assert kbd._pid_carries_other_task(proc.pid, "t_aaaaaaaa") is True
+        result = kbd.guarded_terminate(
+            proc.pid, "t_aaaaaaaa", kb._claimer_id(),
+            signal_fn=lambda pid, sig: signals.append((int(pid), int(sig))),
+        )
+        assert signals == []
+        assert result.get("signal_skipped") == "other_task"
+        assert proc.poll() is None
+    finally:
+        _stop(proc)
+
+
+def test_reopen_done_does_not_signal_descendant_carrying_other_task(board, monkeypatch):
+    """Reopen must not signal a running descendant whose argv names another task."""
+    conn = board
+    parent = kb.create_task(conn, title="parent", assignee="worker")
+    assert kb.complete_task(conn, parent, result="done")
+    child = kb.create_task(conn, title="child", assignee="worker", parents=[parent])
+    claimed = kb.claim_task(conn, child)
+    assert claimed is not None and claimed.status == "running"
+    assert claimed.claim_lock and claimed.claim_lock.startswith(kb._host_prefix())
+
+    proc = _compound_other_task_child()
+    signals: list[tuple[int, int]] = []
+    real_kill = os.kill
+
+    def recorder(pid, sig, *_args):
+        signals.append((int(pid), int(sig)))
+
+    monkeypatch.setattr(os, "kill", recorder)
+    if hasattr(os, "killpg"):
+        monkeypatch.setattr(os, "killpg", recorder)
+    try:
+        fingerprint = kbd._process_fingerprint(proc.pid)
+        assert fingerprint and fingerprint != kbd.UNVERIFIED_WORKER_FINGERPRINT
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET worker_pid = ?, worker_started_at = ? WHERE id = ?",
+                (proc.pid, fingerprint, child),
+            )
+        ok, _status = kb.reopen_done_task(conn, parent, actor="operator", reason="bad")
+        assert ok is True
+        # sig 0 is the liveness probe (``os.kill(pid, 0)``), not a termination.
+        assert not any(pid == proc.pid and sig != 0 for pid, sig in signals)
+        assert proc.poll() is None
+    finally:
+        if proc.poll() is None:
+            real_kill(proc.pid, signal.SIGKILL)
+        proc.wait(timeout=5)

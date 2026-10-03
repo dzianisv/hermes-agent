@@ -658,17 +658,30 @@ def _parent_chain_reaches_us_ps(pid: int, me: int) -> bool:
     return False
 
 
+# ``_new_task_id`` is ``t_`` + 4 hex bytes. ``{8,}`` accepts a longer id rather
+# than missing one. The id must be a whitespace-delimited token inside an argv
+# element: ``work kanban task t_x`` and a bare ``t_x`` match; a path fragment
+# such as ``hermes-wt-t_x`` or ``/tmp/t_x/y`` does not.
+_TASK_ID_TOKEN_RE = re.compile(r"(?:^|\s)(t_[a-f0-9]{8,})(?=\s|$)")
+
+
+def task_ids_in_argv(argv) -> set[str]:
+    """Task ids named as whitespace-delimited tokens inside any argv element."""
+    found: set[str] = set()
+    for arg in argv or ():
+        found.update(_TASK_ID_TOKEN_RE.findall(str(arg)))
+    return found
+
+
 def _argv_has_exact_task_token(argv, task_id: str) -> bool:
-    """True when ``task_id`` is a whitespace token of some argv element.
+    """True when ``task_id`` is a whitespace-delimited task-id token in ``argv``.
 
     Exact token, not a prefix: ``t_abc`` must not match ``t_abcd``. A worker's
     ``-q`` argument is ``work kanban task <id>``, so the id is a token inside
     a longer element, not always its own element.
     """
-    for arg in argv or ():
-        if task_id in str(arg).split():
-            return True
-    return False
+    task_id = str(task_id or "").strip()
+    return bool(task_id) and task_id in task_ids_in_argv(argv)
 
 
 def _process_status_is_zombie(status) -> bool:
@@ -707,9 +720,6 @@ def _live_worker_pids_for_task(task_id: str) -> list[int]:
             "kanban dispatch: ps worker scan failed for %s", task_id, exc_info=True,
         )
         return []
-
-
-_TASK_ID_TOKEN_RE = re.compile(r"\bt_[a-f0-9]{8,}\b")
 
 
 def _task_ids_carried_by_pid(pid) -> set[str]:
@@ -755,13 +765,7 @@ def _task_ids_carried_by_pid(pid) -> set[str]:
                 argv = (proc.stdout or "").split()
         except Exception:
             argv = []
-    found: set[str] = set()
-    for arg in argv:
-        # Exact argv token only. A path such as ``hermes-wt-t_7a846ba0`` contains
-        # the same shape and must not count as ownership of that task.
-        token = str(arg).strip()
-        if _TASK_ID_TOKEN_RE.fullmatch(token):
-            found.add(token)
+    found = task_ids_in_argv(argv)
     if env_task and str(env_task).strip():
         found.add(str(env_task).strip())
     return found
@@ -844,7 +848,7 @@ def guarded_terminate(
         )
         return skipped
     return _terminate_reclaimed_worker(
-        pid, claim_lock, signal_fn=signal_fn, started_at=started_at,
+        pid, claim_lock, signal_fn=signal_fn, started_at=started_at, task_id=task_id,
     )
 
 
@@ -1287,15 +1291,19 @@ def _poll_worker_exit(pid: int, started_at: Optional[int] = None) -> bool:
     return False
 
 
-def _sigkill(kill, pid: int, *, killpg=None, snapshot=None) -> bool:
+def _sigkill(kill, pid: int, *, killpg=None, snapshot=None, task_id: Optional[str] = None) -> bool:
     """Best-effort SIGKILL of the worker tree; True when the signal was delivered."""
     try:
         # signal.SIGKILL doesn't exist on Windows; SIGTERM maps to TerminateProcess.
         _sig = getattr(signal, "SIGKILL", signal.SIGTERM)
         if snapshot is None:
+            if task_id and _pid_carries_other_task(pid, task_id):
+                return False
             kill(int(pid), _sig)
         else:
-            _signal_worker_tree(int(pid), _sig, kill=kill, killpg=killpg, snapshot=snapshot)
+            _signal_worker_tree(
+                int(pid), _sig, kill=kill, killpg=killpg, snapshot=snapshot, task_id=task_id,
+            )
         return True
     except (ProcessLookupError, OSError):
         return False
@@ -1537,8 +1545,13 @@ def _signal_captured_tree(
     killpg,
     getsid,
     proc_table=None,
+    task_id: Optional[str] = None,
 ) -> None:
-    """Signal every pid in a pre-death snapshot, identity-verified."""
+    """Signal every pid in a pre-death snapshot, identity-verified.
+
+    ``task_id`` skips a candidate that positively names a different task.
+    ``None`` keeps the previous behaviour (signal every verified candidate).
+    """
     worker = int(snapshot.get("pid", 0))
     entries = list(snapshot.get("pids") or ())
     groups = list(snapshot.get("groups") or ())
@@ -1553,7 +1566,12 @@ def _signal_captured_tree(
     if not isinstance(fresh, dict):
         fresh = {}
 
+    def _other(cand) -> bool:
+        return bool(task_id) and _pid_carries_other_task(cand, task_id)
+
     for cand, ctime, via_session in entries:
+        if _other(cand):
+            continue
         if not _verify_snapshot_identity(
             cand, ctime, via_session,
             worker=worker, getsid=getsid, fresh=fresh,
@@ -1567,6 +1585,8 @@ def _signal_captured_tree(
     if killpg is None:
         return
     for pgid, ctime, via_session in groups:
+        if _other(pgid):
+            continue
         if not _verify_snapshot_identity(
             pgid, ctime, via_session,
             worker=worker, getsid=getsid, fresh=fresh,
@@ -1589,6 +1609,7 @@ def _signal_worker_tree(
     scan_pids=None,
     proc_table=None,
     snapshot=None,
+    task_id: Optional[str] = None,
 ) -> None:
     """Signal a dispatcher worker AND its descendants.
 
@@ -1664,7 +1685,11 @@ def _signal_worker_tree(
     _signal_captured_tree(
         snapshot, sig,
         kill=kill, killpg=killpg, getsid=getsid, proc_table=proc_table,
+        task_id=task_id,
     )
+
+    if task_id and _pid_carries_other_task(pid, task_id):
+        return
 
     if killpg is not None and getpgid is not None:
         try:
@@ -1691,6 +1716,7 @@ def _terminate_reclaimed_worker(
     *,
     signal_fn=None,
     started_at=None,
+    task_id: Optional[str] = None,
 ) -> dict[str, Any]:
     """Best-effort host-local worker termination for reclaim paths. ``started_at`` is the spawn-time
     fingerprint: when the live process no longer matches it, the PID was recycled and nothing is
@@ -1732,7 +1758,9 @@ def _terminate_reclaimed_worker(
     # descendants to init(1), so the SIGKILL escalation reuses this snapshot.
     tree = _capture_worker_tree(int(pid))
     try:
-        _signal_worker_tree(int(pid), signal.SIGTERM, kill=kill, killpg=killpg, snapshot=tree)
+        _signal_worker_tree(
+            int(pid), signal.SIGTERM, kill=kill, killpg=killpg, snapshot=tree, task_id=task_id,
+        )
     except ProcessLookupError:
         # Already gone = successful termination. Leaving terminated=False would
         # make the reclaim guard misread a dead worker as alive and defer forever.
@@ -1745,7 +1773,7 @@ def _terminate_reclaimed_worker(
         info["terminated"] = True
         return info
     if _worker_alive(pid, started_at):
-        if not _sigkill(kill, pid, killpg=killpg, snapshot=tree):
+        if not _sigkill(kill, pid, killpg=killpg, snapshot=tree, task_id=task_id):
             return info
         info["sigkill"] = True
     info["terminated"] = not _worker_alive(pid, started_at)

@@ -7,8 +7,8 @@ assumed its result" (M3). These tests pin:
 * done descendants are demoted to ``todo`` with a ``descendant_invalidated``
   event AND a comment naming the ancestor (non-silent),
 * running descendants have their audit trail committed BEFORE their worker
-  is terminated, and the kill routes through ``_terminate_reclaimed_worker``
-  (the same helper the reclaim paths use),
+  is terminated, and the kill routes through ``guarded_terminate`` so a pid
+  that names another task is not signalled,
 * ``consecutive_failures`` resets to 0 (deliberate operator action —
   opposite of the review-loop rule pinned in M2), and
 * the dashboard ``_set_status_direct`` reopen path and the DB function
@@ -105,7 +105,7 @@ def test_running_descendant_event_precedes_termination_via_reclaim_helper(
 
     kills: list[tuple] = []
 
-    def fake_terminate(pid, claim_lock, started_at=None, **kwargs):
+    def fake_terminate(pid, task_id, claim_lock, started_at=None, **kwargs):
         # The audit trail must already be durable when the kill fires:
         # standalone calls commit before terminating.
         side = kbc.connect(tmp_path / "kanban.db")
@@ -114,10 +114,10 @@ def test_running_descendant_event_precedes_termination_via_reclaim_helper(
         finally:
             side.close()
         assert "descendant_invalidated" in kinds
-        kills.append((pid, claim_lock, started_at))
+        kills.append((pid, claim_lock, started_at, task_id))
         return {"terminated": True}
 
-    monkeypatch.setattr(kb, "_terminate_reclaimed_worker", fake_terminate)
+    monkeypatch.setattr(kbd, "guarded_terminate", fake_terminate)
 
     _reopen_parent_directly(conn, parent_id)
     result = kb.invalidate_descendants_for_parent_reopen(

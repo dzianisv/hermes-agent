@@ -758,8 +758,14 @@ def _set_status_direct(conn: sqlite3.Connection, task_id: str, new_status: str) 
             # back worker terminations to perform post-commit.
             result = kanban_db.invalidate_descendants_for_parent_reopen(conn, task_id, author="dashboard")
             terminations.extend(result["terminations"])
-    for pid, claim_lock, started_at in terminations:
-        kanban_db._terminate_reclaimed_worker(pid, claim_lock, started_at=started_at)
+    for item in terminations:
+        if len(item) >= 4:
+            pid, claim_lock, started_at, desc_id = item[:4]
+            from hermes_cli.kanban_db_dispatch import guarded_terminate
+            guarded_terminate(pid, desc_id, claim_lock, started_at=started_at)
+        else:
+            pid, claim_lock, started_at = item
+            kanban_db._terminate_reclaimed_worker(pid, claim_lock, started_at=started_at)
     # Re-opening something may have made children stale.
     if effective_status in {"done", "ready", "review"}:
         kanban_db.recompute_ready(conn)
