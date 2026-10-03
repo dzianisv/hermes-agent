@@ -709,6 +709,66 @@ def _live_worker_pids_for_task(task_id: str) -> list[int]:
         return []
 
 
+_TASK_ID_TOKEN_RE = re.compile(r"\bt_[a-f0-9]{8,}\b")
+
+
+def _task_ids_carried_by_pid(pid) -> set[str]:
+    """Task ids a live process positively names via argv or ``HERMES_KANBAN_TASK``.
+
+    Empty when the pid is dead, unreadable, or carries no task id. A positive
+    id is an exact ``t_<hex>`` argv token, or the env var when it is set.
+    """
+    try:
+        want = int(pid)
+    except (TypeError, ValueError):
+        return set()
+    if want <= 0 or not _kb._pid_alive(want):
+        return set()
+    argv: list[str] = []
+    env_task = None
+    read = False
+    try:
+        import psutil  # type: ignore
+        proc = psutil.Process(want)
+        argv = [str(arg) for arg in (proc.cmdline() or [])]
+        read = True
+        try:
+            env = proc.environ() or {}
+            env_task = env.get("HERMES_KANBAN_TASK")
+        except Exception:
+            env_task = None
+    except Exception:
+        read = False
+    if not read:
+        try:
+            proc = subprocess.run(
+                ["ps", "-p", str(want), "-ww", "-o", "command="],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=5,
+                check=False,
+            )
+            if proc.returncode == 0:
+                argv = (proc.stdout or "").split()
+        except Exception:
+            argv = []
+    found: set[str] = set()
+    for arg in argv:
+        found.update(_TASK_ID_TOKEN_RE.findall(arg))
+    if env_task and str(env_task).strip():
+        found.add(str(env_task).strip())
+    return found
+
+
+def _pid_carries_other_task(pid, task_id: str) -> bool:
+    """True when ``pid`` is live and positively names a task other than ``task_id``."""
+    task_id = str(task_id or "").strip()
+    return any(found != task_id for found in _task_ids_carried_by_pid(pid))
+
+
 def find_live_task_worker(task_id: str, *, prefer: Optional[int] = None) -> Optional[int]:
     """PID of one live worker for ``task_id``, or None.
 
@@ -752,54 +812,84 @@ def is_live_task_worker(pid: Optional[int], task_id: str) -> bool:
     return find_live_task_worker(task_id, prefer=want) == want
 
 
-def _rebind_running_worker(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
-    """Point the running task and its current run at a live worker pid.
+def _rebind_running_worker(
+    conn: sqlite3.Connection,
+    task_id: str,
+    pid: int,
+    *,
+    observed_run_id,
+    observed_worker_pid,
+    observed_claim_lock,
+) -> bool:
+    """Point the running task and its observed run at a live worker pid.
 
-    Caller may already hold the write transaction (crash sweep). Does not
-    touch the claim lock, failure counter, or status.
+    Compare-and-swap on the claim identity read when the scan started
+    (``current_run_id``, ``worker_pid``, ``claim_lock``). A successor claim
+    that landed after that read changes zero rows: no write, no release, no
+    failure count. Caller may already hold the write transaction (crash
+    sweep). Does not touch the claim lock, failure counter, or status.
+    Returns True only when the observed row was updated.
     """
     fingerprint = _process_fingerprint(int(pid)) or UNVERIFIED_WORKER_FINGERPRINT
 
-    def _apply() -> None:
+    def _apply() -> bool:
         cur = conn.execute(
             "UPDATE tasks SET worker_pid = ?, worker_started_at = ? "
-            "WHERE id = ? AND status = 'running'",
-            (int(pid), fingerprint, task_id),
+            "WHERE id = ? AND status = 'running' "
+            "AND current_run_id IS ? AND worker_pid IS ? AND claim_lock IS ?",
+            (
+                int(pid), fingerprint, task_id,
+                observed_run_id, observed_worker_pid, observed_claim_lock,
+            ),
         )
         if cur.rowcount != 1:
-            return
-        run_id = _kb._current_run_id(conn, task_id)
-        if run_id is not None:
+            return False
+        if observed_run_id is not None:
             conn.execute(
                 "UPDATE task_runs SET worker_pid = ?, worker_started_at = ? WHERE id = ?",
-                (int(pid), fingerprint, run_id),
+                (int(pid), fingerprint, observed_run_id),
             )
+        return True
 
     if getattr(conn, "in_transaction", False):
-        _apply()
-    else:
-        with _kb.write_txn(conn):
-            _apply()
+        return _apply()
+    with _kb.write_txn(conn):
+        return _apply()
 
 
 def _adopt_live_task_worker(
-    conn: sqlite3.Connection, task_id: str, recorded_pid,
-) -> Optional[int]:
-    """If a live identity worker exists, rebind the claim to it and return its pid.
+    conn: sqlite3.Connection,
+    task_id: str,
+    recorded_pid,
+    *,
+    observed_run_id,
+    observed_claim_lock,
+) -> tuple[Optional[int], bool]:
+    """Rebind a live identity worker onto the claim observed at scan start.
 
-    None means no task-identity worker: the caller keeps its existing reclaim
-    behaviour. Never counts a failure.
+    Returns ``(live_pid, claim_moved)``. ``live_pid`` is set when the caller
+    must hold the claim (already bound, or the CAS rebind landed). ``claim_moved``
+    means a live worker was seen but the observed run/pid/lock no longer matches:
+    do nothing — no release, no failure count. ``(None, False)`` means no
+    task-identity worker, so the caller keeps its existing reclaim behaviour.
     """
     live = find_live_task_worker(task_id, prefer=recorded_pid)
     if live is None:
-        return None
+        return None, False
     try:
         recorded = int(recorded_pid) if recorded_pid is not None else None
     except (TypeError, ValueError):
         recorded = None
     if recorded != live:
-        _rebind_running_worker(conn, task_id, live)
-    return live
+        rebound = _rebind_running_worker(
+            conn, task_id, live,
+            observed_run_id=observed_run_id,
+            observed_worker_pid=recorded_pid,
+            observed_claim_lock=observed_claim_lock,
+        )
+        if not rebound:
+            return None, True
+    return live, False
 
 
 def _fingerprint_holds_non_descendant(pid, started_at) -> bool:
@@ -1691,7 +1781,7 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
     host_prefix = _kb._host_prefix()
 
     rows = conn.execute(
-        "SELECT t.id, t.worker_pid, t.worker_started_at, "
+        "SELECT t.id, t.worker_pid, t.worker_started_at, t.current_run_id, "
         "       COALESCE(r.started_at, t.started_at) AS active_started_at, "
         "       t.max_runtime_seconds, t.claim_lock "
         "FROM tasks t "
@@ -1716,8 +1806,12 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
         started_at = _kb._row_get(row, "worker_started_at")
         # Another live identity worker owns this task: rebind, do not reclaim,
         # do not count a failure, and do not signal the recorded pid.
-        live = _adopt_live_task_worker(conn, tid, pid)
-        if live is not None and live != pid:
+        live, claim_moved = _adopt_live_task_worker(
+            conn, tid, pid,
+            observed_run_id=row["current_run_id"],
+            observed_claim_lock=row["claim_lock"],
+        )
+        if claim_moved or (live is not None and live != pid):
             continue
         if started_at == UNVERIFIED_WORKER_FINGERPRINT and _kb._pid_alive(pid):
             # Fingerprint capture failed at spawn: we cannot prove this live PID is our worker, so
@@ -1745,7 +1839,11 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
         # Do not release the claim while this task's identity worker still runs.
         if is_live_task_worker(pid, tid) or find_live_task_worker(tid, prefer=pid) is not None:
             if find_live_task_worker(tid, prefer=pid) not in (None, pid):
-                _adopt_live_task_worker(conn, tid, pid)
+                _adopt_live_task_worker(
+                    conn, tid, pid,
+                    observed_run_id=row["current_run_id"],
+                    observed_claim_lock=row["claim_lock"],
+                )
             continue
         error = f"elapsed {int(elapsed)}s > limit {limit}s"
         with _kb.write_txn(conn):
@@ -1816,6 +1914,7 @@ def detect_stale_running(
 
     rows = conn.execute(
         "SELECT t.id, t.worker_pid, t.worker_started_at, t.last_heartbeat_at, t.claim_lock, "
+        "       t.current_run_id, "
         "       COALESCE(r.started_at, t.started_at) AS active_started_at "
         "FROM tasks t "
         "LEFT JOIN task_runs r ON r.id = t.current_run_id "
@@ -1839,7 +1938,13 @@ def detect_stale_running(
         lock = row["claim_lock"] or ""
 
         started_at = _kb._row_get(row, "worker_started_at")
-        live = _adopt_live_task_worker(conn, tid, pid)
+        live, claim_moved = _adopt_live_task_worker(
+            conn, tid, pid,
+            observed_run_id=row["current_run_id"],
+            observed_claim_lock=row["claim_lock"],
+        )
+        if claim_moved:
+            continue
         if live is not None:
             _defer_reclaim_for_live_worker(
                 conn, tid, lock, now,
@@ -1921,14 +2026,20 @@ def reconcile_orphaned_running(conn: sqlite3.Connection) -> list[str]:
     now = int(time.time())
     reconciled: list[str] = []
     rows = conn.execute(
-        "SELECT id, claim_lock, claim_expires, worker_pid, worker_started_at FROM tasks "
+        "SELECT id, claim_lock, claim_expires, worker_pid, worker_started_at, current_run_id "
+        "FROM tasks "
         "WHERE status = 'running' "
         "  AND (claim_lock IS NULL OR claim_expires IS NULL)"
     ).fetchall()
     for row in rows:
         tid = row["id"]
         pid = row["worker_pid"]
-        if _adopt_live_task_worker(conn, tid, pid) is not None or (
+        live, claim_moved = _adopt_live_task_worker(
+            conn, tid, pid,
+            observed_run_id=row["current_run_id"],
+            observed_claim_lock=row["claim_lock"],
+        )
+        if claim_moved or live is not None or (
             pid and _fingerprint_holds_non_descendant(
                 pid, _kb._row_get(row, "worker_started_at"),
             )
@@ -2216,7 +2327,8 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
     sweep = _CrashSweep()
     with _kb.write_txn(conn):
         rows = conn.execute(
-            "SELECT id, worker_pid, worker_started_at, claim_lock, started_at, assignee "
+            "SELECT id, worker_pid, worker_started_at, claim_lock, started_at, assignee, "
+            "       current_run_id "
             "FROM tasks "
             "WHERE status = 'running' AND worker_pid IS NOT NULL"
         ).fetchall()
@@ -2230,8 +2342,14 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
             started_at = _kb._row_get(row, "started_at")
             if started_at is not None and time.time() - started_at < _kb._resolve_crash_grace_seconds():
                 continue
-            live = _adopt_live_task_worker(conn, row["id"], row["worker_pid"])
-            if live is not None:
+            live, claim_moved = _adopt_live_task_worker(
+                conn, row["id"], row["worker_pid"],
+                observed_run_id=row["current_run_id"],
+                observed_claim_lock=row["claim_lock"],
+            )
+            if claim_moved or live is not None:
+                if live is None:
+                    continue
                 _kb._log.debug(
                     "kanban dispatch: not reclaiming %s; live worker pid %s",
                     row["id"], live,
@@ -2580,6 +2698,85 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
         )
 
 
+def _commented_event_anchor_id(
+    conn: sqlite3.Connection,
+    task_id: str,
+    comment_id: int,
+    comment_at: int,
+    author,
+    body: str,
+) -> Optional[int]:
+    """Event id of the ``commented`` row that belongs to this comment.
+
+    Prefer ``payload.comment_id``. Otherwise the same-second ``commented``
+    event with matching author/len, paired by insertion order (the smallest
+    id when this is the only such comment). A later unrelated comment in the
+    same second must not become the anchor.
+    """
+    events = conn.execute(
+        "SELECT id, payload, created_at FROM task_events "
+        "WHERE task_id = ? AND kind = 'commented' ORDER BY id ASC",
+        (task_id,),
+    ).fetchall()
+    parsed = []
+    for row in events:
+        payload = _kb._json_or(row["payload"], {})
+        if not isinstance(payload, dict):
+            payload = {}
+        parsed.append((int(row["id"]), int(row["created_at"] or 0), payload))
+    for eid, _created, payload in parsed:
+        cid = payload.get("comment_id")
+        try:
+            if cid is not None and int(cid) == int(comment_id):
+                return eid
+        except (TypeError, ValueError):
+            continue
+    body_len = len(body) if isinstance(body, str) else None
+
+    def _matches(payload: dict) -> bool:
+        if body_len is None or payload.get("len") is None:
+            return False
+        try:
+            if int(payload.get("len")) != int(body_len):
+                return False
+        except (TypeError, ValueError):
+            return False
+        raw = payload.get("author")
+        if author is None:
+            return raw is None
+        return str(raw or "").strip() == str(author).strip()
+
+    same_second = [
+        eid for eid, created, payload in parsed
+        if created == comment_at and _matches(payload)
+    ]
+    if not same_second:
+        later = [
+            eid for eid, created, payload in parsed
+            if created >= comment_at and _matches(payload)
+        ]
+        return min(later) if later else None
+    siblings = conn.execute(
+        "SELECT id, author, body FROM task_comments "
+        "WHERE task_id = ? AND created_at = ? ORDER BY id ASC",
+        (task_id, comment_at),
+    ).fetchall()
+    ordinal = 0
+    index = None
+    for sib in siblings:
+        sib_author = str(_kb._lossy_text(sib["author"]) or "").strip()
+        sib_body = _kb._lossy_text(sib["body"]) or ""
+        if sib_author != str(author or "").strip() or len(sib_body) != body_len:
+            continue
+        if int(sib["id"]) == int(comment_id):
+            index = ordinal
+            break
+        ordinal += 1
+    if index is not None and index < len(same_second):
+        return same_second[index]
+    return same_second[0]
+
+
 def check_respawn_guard(
     conn: sqlite3.Connection, task_id: str, *, lane: str = "ready",
     exempt_out: Optional[list] = None,
@@ -2693,7 +2890,7 @@ def check_respawn_guard(
         return None
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
     for c in conn.execute(
-        "SELECT id, body, created_at FROM task_comments "
+        "SELECT id, author, body, created_at FROM task_comments "
         "WHERE task_id = ? AND created_at >= ? ORDER BY created_at DESC, id DESC",
         (task_id, pr_cutoff),
     ).fetchall():
@@ -2702,26 +2899,32 @@ def check_respawn_guard(
         if not match:
             continue
         comment_at = int(c["created_at"] or 0)
-        # ``done_reopened`` bypasses on event-id order, not a strict timestamp,
-        # so a reopen that shares the comment's second still wins. Other
-        # handoffs stay strictly after: a same-second ``assigned`` is not a
-        # reopen and must fail closed.
-        anchor = conn.execute(
-            "SELECT id FROM task_events "
-            "WHERE task_id = ? AND kind = 'commented' AND created_at <= ? "
-            "ORDER BY id DESC LIMIT 1",
-            (task_id, comment_at),
-        ).fetchone()
-        anchor_id = int(anchor["id"]) if anchor else int(c["id"])
-        events = conn.execute(
-            "SELECT kind, payload FROM task_events "
-            "WHERE task_id = ? "
-            "AND kind IN ('assigned', 'changes_requested', 'review_reopened', "
-            "'unblocked', 'done_reopened') "
-            "AND (created_at > ? OR ("
-            "kind = 'done_reopened' AND created_at >= ? AND id > ?))",
-            (task_id, comment_at, comment_at, anchor_id),
-        ).fetchall()
+        # Anchor to THIS comment's ``commented`` event, not the latest
+        # ``commented`` row in the same second. ``done_reopened`` after that
+        # event still bypasses; a same-second ``assigned`` does not.
+        anchor_id = _commented_event_anchor_id(
+            conn, task_id, int(c["id"]), comment_at,
+            _kb._lossy_text(c["author"]), body or "",
+        )
+        if anchor_id is None:
+            events = conn.execute(
+                "SELECT kind, payload FROM task_events "
+                "WHERE task_id = ? "
+                "AND kind IN ('assigned', 'changes_requested', 'review_reopened', "
+                "'unblocked', 'done_reopened') "
+                "AND created_at > ?",
+                (task_id, comment_at),
+            ).fetchall()
+        else:
+            events = conn.execute(
+                "SELECT kind, payload FROM task_events "
+                "WHERE task_id = ? "
+                "AND kind IN ('assigned', 'changes_requested', 'review_reopened', "
+                "'unblocked', 'done_reopened') "
+                "AND (created_at > ? OR ("
+                "kind = 'done_reopened' AND created_at >= ? AND id > ?))",
+                (task_id, comment_at, comment_at, anchor_id),
+            ).fetchall()
         if any(_is_handoff_event(e["kind"], e["payload"]) for e in events):
             return None
         # Exempt PRs only the implementer can unblock (not OPEN, CHANGES_REQUESTED,
@@ -3215,6 +3418,20 @@ def _dispatch_lane_task(
     claimed = claim(conn, task_id, ttl_seconds=ttl_seconds)
     if claimed is None:
         return False
+    # Veto before workspace resolution. A resolve failure records spawn_failed
+    # and counts toward the breaker; a live same-task worker is not a failure
+    # and must not be charged for a workspace the spawn will not use.
+    live = find_live_task_worker(claimed.id)
+    if live is not None:
+        _kb._log.debug(
+            "kanban dispatch: refusing spawn of %s; live worker pid %s",
+            claimed.id, live,
+        )
+        _release_claim_spawn_refused_live_worker(
+            conn, claimed.id, [live],
+            run_id=claimed.current_run_id, claim_lock=claimed.claim_lock,
+        )
+        return False
     try:
         resolved_branch_name = None
         if claimed.workspace_kind == "worktree":
@@ -3236,19 +3453,6 @@ def _dispatch_lane_task(
         # Force-load sdlc-review; the kanban lifecycle is already in every
         # worker's system prompt via KANBAN_GUIDANCE.
         claimed.skills = list(dict.fromkeys([*(claimed.skills or []), "sdlc-review"]))
-    live = find_live_task_worker(claimed.id)
-    if live is not None:
-        # Not a spawn failure: the card did not run, and charging the breaker
-        # (or an infrastructure cooldown) would park a task whose worker is fine.
-        _kb._log.debug(
-            "kanban dispatch: refusing spawn of %s; live worker pid %s",
-            claimed.id, live,
-        )
-        _release_claim_spawn_refused_live_worker(
-            conn, claimed.id, [live],
-            run_id=claimed.current_run_id, claim_lock=claimed.claim_lock,
-        )
-        return False
     try:
         pid = _call_spawn_fn(spawn_fn if spawn_fn is not None else _default_spawn, claimed, str(workspace), board)
         if pid:

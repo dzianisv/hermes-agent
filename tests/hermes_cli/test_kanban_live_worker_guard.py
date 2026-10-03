@@ -324,3 +324,153 @@ def test_same_second_assignment_does_not_bypass_active_pr(board, monkeypatch):
         )
     monkeypatch.setattr(kbd, "_active_pr_guard_applies", lambda _url: (True, None))
     assert kbd.check_respawn_guard(conn, tid) == "active_pr"
+
+
+def test_rebind_cas_does_not_clobber_successor_claim(board, tmp_path, monkeypatch):
+    """Scan observes run N; a successor claim on another connection wins the rebind CAS."""
+    conn = board
+    tid = kb.create_task(conn, title="race", assignee="worker")
+    live = _sleep_with_token(tid)
+    other = kbc.connect(tmp_path / "kanban.db")
+    try:
+        recorded = _dead_pid()
+        successor_pid = recorded - 1
+        while successor_pid > 1 and (
+            successor_pid == live.pid or kbd._pid_alive(successor_pid)
+        ):
+            successor_pid -= 1
+        _claim_running(conn, tid, recorded, "1|1")
+        observed = conn.execute(
+            "SELECT current_run_id, worker_pid, claim_lock FROM tasks WHERE id = ?",
+            (tid,),
+        ).fetchone()
+        state = {"done": False, "succ": None}
+
+        def _steal(task_id, *, prefer=None):
+            if state["done"] or task_id != tid:
+                return live.pid
+            state["done"] = True
+            with kb.write_txn(other):
+                other.execute(
+                    "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                    "claim_expires = NULL, current_run_id = NULL, worker_pid = NULL, "
+                    "worker_started_at = NULL WHERE id = ?",
+                    (tid,),
+                )
+            succ = kb.claim_task(other, tid)
+            assert succ and succ.current_run_id != observed["current_run_id"]
+            with kb.write_txn(other):
+                other.execute(
+                    "UPDATE tasks SET worker_pid = ? WHERE id = ?",
+                    (successor_pid, tid),
+                )
+                other.execute(
+                    "UPDATE task_runs SET worker_pid = ? WHERE id = ?",
+                    (successor_pid, succ.current_run_id),
+                )
+            state["succ"] = succ
+            return live.pid
+
+        monkeypatch.setattr(kbd, "find_live_task_worker", _steal)
+        assert kb.release_stale_claims(conn) == 0
+        task = kb.get_task(conn, tid)
+        succ = state["succ"]
+        assert succ is not None
+        assert task.status == "running"
+        assert task.current_run_id == succ.current_run_id
+        assert task.worker_pid == successor_pid
+        assert task.claim_lock == succ.claim_lock
+        assert task.consecutive_failures == 0
+        run = conn.execute(
+            "SELECT worker_pid FROM task_runs WHERE id = ?",
+            (succ.current_run_id,),
+        ).fetchone()
+        assert run["worker_pid"] == successor_pid
+        assert not any(e.kind == "reclaimed" for e in kb.list_events(conn, tid))
+    finally:
+        other.close()
+        _stop(live)
+
+
+def test_live_worker_veto_before_workspace_failure(
+    board, monkeypatch, all_assignees_spawnable,
+):
+    """A live same-task worker is refused before a workspace resolve can count a failure."""
+    conn = board
+    tid = kb.create_task(conn, title="job", assignee="worker")
+    proc = _sleep_with_token(tid)
+    calls = {"n": 0, "resolve": 0}
+
+    def boom(*_args, **_kwargs):
+        calls["resolve"] += 1
+        raise RuntimeError("workspace unavailable")
+
+    monkeypatch.setattr(kbd._kbw, "resolve_workspace", boom)
+    monkeypatch.setattr(kbd._kbw, "_resolve_worktree_workspace", boom)
+
+    def spawn_fn(*_args, **_kwargs):
+        calls["n"] += 1
+        return 4242
+
+    try:
+        kbd.dispatch_once(conn, spawn_fn=spawn_fn)
+        task = kb.get_task(conn, tid)
+        assert calls["n"] == 0
+        assert calls["resolve"] == 0
+        assert task.consecutive_failures == 0
+        assert task.last_failure_error is None
+        assert not any(e.kind == "spawn_failed" for e in kb.list_events(conn, tid))
+    finally:
+        _stop(proc)
+
+
+def test_done_reopened_after_pr_comment_ignores_later_same_second_comment(
+    board, monkeypatch,
+):
+    """PR comment, then done_reopened, then an unrelated comment, all one second.
+
+    The reopen is after THAT comment's event, so the guard must not return
+    active_pr. A same-second assignment is still not a reopen (covered separately).
+    """
+    conn = board
+    tid = kb.create_task(conn, title="rework", assignee="worker")
+    kb.add_comment(conn, tid, author="worker", body="https://github.com/org/repo/pull/77")
+    with kb.write_txn(conn):
+        kb._append_event(conn, tid, "done_reopened", {"actor": "operator", "status": "ready"})
+    kb.add_comment(conn, tid, author="other", body="unrelated note")
+    pinned = int(time.time())
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE task_comments SET created_at = ? WHERE task_id = ?",
+            (pinned, tid),
+        )
+        conn.execute(
+            "UPDATE task_events SET created_at = ? "
+            "WHERE task_id = ? AND kind IN ('commented', 'done_reopened')",
+            (pinned, tid),
+        )
+    monkeypatch.setattr(kbd, "_active_pr_guard_applies", lambda _url: (True, None))
+    assert kbd.check_respawn_guard(conn, tid) is None
+
+
+def test_manual_reclaim_does_not_signal_other_task_pid(board):
+    """Operator reclaim releases the card but does not signal another task's live pid."""
+    conn = board
+    task_a = kb.create_task(conn, title="a", assignee="worker")
+    task_b = kb.create_task(conn, title="b", assignee="worker")
+    child = _sleep_with_token(task_b)
+    signals = []
+    try:
+        fp = kbd._process_fingerprint(child.pid) or "1|1"
+        _claim_running(conn, task_a, child.pid, fp)
+        assert kb.reclaim_task(
+            conn, task_a, reason="operator",
+            signal_fn=lambda pid, sig: signals.append((pid, sig)),
+        )
+        assert signals == []
+        assert child.poll() is None
+        task = kb.get_task(conn, task_a)
+        assert task.status != "running"
+        assert task.claim_lock is None
+    finally:
+        _stop(child)

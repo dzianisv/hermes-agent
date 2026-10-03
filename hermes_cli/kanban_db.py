@@ -1787,8 +1787,11 @@ def add_comment(conn: sqlite3.Connection, task_id: str, author: str, body: str) 
             "INSERT INTO task_comments (task_id, author, body, created_at) "
             "VALUES (?, ?, ?, ?)", (task_id, author.strip(), body.strip(), now),
         )
-        _append_event(conn, task_id, "commented", {"author": author, "len": len(body)})
-        return int(cur.lastrowid or 0)
+        comment_id = int(cur.lastrowid or 0)
+        _append_event(conn, task_id, "commented", {
+            "author": author, "len": len(body), "comment_id": comment_id,
+        })
+        return comment_id
 
 
 def _require_task(conn: sqlite3.Connection, task_id: str) -> None:
@@ -2455,7 +2458,7 @@ def release_stale_claims(
     )
     stale = conn.execute(
         "SELECT id, claim_lock, worker_pid, worker_started_at, claim_expires, last_heartbeat_at, "
-        "       assignee "
+        "       assignee, current_run_id "
         "FROM tasks "
         "WHERE status = 'running' AND claim_expires IS NOT NULL "
         "  AND claim_expires < ?", (now,),
@@ -2469,7 +2472,13 @@ def release_stale_claims(
         started_at = _row_get(row, "worker_started_at")
         # Task-wide identity, not the recorded pid. A dead recorded pid with
         # another live marked descendant is not a reclaim and not a failure.
-        live = _adopt_live_task_worker(conn, row["id"], row["worker_pid"])
+        live, claim_moved = _adopt_live_task_worker(
+            conn, row["id"], row["worker_pid"],
+            observed_run_id=row["current_run_id"],
+            observed_claim_lock=row["claim_lock"],
+        )
+        if claim_moved:
+            continue
         if live is not None:
             _extend_live_stale_claim(conn, row, now, worker_pid=live)
             continue
@@ -2599,8 +2608,20 @@ def reclaim_task(
         # Nothing to reclaim — already ready / blocked / done.
         return False
     prev_lock = row["claim_lock"]
-    termination = _terminate_reclaimed_worker(
-        row["worker_pid"], prev_lock, signal_fn=signal_fn, started_at=row["worker_started_at"])
+    # Operator override still releases the claim, but must not signal a live
+    # process that positively belongs to a different task.
+    if _pid_carries_other_task(row["worker_pid"], task_id):
+        termination = {
+            "prev_pid": int(row["worker_pid"]) if row["worker_pid"] else None,
+            "host_local": bool(prev_lock) and str(prev_lock).startswith(_host_prefix()),
+            "termination_attempted": False,
+            "terminated": False,
+            "sigkill": False,
+            "signal_skipped": "other_task",
+        }
+    else:
+        termination = _terminate_reclaimed_worker(
+            row["worker_pid"], prev_lock, signal_fn=signal_fn, started_at=row["worker_started_at"])
     with write_txn(conn):
         retry_status = _retry_status_for_run(conn, task_id)
         cur = conn.execute(
@@ -4622,6 +4643,7 @@ from hermes_cli.kanban_db_dispatch import (  # noqa: E402
     _defer_reclaim_for_live_worker,
     _pid_alive,
     _record_task_failure,
+    _pid_carries_other_task,
     _terminate_reclaimed_worker,
     _worker_alive,
     _worker_survived_termination,
