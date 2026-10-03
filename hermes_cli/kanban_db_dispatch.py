@@ -543,6 +543,11 @@ def _pid_alive(pid: Optional[int]) -> bool:
 # the live PID) but NEVER signalled — missing process identity is refusal, not permission (#99558).
 UNVERIFIED_WORKER_FINGERPRINT = "unverified"
 
+# macOS psutil create_time drifts by ~200 centiseconds between spawn and a later read
+# (kern.boottime adjustment). Fingerprint units are centiseconds / clock ticks ×100, so 500
+# is a 5-second window: wide enough for that drift, still nothing like a recycled PID.
+WORKER_START_TIME_TOLERANCE_CS = 500
+
 
 def _process_fingerprint(pid: int) -> Optional[str]:
     """Restart-stable identity of a live process: ``"<instantiation epoch>|<start time>"``. The start
@@ -577,19 +582,34 @@ def _pid_recycled(pid: Optional[int], started_at) -> bool:
     """True when a live ``pid`` is NOT the process fingerprinted at spawn (or the fingerprint can no
     longer be read). Signalling it would hit a stranger. ``None`` fingerprint = legacy row, never
     recycled; the UNVERIFIED marker is always foreign. An integer fingerprint (rows written before the
-    boot witness was added) compares the start time only."""
+    boot witness was added) compares the start time only, within ``WORKER_START_TIME_TOLERANCE_CS``.
+    A composed fingerprint requires an exact epoch match and the same start-time window."""
     if started_at is None or not pid:
         return False
     if started_at == UNVERIFIED_WORKER_FINGERPRINT:
         return True
     if isinstance(started_at, str) and "|" in started_at:
-        return _process_fingerprint(int(pid)) != started_at
-    from gateway.status import _start_times_agree, get_process_start_time
+        current_fp = _process_fingerprint(int(pid))
+        if current_fp is None:
+            return True
+        try:
+            recorded_parts = started_at.split("|")
+            current_parts = current_fp.split("|")
+            if len(recorded_parts) != 2 or len(current_parts) != 2:
+                return True
+            recorded_epoch, recorded_start = recorded_parts
+            current_epoch, current_start = current_parts
+            if recorded_epoch != current_epoch:
+                return True
+            return abs(int(current_start) - int(recorded_start)) > WORKER_START_TIME_TOLERANCE_CS
+        except (TypeError, ValueError):
+            return True
+    from gateway.status import get_process_start_time
     current = get_process_start_time(int(pid))
     if current is None:
         return True
     try:
-        return not _start_times_agree(current, started_at)
+        return abs(int(current) - int(started_at)) > WORKER_START_TIME_TOLERANCE_CS
     except (TypeError, ValueError):
         return True
 
