@@ -474,3 +474,174 @@ def test_manual_reclaim_does_not_signal_other_task_pid(board):
         assert task.claim_lock is None
     finally:
         _stop(child)
+
+
+def _steal_successor(owner, other, tid: str):
+    """Commit a fresh claim on ``other`` over the running card ``owner`` observed."""
+    with kb.write_txn(other):
+        other.execute(
+            "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+            "claim_expires = NULL, current_run_id = NULL, worker_pid = NULL, "
+            "worker_started_at = NULL WHERE id = ?",
+            (tid,),
+        )
+    fresh = kb.claim_task(other, tid)
+    assert fresh and fresh.current_run_id and fresh.claim_lock
+    return fresh
+
+
+def test_terminal_reaper_does_not_signal_foreign_task_pid(board):
+    """A closed run must not signal a pid whose argv names a different task."""
+    conn = board
+    task_a = kb.create_task(conn, title="A", assignee="worker")
+    task_b = kb.create_task(conn, title="B", assignee="worker")
+    child = _sleep_with_token(task_b)
+    signals = []
+    try:
+        claimed = kb.claim_task(conn, task_a)
+        assert kb.complete_task(conn, task_a, result="done")
+        fingerprint = kbd._process_fingerprint(child.pid)
+        assert fingerprint
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_runs SET worker_pid = ?, worker_started_at = ?, ended_at = ? "
+                "WHERE id = ?",
+                (child.pid, fingerprint, int(time.time()) - 3600, claimed.current_run_id),
+            )
+        kbd.reap_terminal_workers(
+            conn, signal_fn=lambda pid, sig: signals.append((pid, sig)),
+        )
+        assert signals == []
+        assert child.poll() is None
+    finally:
+        _stop(child)
+
+
+def test_detect_stale_running_does_not_release_successor_claim(board, tmp_path):
+    """A successor claim taken between the stale scan and the release survives."""
+    conn = board
+    other = kbc.connect(tmp_path / "kanban.db")
+    try:
+        tid = kb.create_task(conn, title="race", assignee="worker")
+        old = kb.claim_task(conn, tid)
+        expired = int(time.time()) - 7200
+        dead = _dead_pid()
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET started_at = ?, last_heartbeat_at = ?, worker_pid = ? "
+                "WHERE id = ?",
+                (expired, expired, dead, tid),
+            )
+            conn.execute(
+                "UPDATE task_runs SET started_at = ? WHERE id = ?",
+                (expired, old.current_run_id),
+            )
+        successor = []
+
+        def interpose(*_args, **_kwargs):
+            successor.append(_steal_successor(conn, other, tid))
+            return (None, False)
+
+        original = kbd._adopt_live_task_worker
+        kbd._adopt_live_task_worker = interpose
+        try:
+            result = kbd.detect_stale_running(conn, stale_timeout_seconds=3600)
+        finally:
+            kbd._adopt_live_task_worker = original
+        fresh = successor[0]
+        task = kb.get_task(conn, tid)
+        run = conn.execute(
+            "SELECT status, outcome FROM task_runs WHERE id = ?", (fresh.current_run_id,),
+        ).fetchone()
+        assert result == []
+        assert task.status == "running"
+        assert task.current_run_id == fresh.current_run_id
+        assert task.claim_lock == fresh.claim_lock
+        assert run["status"] == "running"
+        assert run["outcome"] is None
+    finally:
+        other.close()
+
+
+def test_ttl_reclaim_successor_does_not_inherit_failure(board, tmp_path):
+    """TTL release and failure accounting are one fenced txn; a successor is untouched."""
+    conn = board
+    other = kbc.connect(tmp_path / "kanban.db")
+    try:
+        tid = kb.create_task(conn, title="ttl-race", assignee="worker")
+        _claim_running(conn, tid, _dead_pid(), "1|1")
+        successor = []
+
+        def interpose(*_args, **_kwargs):
+            fresh = _steal_successor(conn, other, tid)
+            # Same dispatcher lock, and already expired, so a lock+expires CAS
+            # still hits this successor. Only run_id + pid fencing saves it.
+            with kb.write_txn(other):
+                other.execute(
+                    "UPDATE tasks SET claim_expires = ? WHERE id = ?",
+                    (int(time.time()) - 30, tid),
+                )
+            successor.append(fresh)
+            return (None, False)
+
+        original = kbd._adopt_live_task_worker
+        kbd._adopt_live_task_worker = interpose
+        try:
+            assert kb.release_stale_claims(conn, signal_fn=lambda *_a: None) == 0
+        finally:
+            kbd._adopt_live_task_worker = original
+        fresh = successor[0]
+        task = kb.get_task(conn, tid)
+        run = conn.execute(
+            "SELECT status, outcome, ended_at FROM task_runs WHERE id = ?",
+            (fresh.current_run_id,),
+        ).fetchone()
+        assert task.status == "running"
+        assert task.current_run_id == fresh.current_run_id
+        assert task.claim_lock == fresh.claim_lock
+        assert task.consecutive_failures == 0
+        assert task.last_failure_error is None
+        assert run["status"] == "running" and run["ended_at"] is None
+        assert not any(e.kind in {"reclaimed", "gave_up"} for e in kb.list_events(conn, tid))
+    finally:
+        other.close()
+
+
+def test_defer_reclaim_does_not_extend_successor_claim(board, tmp_path, monkeypatch):
+    """Defer CAS includes run id and pid, so a successor's expiry is not moved."""
+    conn = board
+    other = kbc.connect(tmp_path / "kanban.db")
+    tid = kb.create_task(conn, title="defer-race", assignee="worker")
+    recorded = _dead_pid()
+    try:
+        _claim_running(conn, tid, recorded, "1|1")
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET last_heartbeat_at = NULL, started_at = ? WHERE id = ?",
+                (int(time.time()) - 7200, tid),
+            )
+            conn.execute(
+                "UPDATE task_runs SET started_at = ? WHERE id = "
+                "(SELECT current_run_id FROM tasks WHERE id = ?)",
+                (int(time.time()) - 7200, tid),
+            )
+        stolen = {}
+
+        def steal(task_id, *, prefer=None):
+            if task_id != tid or "fresh" in stolen:
+                return prefer
+            stolen["fresh"] = _steal_successor(conn, other, tid)
+            return prefer if prefer is not None else recorded
+
+        monkeypatch.setattr(kbd, "find_live_task_worker", steal)
+        kbd.detect_stale_running(conn, stale_timeout_seconds=60)
+        fresh = stolen["fresh"]
+        task = kb.get_task(conn, tid)
+        assert task.status == "running"
+        assert task.current_run_id == fresh.current_run_id
+        assert task.claim_lock == fresh.claim_lock
+        assert task.claim_expires == fresh.claim_expires
+        assert task.consecutive_failures == 0
+        assert not any(e.kind == "reclaim_deferred" for e in kb.list_events(conn, tid))
+    finally:
+        other.close()

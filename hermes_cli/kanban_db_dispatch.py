@@ -757,7 +757,11 @@ def _task_ids_carried_by_pid(pid) -> set[str]:
             argv = []
     found: set[str] = set()
     for arg in argv:
-        found.update(_TASK_ID_TOKEN_RE.findall(arg))
+        # Exact argv token only. A path such as ``hermes-wt-t_7a846ba0`` contains
+        # the same shape and must not count as ownership of that task.
+        token = str(arg).strip()
+        if _TASK_ID_TOKEN_RE.fullmatch(token):
+            found.add(token)
     if env_task and str(env_task).strip():
         found.add(str(env_task).strip())
     return found
@@ -812,6 +816,176 @@ def is_live_task_worker(pid: Optional[int], task_id: str) -> bool:
     return find_live_task_worker(task_id, prefer=want) == want
 
 
+def guarded_terminate(
+    pid,
+    task_id: str,
+    claim_lock,
+    *,
+    signal_fn=None,
+    started_at=None,
+    allow_signal: bool = True,
+) -> dict:
+    """Signal ``pid`` unless the fence refused or argv/env names another task.
+
+    ``allow_signal=False`` is a compare-and-swap miss: nothing is signalled.
+    A live pid whose argv or ``HERMES_KANBAN_TASK`` carries a different task
+    id is not signalled either (``signal_skipped='other_task'``).
+    """
+    skipped = {
+        "prev_pid": int(pid) if pid else None,
+        "host_local": bool(claim_lock) and str(claim_lock).startswith(_kb._host_prefix()),
+        "termination_attempted": False,
+        "terminated": False,
+        "sigkill": False,
+    }
+    if not allow_signal or _pid_carries_other_task(pid, task_id):
+        skipped["signal_skipped"] = (
+            "other_task" if _pid_carries_other_task(pid, task_id) else "fenced"
+        )
+        return skipped
+    return _terminate_reclaimed_worker(
+        pid, claim_lock, signal_fn=signal_fn, started_at=started_at,
+    )
+
+
+class _RunningClaimFence:
+    """Observed claim identity held inside one write transaction.
+
+    ``claim_lock`` is ``host:pid`` of the dispatcher, so a successor claim from
+    this same process reuses it. Lock-only CAS therefore releases the
+    successor. Every write and every signal goes through this object so a
+    miss (0 rows) changes nothing and signals nothing.
+    """
+
+    def __init__(
+        self,
+        conn: sqlite3.Connection,
+        task_id: str,
+        *,
+        observed_run_id,
+        observed_worker_pid,
+        observed_claim_lock,
+        matched: bool,
+        running: bool,
+    ) -> None:
+        self.conn = conn
+        self.task_id = task_id
+        self.observed_run_id = observed_run_id
+        self.observed_worker_pid = observed_worker_pid
+        self.observed_claim_lock = observed_claim_lock
+        self.matched = matched
+        self.running = running
+
+    def allows_signal(self, pid) -> bool:
+        """False on a CAS miss or when ``pid`` positively names another task."""
+        return bool(self.matched) and not _pid_carries_other_task(pid, self.task_id)
+
+    def terminate(self, pid, claim_lock, *, signal_fn=None, started_at=None) -> dict:
+        """Signal only when this fence still matches and the pid is not foreign."""
+        return guarded_terminate(
+            pid, self.task_id, claim_lock,
+            signal_fn=signal_fn, started_at=started_at, allow_signal=self.allows_signal(pid),
+        )
+
+    def update_tasks(
+        self,
+        set_sql: str,
+        params: tuple,
+        *,
+        extra_where: str = "",
+        extra_params: tuple = (),
+    ) -> int:
+        """CAS update of the running task. 0 when the observed identity is gone."""
+        if not self.matched or not self.running:
+            return 0
+        cur = self.conn.execute(
+            f"UPDATE tasks SET {set_sql} "
+            "WHERE id = ? AND status = 'running' "
+            "AND current_run_id IS ? AND worker_pid IS ? AND claim_lock IS ?"
+            + extra_where,
+            (
+                *params, self.task_id, self.observed_run_id,
+                self.observed_worker_pid, self.observed_claim_lock, *extra_params,
+            ),
+        )
+        if cur.rowcount != 1:
+            self.matched = False
+            return 0
+        return cur.rowcount
+
+    def clear_closed_run_worker(self, fingerprint) -> int:
+        """Drop a closed run's pid evidence, CAS'd on the observed identity."""
+        if not self.matched or self.observed_run_id is None:
+            return 0
+        cur = self.conn.execute(
+            "UPDATE task_runs SET worker_pid = NULL, worker_started_at = NULL "
+            "WHERE id = ? AND task_id = ? AND worker_pid IS ? "
+            "AND worker_started_at IS ? AND claim_lock IS ?",
+            (
+                self.observed_run_id, self.task_id, self.observed_worker_pid,
+                fingerprint, self.observed_claim_lock,
+            ),
+        )
+        if cur.rowcount != 1:
+            self.matched = False
+            return 0
+        return cur.rowcount
+
+
+@contextlib.contextmanager
+def fenced_running_claim(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    observed_run_id,
+    observed_worker_pid,
+    observed_claim_lock,
+    running: bool = True,
+    extra_match_sql: str = "",
+    extra_match_params: tuple = (),
+):
+    """One IMMEDIATE write txn gated on the observed ``(run_id, pid, lock)``.
+
+    Yields a :class:`_RunningClaimFence`. When the identity no longer matches,
+    ``matched`` is False: callers must not change status, count a failure, or
+    signal. ``running=False`` matches a closed ``task_runs`` row (terminal
+    reaper) instead of the live task row. Joins a caller-owned transaction
+    instead of nesting.
+    """
+    if running:
+        sql = (
+            "SELECT 1 FROM tasks WHERE id = ? AND status = 'running' "
+            "AND current_run_id IS ? AND worker_pid IS ? AND claim_lock IS ?"
+            + extra_match_sql
+        )
+        params: tuple = (
+            task_id, observed_run_id, observed_worker_pid, observed_claim_lock,
+            *extra_match_params,
+        )
+    else:
+        sql = (
+            "SELECT 1 FROM task_runs WHERE id = ? AND task_id = ? "
+            "AND worker_pid IS ? AND claim_lock IS ? AND ended_at IS NOT NULL"
+            + extra_match_sql
+        )
+        params = (
+            observed_run_id, task_id, observed_worker_pid, observed_claim_lock,
+            *extra_match_params,
+        )
+    opened = not getattr(conn, "in_transaction", False)
+    txn = _kb.write_txn(conn) if opened else contextlib.nullcontext(conn)
+    with txn:
+        matched = conn.execute(sql, params).fetchone() is not None
+        yield _RunningClaimFence(
+            conn, task_id,
+            observed_run_id=observed_run_id,
+            observed_worker_pid=observed_worker_pid,
+            observed_claim_lock=observed_claim_lock,
+            matched=matched,
+            running=running,
+        )
+
+
 def _rebind_running_worker(
     conn: sqlite3.Connection,
     task_id: str,
@@ -831,30 +1005,24 @@ def _rebind_running_worker(
     Returns True only when the observed row was updated.
     """
     fingerprint = _process_fingerprint(int(pid)) or UNVERIFIED_WORKER_FINGERPRINT
-
-    def _apply() -> bool:
-        cur = conn.execute(
-            "UPDATE tasks SET worker_pid = ?, worker_started_at = ? "
-            "WHERE id = ? AND status = 'running' "
-            "AND current_run_id IS ? AND worker_pid IS ? AND claim_lock IS ?",
-            (
-                int(pid), fingerprint, task_id,
-                observed_run_id, observed_worker_pid, observed_claim_lock,
-            ),
-        )
-        if cur.rowcount != 1:
+    with fenced_running_claim(
+        conn, task_id,
+        observed_run_id=observed_run_id,
+        observed_worker_pid=observed_worker_pid,
+        observed_claim_lock=observed_claim_lock,
+    ) as fence:
+        if fence.update_tasks(
+            "worker_pid = ?, worker_started_at = ?", (int(pid), fingerprint),
+        ) != 1:
             return False
         if observed_run_id is not None:
+            # The run row may still have a NULL pid (claim recorded it only on
+            # tasks). The task CAS above is the fence; mirror onto that run.
             conn.execute(
                 "UPDATE task_runs SET worker_pid = ?, worker_started_at = ? WHERE id = ?",
                 (int(pid), fingerprint, observed_run_id),
             )
         return True
-
-    if getattr(conn, "in_transaction", False):
-        return _apply()
-    with _kb.write_txn(conn):
-        return _apply()
 
 
 def _adopt_live_task_worker(
@@ -1001,16 +1169,18 @@ def _release_claim_spawn_refused_live_worker(
     ``spawn_failed``. The event is the audit trail; the next tick may spawn
     once those pids are gone.
     """
-    with _kb.write_txn(conn):
+    with fenced_running_claim(
+        conn, task_id,
+        observed_run_id=run_id,
+        observed_worker_pid=None,
+        observed_claim_lock=claim_lock,
+    ) as fence:
         retry_status = _kb._retry_status_for_run(conn, task_id)
-        cur = conn.execute(
-            "UPDATE tasks SET status = ?, claim_lock = NULL, "
-            "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL "
-            "WHERE id = ? AND status = 'running' "
-            "AND current_run_id = ? AND claim_lock = ?",
-            (retry_status, task_id, run_id, claim_lock),
-        )
-        if cur.rowcount != 1:
+        if fence.update_tasks(
+            "status = ?, claim_lock = NULL, "
+            "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL",
+            (retry_status,),
+        ) != 1:
             return
         payload = {"pids": [int(p) for p in pids], "retry_status": retry_status}
         run_id = _kb._end_run(
@@ -1622,25 +1792,31 @@ def _reap_terminal_worker_row(conn, row, host_prefix: str, signal_fn, reaped: li
     # claim's liveness, but it must not override a mismatched spawn fingerprint
     # when deciding whether to signal a closed run's PID.
     alive = _kb._pid_alive(pid) and not _pid_recycled(pid, fingerprint)
-    termination = None
-    if alive:
-        termination = _terminate_reclaimed_worker(
-            pid, row["claim_lock"], signal_fn=signal_fn, started_at=fingerprint)
-        if not termination["terminated"]:
-            return  # still alive: try again next tick
-    with _kb.write_txn(conn):
-        conn.execute(
-            "UPDATE task_runs SET worker_pid = NULL, worker_started_at = NULL "
-            "WHERE id = ? AND worker_pid = ? AND worker_started_at = ?",
-            (row["id"], pid, fingerprint),
-        )
+    with fenced_running_claim(
+        conn, row["task_id"],
+        observed_run_id=row["id"],
+        observed_worker_pid=pid,
+        observed_claim_lock=row["claim_lock"],
+        running=False,
+    ) as fence:
+        if not fence.matched:
+            return
+        termination = None
         if alive:
+            # Closed run: never signal a pid that positively belongs to another task.
+            termination = fence.terminate(
+                pid, row["claim_lock"], signal_fn=signal_fn, started_at=fingerprint,
+            )
+            if not termination.get("terminated") and not termination.get("signal_skipped"):
+                return  # still alive: try again next tick
+        if fence.clear_closed_run_worker(fingerprint) != 1:
+            return
+        if alive and termination and termination.get("termination_attempted"):
             _kb._append_event(
                 conn, row["task_id"], "terminal_worker_reaped",
                 {"pid": pid, "worker_started_at": fingerprint, **termination}, run_id=row["id"],
             )
-    if alive:
-        reaped.append(row["task_id"])
+            reaped.append(row["task_id"])
 
 
 def _worker_survived_termination(termination: dict) -> bool:
@@ -1658,6 +1834,32 @@ def _worker_survived_termination(termination: dict) -> bool:
     )
 
 
+def _apply_deferred_claim_extension(
+    fence: _RunningClaimFence, now: int, termination: dict, reason: str,
+) -> bool:
+    """Extend the fenced claim. False when the observed run/pid/lock is gone."""
+    if not fence.matched:
+        return False
+    grace = now + _kb.RECLAIM_DEFER_GRACE_SECONDS
+    if fence.update_tasks("claim_expires = ?", (grace,)) != 1:
+        return False
+    run_id = fence.observed_run_id
+    if run_id is not None:
+        fence.conn.execute(
+            "UPDATE task_runs SET claim_expires = ? WHERE id = ?", (grace, run_id),
+        )
+    payload = {
+        "reason": reason,
+        "claim_lock": fence.observed_claim_lock,
+        "claim_expires_now": grace,
+    }
+    payload.update(termination)
+    _kb._append_event(
+        fence.conn, fence.task_id, "reclaim_deferred", payload, run_id=run_id,
+    )
+    return True
+
+
 def _defer_reclaim_for_live_worker(
     conn: sqlite3.Connection,
     task_id: str,
@@ -1666,29 +1868,24 @@ def _defer_reclaim_for_live_worker(
     termination: dict,
     *,
     reason: str,
+    observed_run_id,
+    observed_worker_pid,
 ) -> None:
     """Hold a claim whose worker survived termination instead of releasing it.
 
     Extends ``claim_expires`` by ``RECLAIM_DEFER_GRACE_SECONDS`` so the task
     stays ``running`` (no duplicate spawn) and records ``reclaim_deferred``.
     The next tick retries the kill; not spawning a duplicate is what lets the
-    throttled worker finally die.
+    throttled worker finally die. CAS on the observed run, pid, and lock so a
+    successor claim (same ``host:pid`` lock) is not extended.
     """
-    grace = now + _kb.RECLAIM_DEFER_GRACE_SECONDS
-    with _kb.write_txn(conn):
-        cur = conn.execute(
-            "UPDATE tasks SET claim_expires = ? "
-            "WHERE id = ? AND status = 'running' AND claim_lock IS ?",
-            (grace, task_id, claim_lock),
-        )
-        if cur.rowcount != 1:
-            return
-        run_id = _kb._current_run_id(conn, task_id)
-        if run_id is not None:
-            conn.execute("UPDATE task_runs SET claim_expires = ? WHERE id = ?", (grace, run_id))
-        payload = {"reason": reason, "claim_lock": claim_lock, "claim_expires_now": grace}
-        payload.update(termination)
-        _kb._append_event(conn, task_id, "reclaim_deferred", payload, run_id=run_id)
+    with fenced_running_claim(
+        conn, task_id,
+        observed_run_id=observed_run_id,
+        observed_worker_pid=observed_worker_pid,
+        observed_claim_lock=claim_lock,
+    ) as fence:
+        _apply_deferred_claim_extension(fence, now, termination, reason)
 
 
 # Heartbeat outcome kinds: the old bare ``False`` collapsed "no such task" and
@@ -1819,22 +2016,49 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
             _kb._log.warning("kanban: task %s worker pid %s exceeded max runtime but has no verified "
                              "identity; not signalled", tid, pid)
             continue
-        # SIGTERM then SIGKILL after 5 s grace; workers wanting a cleaner
-        # shutdown install their own SIGTERM handler. A recycled PID (fingerprint
-        # mismatch) is never signalled: the worker is already gone. A descendant
-        # that does not name this task is not signalled either.
+        # SIGTERM inside the fence (no signal on a CAS miss or a foreign-task
+        # pid). The 5s poll stays outside the write txn; SIGKILL re-checks the
+        # fence so a successor that arrived during the poll is not signalled.
         killed = False
-        kill = None if _foreign_descendant(pid, tid) else _kill_fn(signal_fn)
-        if kill is not None and not (_kb._pid_alive(pid) and _pid_recycled(pid, started_at)):
-            killpg = signal_fn if signal_fn is not None else None
-            # Pre-death snapshot; reused by the SIGKILL escalation.
-            tree = _capture_worker_tree(pid)
-            with contextlib.suppress(ProcessLookupError, OSError):
-                _signal_worker_tree(pid, signal.SIGTERM, kill=kill, killpg=killpg, snapshot=tree)
-            # Short polling wait — no time.sleep on the write txn.
+        pending_kill = None
+        with fenced_running_claim(
+            conn, tid,
+            observed_run_id=row["current_run_id"],
+            observed_worker_pid=pid,
+            observed_claim_lock=row["claim_lock"],
+        ) as fence:
+            if not fence.matched:
+                continue
+            if (
+                not _foreign_descendant(pid, tid)
+                and not _pid_carries_other_task(pid, tid)
+                and not (_kb._pid_alive(pid) and _pid_recycled(pid, started_at))
+            ):
+                kill = _kill_fn(signal_fn)
+                if kill is not None:
+                    killpg = signal_fn if signal_fn is not None else None
+                    tree = _capture_worker_tree(pid)
+                    with contextlib.suppress(ProcessLookupError, OSError):
+                        _signal_worker_tree(
+                            pid, signal.SIGTERM, kill=kill, killpg=killpg, snapshot=tree,
+                        )
+                    pending_kill = (kill, killpg, tree)
+        if pending_kill is not None:
+            kill, killpg, tree = pending_kill
             _poll_worker_exit(pid, started_at)
             if _worker_alive(pid, started_at):
-                killed = _sigkill(kill, pid, killpg=killpg, snapshot=tree)
+                with fenced_running_claim(
+                    conn, tid,
+                    observed_run_id=row["current_run_id"],
+                    observed_worker_pid=pid,
+                    observed_claim_lock=row["claim_lock"],
+                ) as fence:
+                    if (
+                        fence.matched
+                        and not _foreign_descendant(pid, tid)
+                        and not _pid_carries_other_task(pid, tid)
+                    ):
+                        killed = _sigkill(kill, pid, killpg=killpg, snapshot=tree)
 
         # Do not release the claim while this task's identity worker still runs.
         if is_live_task_worker(pid, tid) or find_live_task_worker(tid, prefer=pid) is not None:
@@ -1846,42 +2070,43 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
                 )
             continue
         error = f"elapsed {int(elapsed)}s > limit {limit}s"
-        with _kb.write_txn(conn):
+        with fenced_running_claim(
+            conn, tid,
+            observed_run_id=row["current_run_id"],
+            observed_worker_pid=pid,
+            observed_claim_lock=row["claim_lock"],
+        ) as fence:
             retry_status = _kb._retry_status_for_run(conn, tid)
-            cur = conn.execute(
-                "UPDATE tasks SET status = ?, claim_lock = NULL, "
+            if fence.update_tasks(
+                "status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, "
-                "last_heartbeat_at = NULL "
-                "WHERE id = ? AND status = 'running' "
-                "  AND worker_pid = ? AND claim_lock IS ?",
-                (retry_status, tid, pid, row["claim_lock"]),
+                "last_heartbeat_at = NULL",
+                (retry_status,),
+            ) != 1:
+                continue
+            payload = {
+                "pid": pid,
+                "elapsed_seconds": int(elapsed),
+                "limit_seconds": limit,
+                "sigkill": killed,
+                "retry_status": retry_status,
+            }
+            run_id = _kb._end_run(
+                conn, tid, outcome="timed_out", status="timed_out",
+                error=error, metadata=payload,
             )
-            if cur.rowcount == 1:
-                payload = {
-                    "pid": pid,
-                    "elapsed_seconds": int(elapsed),
-                    "limit_seconds": limit,
-                    "sigkill": killed,
-                    "retry_status": retry_status,
-                }
-                run_id = _kb._end_run(
-                    conn, tid, outcome="timed_out", status="timed_out",
-                    error=error, metadata=payload,
-                )
-                _kb._append_event(conn, tid, "timed_out", payload, run_id=run_id)
-                timed_out.append(tid)
-        # Outside the write_txn above because ``_record_task_failure`` opens its
-        # own. If the breaker trips this flips the task to ``blocked`` and emits
-        # ``gave_up`` on top of the ``timed_out`` already emitted.
-        if cur.rowcount == 1:
+            _kb._append_event(conn, tid, "timed_out", payload, run_id=run_id)
+            # Same transaction as the release so a successor cannot inherit it.
             _record_task_failure(
                 conn, tid,
                 error=error,
                 outcome="timed_out",
                 release_claim=False,
                 end_run=False,
+                own_txn=False,
                 event_payload_extra={"pid": pid, "sigkill": killed, "retry_status": retry_status},
             )
+            timed_out.append(tid)
     return timed_out
 
 
@@ -1950,41 +2175,48 @@ def detect_stale_running(
                 conn, tid, lock, now,
                 {"prev_pid": int(live), "terminated": False, "host_local": True},
                 reason="heartbeat_stale_worker_alive",
-            )
-            continue
-        if _foreign_descendant(pid, tid):
-            termination = _unsignalled_gone(pid, lock)
-        else:
-            termination = _kb._terminate_reclaimed_worker(
-                pid, lock, signal_fn=signal_fn, started_at=started_at)
-
-        # Never release a claim while our own worker is still alive: that would
-        # spawn a duplicate beside it. Hold the claim and retry next tick.
-        # A foreign descendant is not that worker (parentage is not identity).
-        if (
-            not _foreign_descendant(pid, tid)
-            and (
-                _worker_survived_termination(termination)
-                or _fingerprint_holds_non_descendant(pid, started_at)
-            )
-        ):
-            _defer_reclaim_for_live_worker(
-                conn, tid, lock, now, termination,
-                reason="heartbeat_stale_worker_alive",
+                observed_run_id=row["current_run_id"],
+                observed_worker_pid=int(live),
             )
             continue
 
-        with _kb.write_txn(conn):
+        with fenced_running_claim(
+            conn, tid,
+            observed_run_id=row["current_run_id"],
+            observed_worker_pid=pid,
+            observed_claim_lock=row["claim_lock"],
+        ) as fence:
+            if not fence.matched:
+                continue
+            if _foreign_descendant(pid, tid):
+                termination = _unsignalled_gone(pid, lock)
+            else:
+                termination = fence.terminate(
+                    pid, lock, signal_fn=signal_fn, started_at=started_at,
+                )
+
+            # Never release a claim while our own worker is still alive: that would
+            # spawn a duplicate beside it. Hold the claim and retry next tick.
+            # A foreign descendant is not that worker (parentage is not identity).
+            if (
+                not _foreign_descendant(pid, tid)
+                and (
+                    _worker_survived_termination(termination)
+                    or _fingerprint_holds_non_descendant(pid, started_at)
+                )
+            ):
+                _apply_deferred_claim_extension(
+                    fence, now, termination, "heartbeat_stale_worker_alive",
+                )
+                continue
+
             retry_status = _kb._retry_status_for_run(conn, tid)
-            cur = conn.execute(
-                "UPDATE tasks SET status = ?, claim_lock = NULL, "
+            if fence.update_tasks(
+                "status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, "
-                "last_heartbeat_at = NULL "
-                "WHERE id = ? AND status = 'running' "
-                "  AND claim_lock IS ?",
-                (retry_status, tid, row["claim_lock"]),
-            )
-            if cur.rowcount != 1:
+                "last_heartbeat_at = NULL",
+                (retry_status,),
+            ) != 1:
                 continue
 
             payload = {
@@ -2555,6 +2787,7 @@ def _record_task_failure(
     end_run: bool = False,
     event_payload_extra: Optional[dict] = None,
     infrastructure: bool = False,
+    own_txn: bool = True,
 ) -> bool:
     """Record a non-success outcome and maybe trip the circuit breaker; every
     non-success path funnels through here so ``consecutive_failures`` stays
@@ -2573,11 +2806,20 @@ def _record_task_failure(
     with ``infrastructure: true`` but ``consecutive_failures`` is left alone and
     the breaker never trips; the card stays retryable and
     :func:`check_respawn_guard` spaces the retries.
+
+    ``own_txn=False``: caller already holds the write transaction (the fenced
+    reclaim path, so the failure cannot land on a successor claim).
     """
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
     error = error[:500]
-    with _kb.write_txn(conn):
+    if own_txn:
+        txn = _kb.write_txn(conn)
+    else:
+        if not getattr(conn, "in_transaction", False):
+            raise RuntimeError("_record_task_failure own_txn=False requires an open write transaction")
+        txn = contextlib.nullcontext(conn)
+    with txn:
         row = conn.execute(
             "SELECT consecutive_failures, status, max_retries, current_run_id "
             "FROM tasks WHERE id = ?", (task_id,),

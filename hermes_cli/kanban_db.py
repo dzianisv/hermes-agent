@@ -2452,9 +2452,11 @@ def release_stale_claims(
     host_prefix = _host_prefix()
     from hermes_cli.kanban_db_dispatch import (
         _adopt_live_task_worker,
+        _apply_deferred_claim_extension,
         _fingerprint_holds_non_descendant,
         _foreign_descendant,
         _unsignalled_gone,
+        fenced_running_claim,
     )
     stale = conn.execute(
         "SELECT id, claim_lock, worker_pid, worker_started_at, claim_expires, last_heartbeat_at, "
@@ -2487,29 +2489,40 @@ def release_stale_claims(
             _extend_live_stale_claim(conn, row, now)
             continue
 
-        if _foreign_descendant(row["worker_pid"], row["id"]):
-            termination = _unsignalled_gone(row["worker_pid"], row["claim_lock"])
-        else:
-            termination = _terminate_reclaimed_worker(
-                row["worker_pid"], row["claim_lock"], signal_fn=signal_fn, started_at=started_at,
-            )
-        # A live worker of ours must keep its claim (else a duplicate spawns beside it).
-        if _worker_survived_termination(termination):
-            _defer_reclaim_for_live_worker(
-                conn, row["id"], row["claim_lock"], now, termination,
-                reason="ttl_expired_worker_alive",
-            )
-            continue
-        with write_txn(conn):
+        released = False
+        run_id = None
+        retry_status = None
+        with fenced_running_claim(
+            conn, row["id"],
+            observed_run_id=row["current_run_id"],
+            observed_worker_pid=row["worker_pid"],
+            observed_claim_lock=row["claim_lock"],
+            extra_match_sql=" AND claim_expires IS NOT NULL AND claim_expires < ?",
+            extra_match_params=(now,),
+        ) as fence:
+            if not fence.matched:
+                continue
+            if _foreign_descendant(row["worker_pid"], row["id"]):
+                termination = _unsignalled_gone(row["worker_pid"], row["claim_lock"])
+            else:
+                termination = fence.terminate(
+                    row["worker_pid"], row["claim_lock"],
+                    signal_fn=signal_fn, started_at=started_at,
+                )
+            # A live worker of ours must keep its claim (else a duplicate spawns beside it).
+            if _worker_survived_termination(termination):
+                _apply_deferred_claim_extension(
+                    fence, now, termination, "ttl_expired_worker_alive",
+                )
+                continue
             retry_status = _retry_status_for_run(conn, row["id"])
-            cur = conn.execute(
-                "UPDATE tasks SET status = ?, claim_lock = NULL, "
-                "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL "
-                "WHERE id = ? AND status = 'running' AND claim_lock IS ? "
-                "AND claim_expires IS NOT NULL AND claim_expires < ?",
-                (retry_status, row["id"], row["claim_lock"], now),
-            )
-            if cur.rowcount != 1:
+            if fence.update_tasks(
+                "status = ?, claim_lock = NULL, "
+                "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL",
+                (retry_status,),
+                extra_where=" AND claim_expires IS NOT NULL AND claim_expires < ?",
+                extra_params=(now,),
+            ) != 1:
                 continue
             run_id = _record_reclaim(
                 conn, row["id"], termination,
@@ -2525,18 +2538,20 @@ def release_stale_claims(
                     "retry_status": retry_status,
                 },
             )
+            # Same transaction as the release: a successor must not inherit the failure.
+            _record_task_failure(
+                conn, row["id"], f"stale_lock={row['claim_lock']}",
+                outcome="reclaimed", failure_limit=failure_limit,
+                release_claim=False, end_run=False, own_txn=False,
+                event_payload_extra={
+                    "worker_pid": _opt_int(row["worker_pid"]),
+                    "retry_status": retry_status,
+                },
+            )
             reclaimed += 1
-        # Own txn, after the reclaim commit (same shape as ``enforce_max_runtime``):
-        # the run ended without a verdict, so it counts toward the breaker and a
-        # trip flips the task to ``blocked`` + ``gave_up`` on top of ``reclaimed``.
-        _record_task_failure(
-            conn, row["id"], f"stale_lock={row['claim_lock']}",
-            outcome="reclaimed", failure_limit=failure_limit,
-            release_claim=False, end_run=False,
-            event_payload_extra={"worker_pid": _opt_int(row["worker_pid"]), "retry_status": retry_status},
-        )
+            released = True
         # Post-commit observer; every non-reclaim branch ``continue``d above.
-        if _kanban_observer_consumed("on_kanban_worker_stale_claim"):
+        if released and _kanban_observer_consumed("on_kanban_worker_stale_claim"):
             _fire_kanban_lifecycle_hook(
                 "on_kanban_worker_stale_claim", row["id"], board=get_current_board(),
                 assignee=row["assignee"], run_id=run_id, worker_pid=_opt_int(row["worker_pid"]),
@@ -2569,15 +2584,21 @@ def _extend_live_stale_claim(
     """
     new_expires = now + _resolve_claim_ttl_seconds()
     pid = int(worker_pid if worker_pid is not None else row["worker_pid"])
-    with write_txn(conn):
-        cur = conn.execute(
-            "UPDATE tasks SET claim_expires = ? "
-            "WHERE id = ? AND status = 'running' "
-            "  AND claim_lock IS ? "
-            "  AND claim_expires IS NOT NULL "
-            "  AND claim_expires < ?", (new_expires, row["id"], row["claim_lock"], now),
-        )
-        if cur.rowcount != 1:
+    from hermes_cli.kanban_db_dispatch import fenced_running_claim
+    with fenced_running_claim(
+        conn, row["id"],
+        observed_run_id=row["current_run_id"],
+        observed_worker_pid=pid,
+        observed_claim_lock=row["claim_lock"],
+        extra_match_sql=" AND claim_expires IS NOT NULL AND claim_expires < ?",
+        extra_match_params=(now,),
+    ) as fence:
+        if fence.update_tasks(
+            "claim_expires = ?",
+            (new_expires,),
+            extra_where=" AND claim_expires IS NOT NULL AND claim_expires < ?",
+            extra_params=(now,),
+        ) != 1:
             return
         run_id = _extend_run_claim(conn, row["id"], new_expires)
         _append_event(
@@ -2600,7 +2621,8 @@ def reclaim_task(
     """Operator reclaim regardless of TTL: release the claim, restore the source
     phase, reset the failure counter. False when not running."""
     row = conn.execute(
-        "SELECT status, claim_lock, worker_pid, worker_started_at FROM tasks WHERE id = ?", (task_id,),
+        "SELECT status, claim_lock, worker_pid, worker_started_at, current_run_id "
+        "FROM tasks WHERE id = ?", (task_id,),
     ).fetchone()
     if not row:
         return False
@@ -2608,29 +2630,50 @@ def reclaim_task(
         # Nothing to reclaim — already ready / blocked / done.
         return False
     prev_lock = row["claim_lock"]
-    # Operator override still releases the claim, but must not signal a live
-    # process that positively belongs to a different task.
-    if _pid_carries_other_task(row["worker_pid"], task_id):
-        termination = {
-            "prev_pid": int(row["worker_pid"]) if row["worker_pid"] else None,
-            "host_local": bool(prev_lock) and str(prev_lock).startswith(_host_prefix()),
-            "termination_attempted": False,
-            "terminated": False,
-            "sigkill": False,
-            "signal_skipped": "other_task",
-        }
-    else:
-        termination = _terminate_reclaimed_worker(
-            row["worker_pid"], prev_lock, signal_fn=signal_fn, started_at=row["worker_started_at"])
-    with write_txn(conn):
-        retry_status = _retry_status_for_run(conn, task_id)
-        cur = conn.execute(
-            "UPDATE tasks SET status = ?, claim_lock = NULL, "
-            "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL "
-            "WHERE id = ? AND status IN ('running', 'ready', 'blocked') "
-            "AND claim_lock IS ?", (retry_status, task_id, prev_lock),
+    if row["status"] != "running":
+        # Residual lock on a non-running card: not a live claim. Still refuse a
+        # pid that positively names another task.
+        from hermes_cli.kanban_db_dispatch import guarded_terminate
+        termination = guarded_terminate(
+            row["worker_pid"], task_id, prev_lock,
+            signal_fn=signal_fn, started_at=row["worker_started_at"],
         )
-        if cur.rowcount != 1:
+        with write_txn(conn):
+            retry_status = _retry_status_for_run(conn, task_id)
+            cur = conn.execute(
+                "UPDATE tasks SET status = ?, claim_lock = NULL, "
+                "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL "
+                "WHERE id = ? AND status IN ('ready', 'blocked') "
+                "AND claim_lock IS ?", (retry_status, task_id, prev_lock),
+            )
+            if cur.rowcount != 1:
+                return False
+            _record_reclaim(
+                conn, task_id, termination,
+                error=f"manual_reclaim: {reason}" if reason else f"manual_reclaim lock={prev_lock}",
+                payload={"manual": True, "reason": reason, "prev_lock": prev_lock, "retry_status": retry_status},
+            )
+        _clear_failure_counter(conn, task_id)
+        return True
+    from hermes_cli.kanban_db_dispatch import fenced_running_claim
+    with fenced_running_claim(
+        conn, task_id,
+        observed_run_id=row["current_run_id"],
+        observed_worker_pid=row["worker_pid"],
+        observed_claim_lock=prev_lock,
+    ) as fence:
+        if not fence.matched:
+            return False
+        termination = fence.terminate(
+            row["worker_pid"], prev_lock,
+            signal_fn=signal_fn, started_at=row["worker_started_at"],
+        )
+        retry_status = _retry_status_for_run(conn, task_id)
+        if fence.update_tasks(
+            "status = ?, claim_lock = NULL, "
+            "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL",
+            (retry_status,),
+        ) != 1:
             return False
         _record_reclaim(
             conn, task_id, termination,
@@ -4057,7 +4100,10 @@ def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> b
         )
         _append_event(conn, task_id, "archived", None, run_id=run_id)
     if was_running:
-        termination = _terminate_reclaimed_worker(prev_pid, prev_lock, signal_fn=signal_fn, started_at=prev_started)
+        from hermes_cli.kanban_db_dispatch import guarded_terminate
+        termination = guarded_terminate(
+            prev_pid, task_id, prev_lock, signal_fn=signal_fn, started_at=prev_started,
+        )
         with write_txn(conn):
             _append_event(conn, task_id, "archive_worker_termination", termination, run_id=run_id)
     # ``archived`` parents no longer block children; promote them now.
