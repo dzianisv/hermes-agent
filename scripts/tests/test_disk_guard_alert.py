@@ -100,13 +100,13 @@ def test_every_deployed_floor_agrees_with_the_decision():
 
     found["disk_guard_alert.py"] = float(dga.DEFAULT_FLOOR_GI)
 
-    sh = (root / "scripts" / "disk-guard.sh").read_text()
+    sh = (root / "scripts" / "disk-guard.sh").read_text(encoding="utf-8-sig")
     m = _re.search(r'FLOOR_GI="\$\{DISK_GUARD_FLOOR_GI:-' + _NUM + r'\}"', sh)
     assert m, "disk-guard.sh no longer declares FLOOR_GI the way this guard parses"
     found["disk-guard.sh"] = float(m.group(1))
 
     cron = (root / "profiles" / "software-engineer" / "scripts"
-            / "disk-guard-cron.sh").read_text()
+            / "disk-guard-cron.sh").read_text(encoding="utf-8-sig")
     m = _re.search(r'^FLOOR_GI_PINNED=' + _NUM, cron, _re.M)
     assert m, "disk-guard-cron.sh no longer declares FLOOR_GI_PINNED"
     found["disk-guard-cron.sh"] = float(m.group(1))
@@ -117,7 +117,7 @@ def test_every_deployed_floor_agrees_with_the_decision():
         sorted(root.glob("profiles/*/scripts/agentpod_em_heartbeat.py"))
     assert hbs, "no heartbeat copy found — the glob is wrong, not the floor"
     for p in hbs:
-        m = _re.search(r'^DISK_FLOOR_GI\s*=\s*' + _NUM, p.read_text(), _re.M)
+        m = _re.search(r'^DISK_FLOOR_GI\s*=\s*' + _NUM, p.read_text(encoding="utf-8-sig"), _re.M)
         assert m, f"{p} no longer declares DISK_FLOOR_GI"
         found[str(p)] = float(m.group(1))
 
@@ -139,7 +139,7 @@ def test_reclaim_target_is_higher_than_the_paging_floor_and_never_pages():
     alert rate the owner cut on 2026-09-22). Both are DERIVED from the file.
     """
     import re as _re
-    sh = Path(os.path.expanduser("~/.hermes/scripts/disk-guard.sh")).read_text()
+    sh = Path(os.path.expanduser("~/.hermes/scripts/disk-guard.sh")).read_text(encoding="utf-8-sig")
 
     m = _re.search(r'RECLAIM_TARGET_GI="\$\{DISK_GUARD_RECLAIM_TARGET_GI:-'
                    + _NUM + r'\}"', sh)
@@ -209,7 +209,7 @@ def test_cto_card_uses_idempotency_key_and_cto_assignee(monkeypatch, tmp_path):
     idempotency key, so a repeated observation returns the same card instead of
     littering the board."""
     fake = tmp_path / "hermes"
-    fake.write_text("#!/bin/sh\necho '{\"id\": \"t_dead1234\"}'\n")
+    fake.write_text("#!/bin/sh\necho '{\"id\": \"t_dead1234\"}'\n", encoding="utf-8")
     fake.chmod(0o755)
     monkeypatch.setattr(dga, "KANBAN_BIN", str(fake))
     captured = {}
@@ -271,7 +271,7 @@ def test_wake_signs_v2_over_timestamp_dot_body(monkeypatch, tmp_path):
     import hmac
 
     secret_file = tmp_path / "secret"
-    secret_file.write_text("s3cr3t\n")
+    secret_file.write_text("s3cr3t\n", encoding="utf-8")
     sent = {}
 
     class FakeResp:
@@ -435,9 +435,9 @@ def test_identical_red_repages_after_ttl(monkeypatch, tmp_path):
     body = "Top reclaimable:\n  2337MB  /a"
     _fire(monkeypatch, delivered, "14", body)
     n = len(delivered)
-    st = json.loads((tmp_path / "s.json").read_text())
+    st = json.loads((tmp_path / "s.json").read_text(encoding="utf-8-sig"))
     st["last_at"] = int(time.time()) - (dga.REPEAT_WINDOW_SECONDS + 60)
-    (tmp_path / "s.json").write_text(json.dumps(st))
+    (tmp_path / "s.json").write_text(json.dumps(st), encoding="utf-8")
     _fire(monkeypatch, delivered, "14", body)
     assert len(delivered) > n, "TTL expiry must re-page even when unchanged"
 
