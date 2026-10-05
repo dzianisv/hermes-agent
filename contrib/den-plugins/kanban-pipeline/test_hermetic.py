@@ -22,7 +22,7 @@ for v in ("HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD", "HERMES_KANBAN_HOME", "HERM
 for prof in ("reviewer", "software-engineer", "default"):
     os.makedirs(os.path.join(home, "profiles", prof), exist_ok=True)
 # The observer is OFF unless a board owner opts in AND allow-lists the repo.
-with open(os.path.join(home, "config.yaml"), "w") as fh:
+with open(os.path.join(home, "config.yaml"), "w", encoding="utf-8") as fh:
     fh.write("kanban_pipeline:\n  enabled: true\n  repos:\n"
              "    VibeTechnologies/AgentPod:\n"
              "      merge_command: scripts/safe-merge.sh\n")
