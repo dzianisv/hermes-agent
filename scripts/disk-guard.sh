@@ -550,7 +550,7 @@ reclaim_shell_worktrees() {
 # Done-card worktrees: one implementation, in hermes, shared with `kanban gc`.
 # The shell copy is a fallback only (see reclaim_merged_worktrees).
 reclaim_hermes_worktrees() {
-  local HERMES_BIN probe_err probe_rc probe_line wt_out wt_rc
+  local HERMES_BIN probe_err probe_rc probe_line refusal_line wt_out wt_rc
   # DISK_GUARD_HERMES_BIN wins so a proof harness can point at a stub without
   # hiding a real `hermes` on PATH. Otherwise prefer PATH, then the venv copy
   # launchd has always used.
@@ -568,7 +568,11 @@ reclaim_hermes_worktrees() {
   # stderr is kept: a real refusal and a missing flag are different failures.
   probe_err=$("$HERMES_BIN" kanban reclaim --dry-run 2>&1 >/dev/null)
   probe_rc=$?
-  probe_line=$(printf '%s\n' "$probe_err" | head -n 1)
+  # Live hermes writes a preamble on stderr before the real message
+  # ("  Command helper: applied 1 secret"). SKIP must quote the refusal
+  # line itself; FAIL keeps the first non-empty line that is not that preamble.
+  refusal_line=$(printf '%s\n' "$probe_err" | grep -m1 'cannot mutate Kanban tasks' || true)
+  probe_line=$(printf '%s\n' "$probe_err" | grep -Ev '^ *Command helper:' | grep -m1 '[^[:space:]]' || true)
   [ -n "$probe_line" ] || probe_line="(probe rc=${probe_rc}, no stderr)"
 
   # Fence is the env var, not a substring of stderr. "child context" also
@@ -577,7 +581,7 @@ reclaim_hermes_worktrees() {
   if fenced_child; then
     case "$probe_err" in
       *"cannot mutate Kanban tasks"*)
-        log "worktrees: SKIP fenced child context -- run disk-guard from an operator shell/launchd: $probe_line"
+        log "worktrees: SKIP fenced child context -- run disk-guard from an operator shell/launchd: $refusal_line"
         ;;
       *)
         log "worktrees: FAIL hermes reclaim probe rc=$probe_rc at $HERMES_BIN: $probe_line"

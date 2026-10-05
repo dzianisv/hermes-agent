@@ -38,16 +38,21 @@ mkdir -p "$BIN" "$HOME_FIX/workspace"
 
 cat > "$BIN/hermes" << 'EOF'
 #!/usr/bin/env bash
-# Stub: explicit stderr, fence refusal, broken probe, or a successful summary.
+# Stub: preamble on stderr (live hermes does this), then explicit stderr,
+# fence refusal, broken probe, or a successful summary on stdout.
+preamble() { echo "  Command helper: applied 1 secret" >&2; }
 if [ -n "${STUB_STDERR:-}" ]; then
+  preamble
   printf '%s\n' "$STUB_STDERR" >&2
   exit "${STUB_RC:-1}"
 fi
 if [ -n "${HERMES_DELEGATED_CHILD_CONTEXT:-}" ]; then
+  preamble
   echo "delegate_task child contexts cannot mutate Kanban tasks via the CLI" >&2
   exit 1
 fi
 if [ "${STUB_BROKEN:-0}" = 1 ]; then
+  preamble
   echo "unrecognized arguments: --dry-run" >&2
   exit 2
 fi
@@ -121,6 +126,12 @@ out=$(drive HERMES_DELEGATED_CHILD_CONTEXT=1)
 printf '%s\n' "$out" | grep -qx "$SKIP_LINE" \
   && ok "fenced child logs SKIP quoting the real refusal" \
   || { bad "fenced child did not log the exact SKIP line"; printf '    got: %s\n' "$out"; }
+printf '%s\n' "$out" | grep -E '^worktrees: SKIP' | grep -F "cannot mutate Kanban tasks" >/dev/null \
+  && ok "fenced child SKIP line contains the real refusal" \
+  || { bad "fenced child SKIP line missing the real refusal"; printf '    got: %s\n' "$out"; }
+printf '%s\n' "$out" | grep -E '^worktrees: SKIP' | grep -F "Command helper" >/dev/null \
+  && bad "fenced child SKIP line quoted the Command helper preamble" \
+  || ok "fenced child SKIP line does not quote Command helper"
 printf '%s\n' "$out" | grep -q 'upgrade' \
   && bad "fenced child told the operator to upgrade hermes" \
   || ok "fenced child does not say upgrade"
@@ -164,6 +175,9 @@ out=$(dispatch HERMES_DELEGATED_CHILD_CONTEXT=1)
 printf '%s\n' "$out" | grep -E '^worktrees: SKIP' | grep -F "cannot mutate Kanban tasks" >/dev/null \
   && ok "fenced dispatch logs worktrees SKIP with the real refusal" \
   || { bad "fenced dispatch missing worktrees SKIP refusal"; printf '    got: %s\n' "$out"; }
+printf '%s\n' "$out" | grep -E '^worktrees: SKIP' | grep -F "Command helper" >/dev/null \
+  && bad "fenced dispatch SKIP line quoted the Command helper preamble" \
+  || ok "fenced dispatch SKIP line does not quote Command helper"
 printf '%s\n' "$out" | grep -Fx "$DEAD_SKIP" >/dev/null \
   && ok "fenced dispatch logs dead-card SKIP" \
   || { bad "fenced dispatch missing dead-card SKIP"; printf '    got: %s\n' "$out"; }
