@@ -397,3 +397,26 @@ def test_announced_non_function_item_precedes_pending_call():
     assert types == ["message", "function_call"], (
         f"announced message lost its leading position: {types}"
     )
+
+
+def test_done_with_different_item_id_same_call_id_is_authoritative_once():
+    """Copilot gpt-6 sends output_item.done with a new item id but the same call_id.
+    The announced copy must be reconciled by call_id, not re-settled as a phantom "{}" call,
+    and the done item must keep the announced position next to a still-pending call."""
+    ns = SimpleNamespace
+    events = [
+        ns(type="response.output_item.added", item=ns(type="function_call", id="fc_a", call_id="call_1",
+                                                       name="read_file", arguments="")),
+        ns(type="response.output_item.added", item=ns(type="function_call", id="fc_b", call_id="call_2",
+                                                       name="search", arguments="")),
+        ns(type="response.function_call_arguments.delta", item_id="fc_b", delta='{"q": "x"}'),
+        ns(type="response.output_item.done", item=ns(type="function_call", id="fc_a_done", call_id="call_1",
+                                                      name="read_file", arguments='{"path": "a.py"}')),
+        ns(type="response.completed", response=ns(id="resp_1", status="completed", usage=None, output=None)),
+    ]
+    final = _consume_codex_event_stream(events, model="gpt-test")
+    calls = [i for i in final.output if getattr(i, "type", None) == "function_call"]
+    assert [c.call_id for c in calls] == ["call_1", "call_2"]
+    assert calls[0].arguments == '{"path": "a.py"}'
+    assert calls[0].id == "fc_a_done"
+    assert calls[1].arguments == '{"q": "x"}'

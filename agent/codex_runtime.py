@@ -894,6 +894,16 @@ class _CodexResponseAssembler:
         # event's own output_index wins over the announced one.
         done_id = str(_event_field(done_item, "id", ""))
         announced_sequence, announced_index = self.announced_output_order.get(done_id, (None, None))
+        # Some backends (Copilot gpt-6) send .done with a different item id but the same call_id; match the
+        # pending announcement by non-empty call_id so it is not settled again as a phantom "{}" duplicate.
+        done_call_id = _event_field(done_item, "call_id", None)
+        if done_id not in self.pending_function_calls and isinstance(done_call_id, str) and done_call_id:
+            for pending_id, pending in list(self.pending_function_calls.items()):
+                if _event_field(pending["item"], "call_id", None) == done_call_id:
+                    del self.pending_function_calls[pending_id]
+                    if announced_sequence is None:
+                        announced_sequence, announced_index = pending["sequence"], pending["output_index"]
+                    break
         if announced_sequence is None:
             announced_sequence, self.next_output_sequence = self.next_output_sequence, self.next_output_sequence + 1
         self.output_indexes.append(_event_field(event, "output_index", announced_index))
