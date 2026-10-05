@@ -14,6 +14,14 @@
 #      covered — proven by planting a large dir under a real root and requiring
 #      it to surface
 #   R4 a path with a LIVE process in it is never listed as reclaimable
+#   R5 a path the guard's OWN reclaim classes are forbidden to delete is never
+#      listed. CLASS (measured 2026-10-05, card t_4b6e5ab2): the RED page named
+#      ~/.cache/huggingface (guard_hf_cache protects it) and
+#      ~/Library/pnpm/store/v10 (reclaim_stale_pnpm_stores logged
+#      "skip (referenced)" every tick). An operator following the list deleted
+#      both: local STT model gone, three projects forced to reinstall. A
+#      remediation list that recommends what the automation refuses to do is
+#      worse than no list.
 #
 # Run: bash ~/.hermes/scripts/tests/prove_disk_guard_ranking.sh
 set -uo pipefail
@@ -86,5 +94,26 @@ check "R3 large dir under a real scratch root is listed" "1" "$hit"
 # R4: an in-use path is never offered for deletion
 inuse_hit=$(printf '%s\n' "$out" | grep -c "zzz-ranking-proof-inuse")
 check "R4 in-use path is not listed" "0" "$inuse_hit"
+
+# R5: a protected path (one a reclaim class refuses to delete) is never listed.
+# Derived from the guard itself, not a copy of the predicate: source the library
+# seam, ask protected_paths() what it protects, and require that NO ranked row
+# sits at or under any of them. Anti-vacuity: protected_paths must be non-empty
+# (the HF cache path is unconditional), or R5 would pass on a broken guard.
+prot=$(DISK_GUARD_LIB=1 . "$GUARD" >/dev/null 2>&1; protected_paths 2>/dev/null | sort -u)
+nprot=$(printf '%s\n' "$prot" | grep -c '^/')
+check "R5a guard exposes a non-empty protected set" "yes" \
+      "$([ "${nprot:-0}" -ge 1 ] && echo yes || echo no)"
+
+prot_hit=0
+while read -r p; do
+  [ -n "$p" ] || continue
+  printf '%s\n' "$out" | awk -v pp="$p" '{ $1=""; sub(/^[ \t]+/,""); \
+        if ($0 == pp || index($0, pp "/") == 1) exit 0 } END { exit 1 }' \
+    && { echo "  protected path offered for deletion: $p"; prot_hit=1; }
+done <<EOF
+$prot
+EOF
+check "R5b no protected path is listed as reclaimable" "0" "$prot_hit"
 
 exit "$fail"

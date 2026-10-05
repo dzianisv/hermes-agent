@@ -174,9 +174,58 @@ scratch_roots() {
   } | while read -r r; do [ -d "$r" ] && echo "$r"; done
 }
 
+# --- derived fact 3b: paths the reclaim classes are FORBIDDEN to delete.
+#
+# MEASURED 2026-10-05 (card t_4b6e5ab2): the RED page's "Top reclaimable,
+# largest first" named exactly two paths —
+#   2948MB  ~/.cache/huggingface        (guard_hf_cache: STT model cache, the
+#                                        2026-09-29 voice outage; must stay local)
+#   1854MB  ~/Library/pnpm/store/v10    (reclaim_stale_pnpm_stores: logged
+#                                        "skip (referenced)" on every tick)
+# Both are paths the guard's OWN reclaim classes refuse to touch. The operator
+# acting on the page deleted them, taking down the local STT model and forcing
+# a reinstall on three projects still linked against v10. The ranking and the
+# reclaiming disagreed because top_reclaimable only ever consulted liveness
+# (path_in_use), never the keep-predicates.
+#
+# CLASS FIX: an advisory list that recommends what the automation is forbidden
+# to do is worse than no list. The keep-predicates are DERIVED here from the
+# same runtime facts the reclaim classes use — the HF cache path that
+# guard_hf_cache protects, and the pnpm generations that
+# reclaim_stale_pnpm_stores keeps (current store + any generation an existing
+# .modules.yaml references). No hand-kept path list: add a protected class to
+# its reclaim function and it must be reflected here too.
+protected_paths() {
+  printf '%s\n' "$HOME/.cache/huggingface"
+  local root current
+  root="$HOME/Library/pnpm/store"
+  if [ -d "$root" ] && command -v pnpm >/dev/null 2>&1; then
+    current=$(pnpm store path 2>/dev/null)
+    [ -n "$current" ] && printf '%s\n' "$current"
+    for r in "$HOME/workspace" "$HOME/.hermes/kanban/workspaces" \
+             "$HOME"/.hermes/kanban/boards/*/workspaces; do
+      [ -d "$r" ] || continue
+      find "$r" -maxdepth 5 -name .modules.yaml -not -path '*/node_modules/*/node_modules/*' \
+           -exec grep -ho "$root/v[0-9]*" {} + 2>/dev/null
+    done
+  fi
+}
+
+is_protected() { # $1 = abs path; 0 when a reclaim class is forbidden to delete it
+  local p
+  while read -r p; do
+    [ -n "$p" ] || continue
+    case "$1" in "$p"|"$p"/*) return 0 ;; esac
+  done <<EOF
+$(protected_paths)
+EOF
+  return 1
+}
+
 # Rank first-level entries of every scratch root by APPARENT SIZE, descending,
-# dropping anything below the floor of interest and anything a live process is
-# sitting in. Output: "<MB>\t<path>" lines, largest first.
+# dropping anything below the floor of interest, anything a live process is
+# sitting in, and anything the reclaim classes are forbidden to delete.
+# Output: "<MB>\t<path>" lines, largest first.
 top_reclaimable() {
   local n="${1:-8}"
   scratch_roots | while read -r root; do
@@ -184,6 +233,7 @@ top_reclaimable() {
   done | sort -rn | awk -v min="$RANK_MIN_MB" '$1 >= min' | \
   while read -r mb path; do
     path_in_use "$path" && continue
+    is_protected "$path" && continue
     printf '%s\t%s\n' "$mb" "$path"
   done | head -"$n"
 }
@@ -202,7 +252,19 @@ if [ "${1:-}" = "--rank-min-mb" ]; then
   exit 0
 fi
 
+# Delegate children are refused by the Kanban write fence. Skipping only the
+# hermes probe left the other deletion classes in the same --reclaim run free
+# to remove scratch the child is not allowed to touch. Do NOT unset
+# HERMES_DELEGATED_CHILD_CONTEXT — clearing it would bypass the trust boundary.
+fenced_child() { # 0 when this process is a delegate_task child
+  [ -n "${HERMES_DELEGATED_CHILD_CONTEXT:-}" ]
+}
+
 reclaim_workspaces() {
+  if fenced_child; then
+    log "workspaces: SKIP fenced child context -- run disk-guard from an operator shell/launchd"
+    return 0
+  fi
   local freed=0 n=0 id sz root db
   # WORKSPACE ROOTS ARE DISCOVERED, NOT PINNED. Until 2026-09-25 this swept
   # only $HOME/.hermes/kanban/workspaces, i.e. the DEFAULT board. Every named
@@ -288,8 +350,59 @@ reclaim_tmp() {
 # human decision (VM images, repos, databases) is deliberately NOT here.
 SAFE_AGE_DAYS="${DISK_GUARD_SAFE_AGE_DAYS:-7}"
 
+# --- STT model cache must stay on the boot volume. On 2026-09-29 ~/.cache/huggingface
+# was relocated as a symlink to /Volumes/mac-offload; once that volume unmounted,
+# every gateway voice transcription failed (EACCES). Never offload it; if it is a
+# symlink whose target is missing, replace it with a real dir so the model refetches.
+guard_hf_cache() {
+  local hf="$HOME/.cache/huggingface"
+  if [ -L "$hf" ] && [ ! -d "$hf/" ]; then
+    rm -f "$hf" && mkdir -p "$hf/hub"
+    log "  REPAIRED dangling symlink $hf (STT model cache must stay local)"
+  fi
+}
+
+# --- superseded pnpm store GENERATIONS. MEASURED 2026-10-04: ~/Library/pnpm/store
+# held v3 (826MB) + v10 (1753MB) + v11 (3486MB) = 5.3GB on a host that had 0.2Gi
+# free, and these three paths were the top of the guard's own alert. No class
+# reclaimed them: `pnpm store prune` (called by reclaim_safe_caches) only ever
+# prunes the ONE generation the installed pnpm owns, and the store lives under
+# ~/Library, outside every node_modules / cache / workspace root the guard sweeps.
+# A store generation is pure content-addressable cache — refetchable from the
+# registry — but deleting a generation a project is still linked against forces a
+# reinstall, so liveness is DETECTED, never pinned:
+#   - keep the generation `pnpm store path` resolves to (what installs use now)
+#   - keep any generation referenced by an existing node_modules/.modules.yaml
+#   - keep anything a live process holds
+# Everything else is an abandoned generation left behind by a pnpm major upgrade.
+reclaim_stale_pnpm_stores() {
+  local root before after n=0 current d refs
+  root="$HOME/Library/pnpm/store"
+  [ -d "$root" ] || return 0
+  command -v pnpm >/dev/null 2>&1 || return 0
+  current=$(pnpm store path 2>/dev/null)
+  [ -n "$current" ] || { log "pnpm stores: SKIP (cannot resolve current store path)"; return 0; }
+  refs=$(for r in "$HOME/workspace" "$HOME/.hermes/kanban/workspaces" \
+                 "$HOME"/.hermes/kanban/boards/*/workspaces; do
+           [ -d "$r" ] || continue
+           find "$r" -maxdepth 5 -name .modules.yaml -not -path '*/node_modules/*/node_modules/*' \
+                -exec grep -ho "$root/v[0-9]*" {} + 2>/dev/null
+         done | sort -u)
+  before=$(free_mb)
+  for d in "$root"/v*; do
+    [ -d "$d" ] || continue
+    case "$current" in "$d"|"$d"/*) continue ;; esac
+    printf '%s\n' "$refs" | grep -qx "$d" && { log "  skip (referenced) $d"; continue; }
+    path_in_use "$d" && { log "  skip (in use) $d"; continue; }
+    rm -rf "$d" 2>/dev/null && n=$((n + 1))
+  done
+  after=$(free_mb)
+  log "pnpm stores: removed $n superseded generations, $(( after - before ))MB"
+}
+
 reclaim_safe_caches() {
   local before after n=0 d
+  guard_hf_cache
   before=$(free_mb)
 
   for d in "$HOME/.cache/uv" "$HOME/Library/Caches/pip" \
@@ -383,6 +496,10 @@ reclaim_stale_installs() {
 # process holds, are kept. Repos are discovered from the worktree parents the
 # guard already derives, never from a pinned directory list.
 reclaim_dead_task_worktrees() {
+  if fenced_child; then
+    log "dead-card worktrees: SKIP fenced child context -- run disk-guard from an operator shell/launchd"
+    return 0
+  fi
   local before after n=0 repo p b id sz
   before=$(free_mb)
   while read -r repo; do
@@ -515,6 +632,106 @@ reclaim_pytest_roots() {
   log "pytest roots: removed $n idle roots under $base, $(( after - before ))MB"
 }
 
+# Shell copy of done-card worktree reclaim. Known no-op on squash-merging
+# repos (see reclaim_merged_worktrees). Shared by the probe-failure path and
+# the hermes-reclaim rc!=0 path so the loop cannot drift between them.
+reclaim_shell_worktrees() {
+  # A non-zero hermes probe falls through to here. The fence has to hold on
+  # this path too, or the child deletes what the probe refusal forbade.
+  if fenced_child; then
+    log "worktrees: SKIP fenced child context -- run disk-guard from an operator shell/launchd"
+    return 0
+  fi
+  local repo
+  for repo in $(ls -d "$HOME"/workspace/*/.git 2>/dev/null | xargs -n1 dirname); do
+    git -C "$repo" worktree list 2>/dev/null | grep -q . && reclaim_merged_worktrees "$repo"
+  done
+}
+
+# Done-card worktrees: one implementation, in hermes, shared with `kanban gc`.
+# The shell copy is a fallback only (see reclaim_merged_worktrees).
+reclaim_hermes_worktrees() {
+  local HERMES_BIN probe_err probe_rc probe_line refusal_line wt_out wt_rc
+  # DISK_GUARD_HERMES_BIN wins so a proof harness can point at a stub without
+  # hiding a real `hermes` on PATH. Otherwise prefer PATH, then the venv copy
+  # launchd has always used.
+  if [ -n "${DISK_GUARD_HERMES_BIN:-}" ]; then
+    HERMES_BIN=$DISK_GUARD_HERMES_BIN
+  else
+    HERMES_BIN=$(command -v hermes 2>/dev/null || true)
+    [ -n "$HERMES_BIN" ] || HERMES_BIN="$HOME/.hermes/hermes-agent/venv/bin/hermes"
+  fi
+
+  # --dry-run is a CAPABILITY PROBE, and under the Kanban write fence it is
+  # also the refusal we must quote. Always run it — including when fenced.
+  # Do NOT unset HERMES_DELEGATED_CHILD_CONTEXT (agent/delegation_context.py,
+  # hermes_cli/kanban.py): clearing it would bypass the trust boundary.
+  # stderr is kept: a real refusal and a missing flag are different failures.
+  probe_err=$("$HERMES_BIN" kanban reclaim --dry-run 2>&1 >/dev/null)
+  probe_rc=$?
+  # Live hermes writes a preamble on stderr before the real message
+  # ("  Command helper: applied 1 secret"). Those lines are not the refusal
+  # and must not disqualify it. SKIP quotes the refusal line itself; FAIL
+  # keeps the first non-empty line that is not that preamble.
+  #
+  # Exact line, not a substring. "cannot mutate Kanban tasks" also appears in
+  # unrelated plugin errors. Real hermes (hermes_cli/kanban.py:154 via _err,
+  # rc 1) prints the "kanban: " prefix; a stub may omit it. Anything else
+  # while fenced is FAIL — still no deletion.
+  refusal_line=$(printf '%s\n' "$probe_err" | grep -x -m1 \
+    -e 'kanban: delegate_task child contexts cannot mutate Kanban tasks via the CLI' \
+    -e 'delegate_task child contexts cannot mutate Kanban tasks via the CLI' || true)
+  probe_line=$(printf '%s\n' "$probe_err" | grep -Ev '^ *Command helper:' | grep -m1 '[^[:space:]]' || true)
+  [ -n "$probe_line" ] || probe_line="(probe rc=${probe_rc}, no stderr)"
+
+  # A fenced child never deletes: no real reclaim, no shell fallback.
+  # SKIP only for the real fence refusal (rc 1 AND an exact refusal line).
+  if fenced_child; then
+    if [ "$probe_rc" = 1 ] && [ -n "$refusal_line" ]; then
+      log "worktrees: SKIP fenced child context -- run disk-guard from an operator shell/launchd: $refusal_line"
+    else
+      log "worktrees: FAIL hermes reclaim probe rc=$probe_rc at $HERMES_BIN: $probe_line"
+    fi
+    return 0
+  fi
+
+  if [ "$probe_rc" = 0 ]; then
+    wt_out=$("$HERMES_BIN" kanban reclaim --logs 2>&1); wt_rc=$?
+    if [ "$wt_rc" = 0 ]; then
+      log "worktrees: $(printf '%s' "$wt_out" | grep -E '^ *-> ' | tr '\n' ' ')"
+    else
+      log "worktrees: FAIL hermes reclaim rc=$wt_rc, falling back to the shell copy"
+      printf '%s\n' "$wt_out" | tail -3 | while read -r l; do log "  $l"; done
+      reclaim_shell_worktrees
+    fi
+    return 0
+  fi
+
+  # NOT routine. The shell fallback is a known no-op (squash-merge gate).
+  # Every non-zero probe is this branch — say FAIL with rc and stderr so it
+  # is greppable. Do not special-case stderr text and do not call it an upgrade.
+  log "worktrees: FAIL hermes reclaim probe rc=$probe_rc at $HERMES_BIN: $probe_line"
+  reclaim_shell_worktrees
+}
+
+# Ordinary --reclaim sequence. Defined above the library seam so a proof
+# harness can drive the whole dispatch against a fixture HOME.
+run_reclaim_classes() {
+  reclaim_workspaces
+  reclaim_safe_caches
+  reclaim_hermes_worktrees
+  reclaim_tmp
+  reclaim_home_node_modules
+  reclaim_pytest_roots
+  reclaim_npm_cache
+  reclaim_stale_pnpm_stores
+  reclaim_stale_installs
+  reclaim_dead_task_worktrees
+  # Target enforcement runs LAST: only after every ordinary class has been
+  # reclaimed do we decide whether to escalate.
+  reclaim_to_target
+}
+
 before=$(free_gi)
 
 # Library seam: `DISK_GUARD_LIB=1 source disk-guard.sh` defines the reclaim
@@ -529,44 +746,7 @@ log "free=${before}Gi floor=${FLOOR_GI}Gi target=${RECLAIM_TARGET_GI}Gi"
 
 
 if [ "$RECLAIM" = 1 ]; then
-  reclaim_workspaces
-  reclaim_safe_caches
-  # Done-card worktrees: one implementation, in hermes, shared with `kanban gc`.
-  # The shell copy below is a fallback only (see reclaim_merged_worktrees).
-  HERMES_BIN="${DISK_GUARD_HERMES_BIN:-$HOME/.hermes/hermes-agent/venv/bin/hermes}"
-  if [ -x "$HERMES_BIN" ] && "$HERMES_BIN" kanban reclaim --dry-run >/dev/null 2>&1; then
-    # --dry-run above is a CAPABILITY PROBE: the installed hermes only grows the
-    # worktree-reclaim flags once this change ships. Older builds reject it and
-    # we fall through to the shell copy instead of silently reclaiming nothing.
-    wt_out=$("$HERMES_BIN" kanban reclaim --logs 2>&1); wt_rc=$?
-    if [ "$wt_rc" = 0 ]; then
-      log "worktrees: $(printf '%s' "$wt_out" | grep -E '^ *-> ' | tr '\n' ' ')"
-    else
-      log "worktrees: FAIL hermes reclaim rc=$wt_rc, falling back to the shell copy"
-      printf '%s\n' "$wt_out" | tail -3 | while read -r l; do log "  $l"; done
-      for repo in $(ls -d "$HOME"/workspace/*/.git 2>/dev/null | xargs -n1 dirname); do
-        git -C "$repo" worktree list 2>/dev/null | grep -q . && reclaim_merged_worktrees "$repo"
-      done
-    fi
-  else
-    # NOT routine. The shell fallback (reclaim_merged_worktrees) is the function
-    # whose squash-merge gate made it a permanent no-op: it has removed 0 dirs
-    # over its entire log. Taking this branch means the host is STILL LEAKING
-    # and the installed hermes needs upgrading — say FAIL so it is greppable.
-    log "worktrees: FAIL hermes reclaim unavailable at $HERMES_BIN (upgrade the installed hermes); the shell fallback below is a known no-op"
-    for repo in $(ls -d "$HOME"/workspace/*/.git 2>/dev/null | xargs -n1 dirname); do
-      git -C "$repo" worktree list 2>/dev/null | grep -q . && reclaim_merged_worktrees "$repo"
-    done
-  fi
-  reclaim_tmp
-  reclaim_home_node_modules
-  reclaim_pytest_roots
-  reclaim_npm_cache
-  reclaim_stale_installs
-  reclaim_dead_task_worktrees
-  # Target enforcement runs LAST: only after every ordinary class has been
-  # reclaimed do we decide whether to escalate.
-  reclaim_to_target
+  run_reclaim_classes
 fi
 
 after=$(free_gi)
