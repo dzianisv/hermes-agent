@@ -569,24 +569,28 @@ reclaim_hermes_worktrees() {
   probe_err=$("$HERMES_BIN" kanban reclaim --dry-run 2>&1 >/dev/null)
   probe_rc=$?
   # Live hermes writes a preamble on stderr before the real message
-  # ("  Command helper: applied 1 secret"). SKIP must quote the refusal
-  # line itself; FAIL keeps the first non-empty line that is not that preamble.
-  refusal_line=$(printf '%s\n' "$probe_err" | grep -m1 'cannot mutate Kanban tasks' || true)
+  # ("  Command helper: applied 1 secret"). Those lines are not the refusal
+  # and must not disqualify it. SKIP quotes the refusal line itself; FAIL
+  # keeps the first non-empty line that is not that preamble.
+  #
+  # Exact line, not a substring. "cannot mutate Kanban tasks" also appears in
+  # unrelated plugin errors. Real hermes (hermes_cli/kanban.py:154 via _err,
+  # rc 1) prints the "kanban: " prefix; a stub may omit it. Anything else
+  # while fenced is FAIL — still no deletion.
+  refusal_line=$(printf '%s\n' "$probe_err" | grep -x -m1 \
+    -e 'kanban: delegate_task child contexts cannot mutate Kanban tasks via the CLI' \
+    -e 'delegate_task child contexts cannot mutate Kanban tasks via the CLI' || true)
   probe_line=$(printf '%s\n' "$probe_err" | grep -Ev '^ *Command helper:' | grep -m1 '[^[:space:]]' || true)
   [ -n "$probe_line" ] || probe_line="(probe rc=${probe_rc}, no stderr)"
 
-  # Fence is the env var, not a substring of stderr. "child context" also
-  # shows up in unrelated errors, so only the real refusal text is a SKIP.
   # A fenced child never deletes: no real reclaim, no shell fallback.
+  # SKIP only for the real fence refusal (rc 1 AND an exact refusal line).
   if fenced_child; then
-    case "$probe_err" in
-      *"cannot mutate Kanban tasks"*)
-        log "worktrees: SKIP fenced child context -- run disk-guard from an operator shell/launchd: $refusal_line"
-        ;;
-      *)
-        log "worktrees: FAIL hermes reclaim probe rc=$probe_rc at $HERMES_BIN: $probe_line"
-        ;;
-    esac
+    if [ "$probe_rc" = 1 ] && [ -n "$refusal_line" ]; then
+      log "worktrees: SKIP fenced child context -- run disk-guard from an operator shell/launchd: $refusal_line"
+    else
+      log "worktrees: FAIL hermes reclaim probe rc=$probe_rc at $HERMES_BIN: $probe_line"
+    fi
     return 0
   fi
 

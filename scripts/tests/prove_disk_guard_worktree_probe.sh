@@ -6,9 +6,11 @@
 # HERMES_DELEGATED_CHILD_CONTEXT that refusal is the Kanban write fence
 # ("delegate_task child contexts cannot mutate Kanban tasks via the CLI"),
 # not a stale binary. A fenced child must SKIP every worktree/workspace
-# deletion in the run, quoting the real refusal. Any other non-zero probe is
-# FAIL with rc + stderr — including a fenced child whose stderr is not the
-# real refusal (still no deletion). The env var is never cleared.
+# deletion in the run, quoting the real refusal, ONLY when the probe exits 1
+# AND a stderr line is exactly that sentence (with or without the "kanban: "
+# prefix; "Command helper:" preamble lines are ignored). A substring is not
+# enough. Any other fenced probe is FAIL with rc + the first non-preamble
+# stderr line, and still deletes nothing. The env var is never cleared.
 #
 # Drives the REAL functions via the DISK_GUARD_LIB seam against a stub hermes
 # and a fixture HOME, so the harness cannot reclaim live worktrees and cannot
@@ -74,6 +76,21 @@ reset_wt() {
   git -C "$REPO" worktree add -q "$WT" -b card-t_deadbeef
 }
 
+# Board workspace reclaim_workspaces deletes on a clean run: the dir sits under
+# boards/<slug>/workspaces/<task-id>/ and that board's kanban.db marks the
+# task done. All of this is under the fixture HOME, never the real one.
+WS_BOARD="$HOME_FIX/.hermes/kanban/boards/proof"
+WS_ROOT="$WS_BOARD/workspaces/t_done0001"
+WS_DB="$WS_BOARD/kanban.db"
+MISLEAD='unrelated plugin error: message catalog contains cannot mutate Kanban tasks, init failed'
+reset_ws() {
+  mkdir -p "$WS_ROOT"
+  echo fixture > "$WS_ROOT/scratch.txt"
+  sqlite3 "$WS_DB" "CREATE TABLE IF NOT EXISTS tasks (id TEXT PRIMARY KEY, status TEXT);
+    INSERT INTO tasks (id, status) VALUES ('t_done0001', 'done')
+    ON CONFLICT(id) DO UPDATE SET status='done';"
+}
+
 # Isolate each case from the outer environment. The proof must pass whether or
 # not the parent shell is itself a fenced child.
 base_env() {
@@ -95,8 +112,9 @@ drive() {
 }
 
 # Full --reclaim dispatch. Non-worktree classes are recorders so the fixture
-# never sweeps caches, tmp, or node_modules. dead_task/path_in_use are stubbed
-# so the dead-card class is decided by the fence, not by a live kanban DB.
+# never sweeps caches, tmp, or node_modules. path_in_use is stubbed not-in-use
+# so lsof/ps cannot veto a fixture dir. dead_task is the real function: a
+# board kanban.db under the fixture HOME is what licenses workspace deletion.
 dispatch() {
   base_env "$@" bash -c '
     set -uo pipefail
@@ -105,7 +123,6 @@ dispatch() {
     export PATH="'"$BIN"':$PATH"
     DISK_GUARD_LIB=1 source "'"$GUARD"'"
     log() { echo "$*"; }
-    dead_task() { return 0; }
     path_in_use() { return 1; }
     reclaim_safe_caches() { echo "RECORDER reclaim_safe_caches"; }
     reclaim_tmp() { echo "RECORDER reclaim_tmp"; }
@@ -165,13 +182,46 @@ printf '%s\n' "$out" | grep -q 'SKIP' \
   && bad "fenced unrelated stderr was classified as SKIP" \
   || ok "fenced unrelated stderr is not a SKIP"
 
+# 4b. Fenced + misleading substring, rc=2: FAIL quoting rc, not SKIP.
+out=$(drive HERMES_DELEGATED_CHILD_CONTEXT=1 STUB_RC=2 STUB_STDERR="$MISLEAD")
+want="worktrees: FAIL hermes reclaim probe rc=2 at $BIN/hermes: $MISLEAD"
+printf '%s\n' "$out" | grep -F "$want" >/dev/null \
+  && ok "fenced misleading substring rc=2 logs FAIL" \
+  || { bad "fenced misleading substring rc=2 did not FAIL with the line"; printf '    got: %s\n' "$out"; }
+printf '%s\n' "$out" | grep -E '^worktrees: SKIP' >/dev/null \
+  && bad "fenced misleading substring rc=2 was classified as SKIP" \
+  || ok "fenced misleading substring rc=2 is not a SKIP"
+
+# 4c. Same misleading line at rc=1 is still not the exact refusal: FAIL, not SKIP.
+out=$(drive HERMES_DELEGATED_CHILD_CONTEXT=1 STUB_RC=1 STUB_STDERR="$MISLEAD")
+want="worktrees: FAIL hermes reclaim probe rc=1 at $BIN/hermes: $MISLEAD"
+printf '%s\n' "$out" | grep -F "$want" >/dev/null \
+  && ok "fenced misleading substring rc=1 logs FAIL" \
+  || { bad "fenced misleading substring rc=1 did not FAIL with the line"; printf '    got: %s\n' "$out"; }
+printf '%s\n' "$out" | grep -E '^worktrees: SKIP' >/dev/null \
+  && bad "fenced misleading substring rc=1 was classified as SKIP" \
+  || ok "fenced misleading substring rc=1 is not a SKIP"
+
+# 4d. Real hermes refusal line (kanban: prefix, rc=1) is a SKIP. Preamble stays off the quote.
+out=$(drive HERMES_DELEGATED_CHILD_CONTEXT=1 STUB_RC=1 STUB_STDERR='kanban: delegate_task child contexts cannot mutate Kanban tasks via the CLI')
+want="worktrees: SKIP fenced child context -- run disk-guard from an operator shell/launchd: kanban: delegate_task child contexts cannot mutate Kanban tasks via the CLI"
+printf '%s\n' "$out" | grep -qx "$want" \
+  && ok "fenced exact kanban: refusal line is SKIP" \
+  || { bad "fenced exact kanban: refusal line was not SKIP"; printf '    got: %s\n' "$out"; }
+
 # --- full dispatch: one --reclaim sequence, real worktree on the fixture ---
 
 # 5. Fenced + real refusal: nothing deleted, both SKIP lines, no upgrade, no FAIL.
 reset_wt || { bad "could not create fixture worktree"; echo "=== RESULT: FAIL ==="; exit 1; }
+reset_ws || { bad "could not create fixture workspace"; echo "=== RESULT: FAIL ==="; exit 1; }
 out=$(dispatch HERMES_DELEGATED_CHILD_CONTEXT=1)
 [ -d "$WT" ] && ok "fenced dispatch left the dead-card worktree in place" \
   || bad "fenced dispatch deleted the worktree"
+[ -d "$WS_ROOT" ] && ok "fenced dispatch left the done-task workspace in place" \
+  || bad "fenced dispatch deleted the done-task workspace"
+printf '%s\n' "$out" | grep -F 'workspaces: SKIP' >/dev/null \
+  && ok "fenced dispatch logs workspaces SKIP" \
+  || { bad "fenced dispatch missing workspaces SKIP"; printf '    got: %s\n' "$out"; }
 printf '%s\n' "$out" | grep -E '^worktrees: SKIP' | grep -F "cannot mutate Kanban tasks" >/dev/null \
   && ok "fenced dispatch logs worktrees SKIP with the real refusal" \
   || { bad "fenced dispatch missing worktrees SKIP refusal"; printf '    got: %s\n' "$out"; }
@@ -188,14 +238,17 @@ printf '%s\n' "$out" | grep -q 'FAIL' \
   && bad "fenced dispatch logged FAIL" \
   || ok "fenced dispatch does not FAIL"
 
-# 6. Clean env: hermes summary logged, dead-card worktree actually removed.
+# 6. Clean env: hermes summary logged, dead-card worktree and done workspace removed.
 reset_wt || { bad "could not recreate fixture worktree"; echo "=== RESULT: FAIL ==="; exit 1; }
+reset_ws || { bad "could not recreate fixture workspace"; echo "=== RESULT: FAIL ==="; exit 1; }
 out=$(dispatch)
 printf '%s\n' "$out" | grep -F -- "-> 2 removed, 1 kept" >/dev/null \
   && ok "clean dispatch logs the hermes summary" \
   || { bad "clean dispatch missing hermes summary"; printf '    got: %s\n' "$out"; }
 [ ! -d "$WT" ] && ok "clean dispatch removed the dead-card worktree" \
   || bad "clean dispatch left the dead-card worktree in place"
+[ ! -d "$WS_ROOT" ] && ok "clean dispatch removed the done-task workspace" \
+  || bad "clean dispatch left the done-task workspace in place"
 
 # 7. Fenced + unrelated stderr: FAIL, worktrees class does not SKIP, dir remains.
 # workspaces/dead-card still emit their own SKIP lines — the env fence is
@@ -221,6 +274,35 @@ want="worktrees: FAIL hermes reclaim probe rc=2 at $BIN/hermes: unrecognized arg
 printf '%s\n' "$out" | grep -F "$want" >/dev/null \
   && ok "broken dispatch logs rc=2 and stderr" \
   || { bad "broken dispatch missing rc=2 FAIL line"; printf '    got: %s\n' "$out"; }
+
+# 9. Fenced dispatch + misleading substring, rc=2: FAIL, not worktrees SKIP, no deletion.
+reset_wt || { bad "could not recreate fixture worktree"; echo "=== RESULT: FAIL ==="; exit 1; }
+reset_ws || { bad "could not recreate fixture workspace"; echo "=== RESULT: FAIL ==="; exit 1; }
+out=$(dispatch HERMES_DELEGATED_CHILD_CONTEXT=1 STUB_RC=2 STUB_STDERR="$MISLEAD")
+want="worktrees: FAIL hermes reclaim probe rc=2 at $BIN/hermes: $MISLEAD"
+printf '%s\n' "$out" | grep -F "$want" >/dev/null \
+  && ok "fenced dispatch misleading substring rc=2 logs FAIL" \
+  || { bad "fenced dispatch misleading substring rc=2 missing FAIL line"; printf '    got: %s\n' "$out"; }
+printf '%s\n' "$out" | grep -E '^worktrees: SKIP' >/dev/null \
+  && bad "fenced dispatch misleading substring rc=2 classified worktrees as SKIP" \
+  || ok "fenced dispatch misleading substring rc=2 is not a worktrees SKIP"
+[ -d "$WT" ] && ok "fenced dispatch misleading substring rc=2 left the worktree in place" \
+  || bad "fenced dispatch misleading substring rc=2 deleted the worktree"
+[ -d "$WS_ROOT" ] && ok "fenced dispatch misleading substring rc=2 left the workspace in place" \
+  || bad "fenced dispatch misleading substring rc=2 deleted the workspace"
+
+# 10. Fenced dispatch + same misleading line, rc=1: FAIL, not worktrees SKIP, no deletion.
+reset_wt || { bad "could not recreate fixture worktree"; echo "=== RESULT: FAIL ==="; exit 1; }
+out=$(dispatch HERMES_DELEGATED_CHILD_CONTEXT=1 STUB_RC=1 STUB_STDERR="$MISLEAD")
+want="worktrees: FAIL hermes reclaim probe rc=1 at $BIN/hermes: $MISLEAD"
+printf '%s\n' "$out" | grep -F "$want" >/dev/null \
+  && ok "fenced dispatch misleading substring rc=1 logs FAIL" \
+  || { bad "fenced dispatch misleading substring rc=1 missing FAIL line"; printf '    got: %s\n' "$out"; }
+printf '%s\n' "$out" | grep -E '^worktrees: SKIP' >/dev/null \
+  && bad "fenced dispatch misleading substring rc=1 classified worktrees as SKIP" \
+  || ok "fenced dispatch misleading substring rc=1 is not a worktrees SKIP"
+[ -d "$WT" ] && ok "fenced dispatch misleading substring rc=1 left the worktree in place" \
+  || bad "fenced dispatch misleading substring rc=1 deleted the worktree"
 
 rm -rf "$FIX"
 
