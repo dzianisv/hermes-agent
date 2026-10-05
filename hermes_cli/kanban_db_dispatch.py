@@ -320,7 +320,8 @@ class DispatchResult:
     respawn_guarded: list[tuple[str, str]] = field(default_factory=list)
     """``(task_id, reason)`` skipped by the respawn guard: ``"blocker_auth"``
     (quota/auth error — also auto-blocked), ``"recent_success"`` (completed run
-    within guard window), ``"active_pr"`` (GitHub PR URL in a recent comment)."""
+    within guard window), ``"active_pr"`` (GitHub PR URL in a recent comment),
+    ``"live_worker_process"`` (a live host process already carries this task)."""
     rate_limited: list[str] = field(default_factory=list)
     """Task ids whose workers bailed on a provider rate-limit / quota wall
     (EX_TEMPFAIL sentinel exit) and were released to ``ready`` WITHOUT counting
@@ -2746,6 +2747,182 @@ def _call_spawn_fn(spawn_fn, task: Task, workspace: str, board: Optional[str]) -
         return spawn_fn(task, workspace)
 
 
+def worker_task_argv_token(task_id: str) -> str:
+    """Exact ``-q`` argv element a worker process carries for ``task_id``.
+
+    Matched as a whole argv element, never as a substring, so a shorter id
+    cannot fence a longer one (``t_00`` vs ``t_007efb64``).
+    """
+    return f"work kanban task {task_id}"
+
+
+# Test seam for :func:`find_live_workers_for_task`. None means a real host scan.
+# The dispatch call site reads this at tick time so tests can monkeypatch it.
+_live_worker_proc_iter: Optional[Callable[[], Iterable[Any]]] = None
+_procfs_unavailable_logged = False
+
+
+def _zombie_status(status: Any) -> bool:
+    """True for psutil's zombie status (the string ``"zombie"``)."""
+    if status == "zombie":
+        return True
+    try:
+        import psutil
+    except ImportError:
+        return False
+    return status == getattr(psutil, "STATUS_ZOMBIE", "zombie")
+
+
+def _process_access_errors() -> tuple[type[BaseException], ...]:
+    """psutil errors that mean "this pid vanished or is unreadable", skip it."""
+    try:
+        import psutil
+    except ImportError:
+        return ()
+    return tuple(
+        exc for name in ("AccessDenied", "NoSuchProcess", "ZombieProcess")
+        if isinstance(exc := getattr(psutil, name, None), type)
+    )
+
+
+def _argv_has_exact_token(cmdline: Any, token: str) -> bool:
+    """True only when some argv element equals ``token``. Substrings do not count."""
+    if not cmdline or isinstance(cmdline, (str, bytes)):
+        return False
+    try:
+        return any(part == token for part in cmdline)
+    except TypeError:
+        return False
+
+
+def _collect_matching_workers(
+    token: str, procs: Iterable[Any],
+) -> list[tuple[int, int, list[str]]]:
+    """Filter a psutil-like process iterable. Per-process access errors are skipped."""
+    skip = _process_access_errors()
+    found: list[tuple[int, int, list[str]]] = []
+    for proc in procs:
+        try:
+            info = proc.info
+        except skip:
+            continue
+        if not isinstance(info, dict):
+            continue
+        if _zombie_status(info.get("status")):
+            continue
+        cmdline = info.get("cmdline")
+        if not _argv_has_exact_token(cmdline, token):
+            continue
+        try:
+            argv = [part for part in cmdline]
+            found.append((int(info["pid"]), int(info["ppid"]), argv))
+        except (KeyError, TypeError, ValueError):
+            continue
+    return found
+
+
+def _log_procfs_unavailable_once() -> None:
+    """One debug line when psutil is missing and ``/proc`` cannot be read."""
+    global _procfs_unavailable_logged
+    if _procfs_unavailable_logged:
+        return
+    _procfs_unavailable_logged = True
+    _kb._log.debug(
+        "kanban dispatcher: psutil unavailable and /proc is not readable; "
+        "live-worker scan returning empty"
+    )
+
+
+def _procfs_live_workers(token: str) -> list[tuple[int, int, list[str]]]:
+    """Linux ``/proc`` fallback: NUL-split cmdline, ``stat`` for ppid and state.
+
+    Skips zombie state ``Z``. Unavailable ``/proc`` returns ``[]`` (logged once
+    at debug). A single unreadable pid is skipped, not a scan failure.
+    """
+    proc_root = Path("/proc")
+    if not proc_root.is_dir():
+        _log_procfs_unavailable_once()
+        return []
+    try:
+        entries = list(proc_root.iterdir())
+    except OSError:
+        _log_procfs_unavailable_once()
+        return []
+    found: list[tuple[int, int, list[str]]] = []
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        try:
+            raw = (entry / "cmdline").read_bytes()
+        except OSError:
+            continue
+        if not raw:
+            continue
+        argv = [
+            part.decode("utf-8", "surrogateescape")
+            for part in raw.split(b"\0")
+            if part
+        ]
+        if token not in argv:
+            continue
+        try:
+            stat = (entry / "stat").read_bytes().decode("utf-8", "surrogateescape")
+            rparen = stat.rfind(")")
+            if rparen < 0:
+                continue
+            fields = stat[rparen + 2:].split()
+            state = fields[0]
+            ppid = int(fields[1])
+        except (OSError, IndexError, ValueError):
+            continue
+        if state == "Z":
+            continue
+        found.append((int(entry.name), ppid, argv))
+    return found
+
+
+def _scan_host_workers(token: str) -> list[tuple[int, int, list[str]]]:
+    """psutil host scan, or the Linux ``/proc`` fallback when psutil cannot import."""
+    try:
+        import psutil
+    except ImportError:
+        return _procfs_live_workers(token)
+    return _collect_matching_workers(
+        token, psutil.process_iter(["pid", "ppid", "cmdline", "status"]),
+    )
+
+
+def find_live_workers_for_task(
+    task_id: str, *, proc_iter: Optional[Callable[[], Iterable[Any]]] = None,
+) -> list[tuple[int, int, list[str]]]:
+    """Host-wide live processes whose argv contains this task's worker token.
+
+    Returns ``(pid, ppid, argv)`` triples. Match is an exact argv element, never
+    a substring, and not limited to dispatcher descendants. Zombies, empty
+    cmdlines, and processes that raise ``psutil.AccessDenied`` /
+    ``NoSuchProcess`` / ``ZombieProcess`` are skipped.
+
+    ``proc_iter``, when given, is a zero-arg callable yielding psutil-like
+    objects with an ``.info`` dict (``pid``, ``ppid``, ``cmdline``, ``status``).
+    When omitted, the module hook ``_live_worker_proc_iter`` is used, else a
+    real ``psutil.process_iter``. Any unexpected error returns ``[]`` and logs
+    a warning — fail open, never crash the tick.
+    """
+    if proc_iter is None:
+        proc_iter = _live_worker_proc_iter
+    token = worker_task_argv_token(str(task_id))
+    try:
+        if proc_iter is None:
+            return _scan_host_workers(token)
+        return _collect_matching_workers(token, proc_iter())
+    except Exception as exc:
+        _kb._log.warning(
+            "kanban dispatcher: live-worker scan failed for %s (%s); failing open",
+            task_id, exc,
+        )
+        return []
+
+
 def _dispatch_lane_task(
     conn: sqlite3.Connection,
     row: sqlite3.Row,
@@ -2781,6 +2958,26 @@ def _dispatch_lane_task(
         if current >= per_profile_cap:
             result.skipped_per_profile_capped.append((task_id, assignee, current))
             return False
+    # Spawn fence, both lanes: a live host process already carrying this task's
+    # argv token is a worker in flight even when the board has no claim. Refuse
+    # before claim / run-row / failure accounting. ``_live_worker_proc_iter`` is
+    # the test seam (None = real host scan).
+    live = find_live_workers_for_task(task_id, proc_iter=_live_worker_proc_iter)
+    if live:
+        result.respawn_guarded.append((task_id, "live_worker_process"))
+        pids = [pid for pid, _ppid, _argv in live]
+        ppids = [ppid for _pid, ppid, _argv in live]
+        if not dry_run:
+            with _kb.write_txn(conn):
+                _kb._append_event(
+                    conn, task_id, "respawn_guarded",
+                    {"reason": "live_worker_process", "pids": pids, "ppids": ppids},
+                )
+        _kb._log.warning(
+            "kanban dispatcher: refusing spawn for %s — live worker process(es) %s already carry this task",
+            task_id, pids,
+        )
+        return False
     guard_exemptions: list = []
     guard_reason = check_respawn_guard(conn, task_id, lane=lane, exempt_out=guard_exemptions)
     if guard_reason is not None:
@@ -3481,7 +3678,7 @@ def _worker_argv(task: Task, profile_arg: str, hermes_home: Optional[str]) -> li
     worker_toolsets = _resolve_worker_cli_toolsets(hermes_home)
     if worker_toolsets:
         cmd.extend(["--toolsets", ",".join(worker_toolsets)])
-    cmd.extend(["chat", "-q", f"work kanban task {task.id}"])
+    cmd.extend(["chat", "-q", worker_task_argv_token(task.id)])
     # goal_mode rides the same `-q` path: cli.py runs the judge loop there too, so the
     # worker log keeps its live tool feed (forcing -Q blanked it).
     return cmd
