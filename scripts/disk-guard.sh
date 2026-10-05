@@ -515,6 +515,74 @@ reclaim_pytest_roots() {
   log "pytest roots: removed $n idle roots under $base, $(( after - before ))MB"
 }
 
+# Shell copy of done-card worktree reclaim. Known no-op on squash-merging
+# repos (see reclaim_merged_worktrees). Shared by the probe-failure path and
+# the hermes-reclaim rc!=0 path so the loop cannot drift between them.
+reclaim_shell_worktrees() {
+  local repo
+  for repo in $(ls -d "$HOME"/workspace/*/.git 2>/dev/null | xargs -n1 dirname); do
+    git -C "$repo" worktree list 2>/dev/null | grep -q . && reclaim_merged_worktrees "$repo"
+  done
+}
+
+# Done-card worktrees: one implementation, in hermes, shared with `kanban gc`.
+# The shell copy is a fallback only (see reclaim_merged_worktrees).
+reclaim_hermes_worktrees() {
+  local HERMES_BIN probe_err probe_rc probe_line wt_out wt_rc
+  # DISK_GUARD_HERMES_BIN wins so a proof harness can point at a stub without
+  # hiding a real `hermes` on PATH. Otherwise prefer PATH, then the venv copy
+  # launchd has always used.
+  if [ -n "${DISK_GUARD_HERMES_BIN:-}" ]; then
+    HERMES_BIN=$DISK_GUARD_HERMES_BIN
+  else
+    HERMES_BIN=$(command -v hermes 2>/dev/null || true)
+    [ -n "$HERMES_BIN" ] || HERMES_BIN="$HOME/.hermes/hermes-agent/venv/bin/hermes"
+  fi
+
+  # Kanban WRITE FENCE (agent/delegation_context.py, hermes_cli/kanban.py).
+  # A delegate_task child is supposed to be refused; that is not a stale hermes.
+  # Do NOT unset HERMES_DELEGATED_CHILD_CONTEXT — clearing it would bypass the
+  # trust boundary. No shell fallback: the child must not reclaim either.
+  if [ -n "${HERMES_DELEGATED_CHILD_CONTEXT:-}" ]; then
+    log "worktrees: SKIP fenced child context -- run disk-guard from an operator shell/launchd"
+    return 0
+  fi
+
+  # --dry-run is a CAPABILITY PROBE: the installed hermes only grows the
+  # worktree-reclaim flags once this change ships. Older builds reject it and
+  # we fall through to the shell copy instead of silently reclaiming nothing.
+  # stderr is kept: a fence refusal and a missing flag are different failures.
+  probe_err=$("$HERMES_BIN" kanban reclaim --dry-run 2>&1 >/dev/null)
+  probe_rc=$?
+  if [ "$probe_rc" = 0 ]; then
+    wt_out=$("$HERMES_BIN" kanban reclaim --logs 2>&1); wt_rc=$?
+    if [ "$wt_rc" = 0 ]; then
+      log "worktrees: $(printf '%s' "$wt_out" | grep -E '^ *-> ' | tr '\n' ' ')"
+    else
+      log "worktrees: FAIL hermes reclaim rc=$wt_rc, falling back to the shell copy"
+      printf '%s\n' "$wt_out" | tail -3 | while read -r l; do log "  $l"; done
+      reclaim_shell_worktrees
+    fi
+    return 0
+  fi
+
+  probe_line=$(printf '%s\n' "$probe_err" | head -n 1)
+  # The CLI refusal is "delegate_task child contexts cannot mutate ...".
+  # Same SKIP as the env check, with the refusal text so the log shows why.
+  case "$probe_err" in
+    *"child context"*)
+      log "worktrees: SKIP fenced child context -- run disk-guard from an operator shell/launchd: $probe_line"
+      return 0
+      ;;
+  esac
+  # NOT routine. The shell fallback is a known no-op (squash-merge gate).
+  # Taking this branch means the host is STILL LEAKING — say FAIL with the
+  # probe rc and stderr so it is greppable, and do not call it an upgrade
+  # unless the stderr actually says the flag is missing.
+  log "worktrees: FAIL hermes reclaim probe rc=$probe_rc at $HERMES_BIN: $probe_line"
+  reclaim_shell_worktrees
+}
+
 before=$(free_gi)
 
 # Library seam: `DISK_GUARD_LIB=1 source disk-guard.sh` defines the reclaim
@@ -531,33 +599,8 @@ log "free=${before}Gi floor=${FLOOR_GI}Gi target=${RECLAIM_TARGET_GI}Gi"
 if [ "$RECLAIM" = 1 ]; then
   reclaim_workspaces
   reclaim_safe_caches
-  # Done-card worktrees: one implementation, in hermes, shared with `kanban gc`.
-  # The shell copy below is a fallback only (see reclaim_merged_worktrees).
-  HERMES_BIN="${DISK_GUARD_HERMES_BIN:-$HOME/.hermes/hermes-agent/venv/bin/hermes}"
-  if [ -x "$HERMES_BIN" ] && "$HERMES_BIN" kanban reclaim --dry-run >/dev/null 2>&1; then
-    # --dry-run above is a CAPABILITY PROBE: the installed hermes only grows the
-    # worktree-reclaim flags once this change ships. Older builds reject it and
-    # we fall through to the shell copy instead of silently reclaiming nothing.
-    wt_out=$("$HERMES_BIN" kanban reclaim --logs 2>&1); wt_rc=$?
-    if [ "$wt_rc" = 0 ]; then
-      log "worktrees: $(printf '%s' "$wt_out" | grep -E '^ *-> ' | tr '\n' ' ')"
-    else
-      log "worktrees: FAIL hermes reclaim rc=$wt_rc, falling back to the shell copy"
-      printf '%s\n' "$wt_out" | tail -3 | while read -r l; do log "  $l"; done
-      for repo in $(ls -d "$HOME"/workspace/*/.git 2>/dev/null | xargs -n1 dirname); do
-        git -C "$repo" worktree list 2>/dev/null | grep -q . && reclaim_merged_worktrees "$repo"
-      done
-    fi
-  else
-    # NOT routine. The shell fallback (reclaim_merged_worktrees) is the function
-    # whose squash-merge gate made it a permanent no-op: it has removed 0 dirs
-    # over its entire log. Taking this branch means the host is STILL LEAKING
-    # and the installed hermes needs upgrading — say FAIL so it is greppable.
-    log "worktrees: FAIL hermes reclaim unavailable at $HERMES_BIN (upgrade the installed hermes); the shell fallback below is a known no-op"
-    for repo in $(ls -d "$HOME"/workspace/*/.git 2>/dev/null | xargs -n1 dirname); do
-      git -C "$repo" worktree list 2>/dev/null | grep -q . && reclaim_merged_worktrees "$repo"
-    done
-  fi
+  # Done-card worktrees: hermes when the probe passes, shell copy otherwise.
+  reclaim_hermes_worktrees
   reclaim_tmp
   reclaim_home_node_modules
   reclaim_pytest_roots
