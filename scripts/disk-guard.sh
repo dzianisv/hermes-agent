@@ -202,7 +202,19 @@ if [ "${1:-}" = "--rank-min-mb" ]; then
   exit 0
 fi
 
+# Delegate children are refused by the Kanban write fence. Skipping only the
+# hermes probe left the other deletion classes in the same --reclaim run free
+# to remove scratch the child is not allowed to touch. Do NOT unset
+# HERMES_DELEGATED_CHILD_CONTEXT — clearing it would bypass the trust boundary.
+fenced_child() { # 0 when this process is a delegate_task child
+  [ -n "${HERMES_DELEGATED_CHILD_CONTEXT:-}" ]
+}
+
 reclaim_workspaces() {
+  if fenced_child; then
+    log "workspaces: SKIP fenced child context -- run disk-guard from an operator shell/launchd"
+    return 0
+  fi
   local freed=0 n=0 id sz root db
   # WORKSPACE ROOTS ARE DISCOVERED, NOT PINNED. Until 2026-09-25 this swept
   # only $HOME/.hermes/kanban/workspaces, i.e. the DEFAULT board. Every named
@@ -383,6 +395,10 @@ reclaim_stale_installs() {
 # process holds, are kept. Repos are discovered from the worktree parents the
 # guard already derives, never from a pinned directory list.
 reclaim_dead_task_worktrees() {
+  if fenced_child; then
+    log "dead-card worktrees: SKIP fenced child context -- run disk-guard from an operator shell/launchd"
+    return 0
+  fi
   local before after n=0 repo p b id sz
   before=$(free_mb)
   while read -r repo; do
@@ -519,6 +535,12 @@ reclaim_pytest_roots() {
 # repos (see reclaim_merged_worktrees). Shared by the probe-failure path and
 # the hermes-reclaim rc!=0 path so the loop cannot drift between them.
 reclaim_shell_worktrees() {
+  # A non-zero hermes probe falls through to here. The fence has to hold on
+  # this path too, or the child deletes what the probe refusal forbade.
+  if fenced_child; then
+    log "worktrees: SKIP fenced child context -- run disk-guard from an operator shell/launchd"
+    return 0
+  fi
   local repo
   for repo in $(ls -d "$HOME"/workspace/*/.git 2>/dev/null | xargs -n1 dirname); do
     git -C "$repo" worktree list 2>/dev/null | grep -q . && reclaim_merged_worktrees "$repo"
@@ -539,21 +561,31 @@ reclaim_hermes_worktrees() {
     [ -n "$HERMES_BIN" ] || HERMES_BIN="$HOME/.hermes/hermes-agent/venv/bin/hermes"
   fi
 
-  # Kanban WRITE FENCE (agent/delegation_context.py, hermes_cli/kanban.py).
-  # A delegate_task child is supposed to be refused; that is not a stale hermes.
-  # Do NOT unset HERMES_DELEGATED_CHILD_CONTEXT — clearing it would bypass the
-  # trust boundary. No shell fallback: the child must not reclaim either.
-  if [ -n "${HERMES_DELEGATED_CHILD_CONTEXT:-}" ]; then
-    log "worktrees: SKIP fenced child context -- run disk-guard from an operator shell/launchd"
+  # --dry-run is a CAPABILITY PROBE, and under the Kanban write fence it is
+  # also the refusal we must quote. Always run it — including when fenced.
+  # Do NOT unset HERMES_DELEGATED_CHILD_CONTEXT (agent/delegation_context.py,
+  # hermes_cli/kanban.py): clearing it would bypass the trust boundary.
+  # stderr is kept: a real refusal and a missing flag are different failures.
+  probe_err=$("$HERMES_BIN" kanban reclaim --dry-run 2>&1 >/dev/null)
+  probe_rc=$?
+  probe_line=$(printf '%s\n' "$probe_err" | head -n 1)
+  [ -n "$probe_line" ] || probe_line="(probe rc=${probe_rc}, no stderr)"
+
+  # Fence is the env var, not a substring of stderr. "child context" also
+  # shows up in unrelated errors, so only the real refusal text is a SKIP.
+  # A fenced child never deletes: no real reclaim, no shell fallback.
+  if fenced_child; then
+    case "$probe_err" in
+      *"cannot mutate Kanban tasks"*)
+        log "worktrees: SKIP fenced child context -- run disk-guard from an operator shell/launchd: $probe_line"
+        ;;
+      *)
+        log "worktrees: FAIL hermes reclaim probe rc=$probe_rc at $HERMES_BIN: $probe_line"
+        ;;
+    esac
     return 0
   fi
 
-  # --dry-run is a CAPABILITY PROBE: the installed hermes only grows the
-  # worktree-reclaim flags once this change ships. Older builds reject it and
-  # we fall through to the shell copy instead of silently reclaiming nothing.
-  # stderr is kept: a fence refusal and a missing flag are different failures.
-  probe_err=$("$HERMES_BIN" kanban reclaim --dry-run 2>&1 >/dev/null)
-  probe_rc=$?
   if [ "$probe_rc" = 0 ]; then
     wt_out=$("$HERMES_BIN" kanban reclaim --logs 2>&1); wt_rc=$?
     if [ "$wt_rc" = 0 ]; then
@@ -566,21 +598,28 @@ reclaim_hermes_worktrees() {
     return 0
   fi
 
-  probe_line=$(printf '%s\n' "$probe_err" | head -n 1)
-  # The CLI refusal is "delegate_task child contexts cannot mutate ...".
-  # Same SKIP as the env check, with the refusal text so the log shows why.
-  case "$probe_err" in
-    *"child context"*)
-      log "worktrees: SKIP fenced child context -- run disk-guard from an operator shell/launchd: $probe_line"
-      return 0
-      ;;
-  esac
   # NOT routine. The shell fallback is a known no-op (squash-merge gate).
-  # Taking this branch means the host is STILL LEAKING — say FAIL with the
-  # probe rc and stderr so it is greppable, and do not call it an upgrade
-  # unless the stderr actually says the flag is missing.
+  # Every non-zero probe is this branch — say FAIL with rc and stderr so it
+  # is greppable. Do not special-case stderr text and do not call it an upgrade.
   log "worktrees: FAIL hermes reclaim probe rc=$probe_rc at $HERMES_BIN: $probe_line"
   reclaim_shell_worktrees
+}
+
+# Ordinary --reclaim sequence. Defined above the library seam so a proof
+# harness can drive the whole dispatch against a fixture HOME.
+run_reclaim_classes() {
+  reclaim_workspaces
+  reclaim_safe_caches
+  reclaim_hermes_worktrees
+  reclaim_tmp
+  reclaim_home_node_modules
+  reclaim_pytest_roots
+  reclaim_npm_cache
+  reclaim_stale_installs
+  reclaim_dead_task_worktrees
+  # Target enforcement runs LAST: only after every ordinary class has been
+  # reclaimed do we decide whether to escalate.
+  reclaim_to_target
 }
 
 before=$(free_gi)
@@ -597,19 +636,7 @@ log "free=${before}Gi floor=${FLOOR_GI}Gi target=${RECLAIM_TARGET_GI}Gi"
 
 
 if [ "$RECLAIM" = 1 ]; then
-  reclaim_workspaces
-  reclaim_safe_caches
-  # Done-card worktrees: hermes when the probe passes, shell copy otherwise.
-  reclaim_hermes_worktrees
-  reclaim_tmp
-  reclaim_home_node_modules
-  reclaim_pytest_roots
-  reclaim_npm_cache
-  reclaim_stale_installs
-  reclaim_dead_task_worktrees
-  # Target enforcement runs LAST: only after every ordinary class has been
-  # reclaimed do we decide whether to escalate.
-  reclaim_to_target
+  run_reclaim_classes
 fi
 
 after=$(free_gi)
