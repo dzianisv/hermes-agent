@@ -226,6 +226,9 @@ _SPECS = [
                   "review). Best for open-ended cards one shot rarely finishes."),
         _arg("--goal-max-turns", type=int, metavar="N", dest="goal_max_turns",
              help="Turn budget for --goal workers (default 20). Ignored without --goal."),
+        _arg("--step", dest="step", metavar="KEY",
+             help="Record this kanban.stages key as the task's current stage (no handoff; "
+                  "use `kanban step` to hand off to the stage owner)"),
         _arg("--initial-status", choices=sorted(kb.VALID_INITIAL_STATUSES), default="running",
              help="Initial card status. Use 'blocked' for cards "
                   "that require immediate human ops (R3 gate) "
@@ -334,8 +337,21 @@ _SPECS = [
         _arg("--body", help="Replace the task body"),
         _arg("--priority", type=int, help="Replace the task priority"),
         _arg("--result", help="Backfilled task result text for a done task"),
+        _arg("--step", dest="step", metavar="KEY",
+             help="Set current stage key (kanban.stages); 'none' clears. No handoff."),
         *_STEP_HANDOFF,
     ], help="Edit task fields or recovery fields on an already-completed task"),
+    _cmd("step", [
+        _TASK_ID,
+        _arg("key", nargs="?", help="Stage key from kanban.stages"),
+        _arg("--next", dest="next_stage", action="store_true", help="Advance to the next configured stage"),
+        _arg("--note", help="Note appended to the STAGE comment"),
+        _arg("--keep-status", action="store_true",
+             help="Record stage + owner but leave the status unchanged (e.g. keep a parked card parked)"),
+        _json_flag(),
+    ], help="Move a task to a workflow stage: set current_step_key, hand off to the stage "
+            "owner and set the stage status (kanban.stages)"),
+    _cmd("stages", [_json_flag()], help="List configured workflow stages (kanban.stages)"),
     _cmd("set-workspace", [
         _TASK_ID,
         _arg("--kind", required=True, choices=sorted(kb.VALID_WORKSPACE_KINDS),

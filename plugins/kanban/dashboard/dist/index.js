@@ -645,6 +645,7 @@
 
     const [tenantFilter, setTenantFilter] = useState("");
     const [assigneeFilter, setAssigneeFilter] = useState("");
+    const [stageFilter, setStageFilter] = useState("");
     const [includeArchived, setIncludeArchived] = useState(false);
     const [search, setSearch] = useState("");
     const [laneByProfile, setLaneByProfile] = useState(true);
@@ -821,8 +822,9 @@
       const filterTask = function (t) {
         if (tenantFilter && t.tenant !== tenantFilter) return false;
         if (assigneeFilter && t.assignee !== assigneeFilter) return false;
+        if (stageFilter && (t.current_step_key || "__none__") !== stageFilter) return false;
         if (q) {
-          const hay = `${t.id} ${t.title || ""} ${t.body || ""} ${t.result || ""} ${t.latest_summary || ""} ${t.assignee || ""} ${t.tenant || ""}`.toLowerCase();
+          const hay = `${t.id} ${t.title || ""} ${t.body || ""} ${t.result || ""} ${t.latest_summary || ""} ${t.assignee || ""} ${t.tenant || ""} ${t.current_step_key || ""}`.toLowerCase();
           if (hay.indexOf(q) === -1) return false;
         }
         return true;
@@ -832,7 +834,7 @@
           return Object.assign({}, col, { tasks: col.tasks.filter(filterTask) });
         }),
       });
-    }, [boardData, tenantFilter, assigneeFilter, search]);
+    }, [boardData, tenantFilter, assigneeFilter, stageFilter, search]);
 
     // --- actions ------------------------------------------------------------
     // Performs the actual move (optimistic UI + PATCH) once any required
@@ -1315,6 +1317,7 @@
           board: boardData,
           tenantFilter, setTenantFilter,
           assigneeFilter, setAssigneeFilter,
+          stageFilter, setStageFilter,
           includeArchived, setIncludeArchived,
           laneByProfile, setLaneByProfile,
           search, setSearch,
@@ -2581,6 +2584,20 @@
           }),
         ),
       ),
+      h("div", { className: "flex flex-col gap-1",
+                 title: "Filter by workflow stage (kanban.stages / current_step_key). Set with `hermes kanban step <id> <stage>`." },
+        h(Label, { className: "text-xs text-muted-foreground" }, "Stage"),
+        h(Select, Object.assign({
+          value: props.stageFilter || "",
+          className: "h-8",
+        }, selectChangeHandler(props.setStageFilter || function () {})),
+          h(SelectOption, { value: "" }, "All stages"),
+          h(SelectOption, { value: "__none__" }, "(no stage)"),
+          ((props.board && props.board.stages) || []).map(function (s) {
+            return h(SelectOption, { key: s, value: s }, s);
+          }),
+        ),
+      ),
       h("label", { className: "flex items-center gap-2 text-xs",
                    title: "Include archived tasks in the board view. Archived tasks are hidden by default." },
         h(Checkbox, {
@@ -2613,6 +2630,7 @@
           props.setSearch("");
           props.setTenantFilter("");
           props.setAssigneeFilter("");
+          if (props.setStageFilter) props.setStageFilter("");
           props.setIncludeArchived(false);
         },
         size: "sm",
@@ -3223,6 +3241,12 @@
                   ),
                 }, t.warnings.highest_severity === "critical" ? "!!!" :
                    t.warnings.highest_severity === "error" ? "!!" : "⚠")
+              : null,
+            t.current_step_key
+              ? h(Badge, { variant: "outline", className: "hermes-kanban-stage",
+                           "data-stage": t.current_step_key,
+                           title: `Stage: ${t.current_step_key}. Advance with hermes kanban step ${t.id} --next.` },
+                  "◆ " + t.current_step_key)
               : null,
             t.priority > 0
               ? h(Badge, { className: "hermes-kanban-priority",

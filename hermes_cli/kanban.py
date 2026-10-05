@@ -211,7 +211,7 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "schedule", "unblock", "promote", "reopen-done", "archive", "dispatch", "daemon", "repair",
     "heartbeat", "notify-subscribe", "notify-unsubscribe", "specify", "decompose",
     "request-review", "request-changes", "reopen-review",
-    "gc",
+    "gc", "step",
 })
 
 _DELEGATED_CHILD_DENIED_BOARD_ACTIONS: frozenset[str] = frozenset({
@@ -385,6 +385,10 @@ def _cmd_create(args: argparse.Namespace) -> int:
             creator_task_id=(os.environ.get("HERMES_KANBAN_TASK")
                              if is_dispatcher_owned_worker_context() else None),
         )
+        step = getattr(args, "step", None)
+        if step:
+            from hermes_cli import kanban_stages as kst
+            kst.set_step_key(conn, task_id, step)
         task = kb.get_task(conn, task_id)
         # Gateway sessions that run `hermes kanban create` (rather than the kanban_create
         # tool) get the same completion/block notifications; no-op for plain CLI/cron.
@@ -517,6 +521,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
     print(f"Task {task.id}: {task.title}")
     field("status", task.status)
     field("assignee", task.assignee or "-")
+    field("stage", task.current_step_key or "-")
     if task.tenant:
         field("tenant", task.tenant)
     field("workspace", f"{task.workspace_kind}" + (f" @ {task.workspace_path}" if task.workspace_path else ""))
@@ -967,12 +972,21 @@ def _cmd_edit(args: argparse.Namespace) -> int:
     priority = getattr(args, "priority", None)
     if result is None and (summary is not None or raw_metadata is not None):
         return _err("kanban edit: --summary and --metadata require --result", 2)
-    if all(value is None for value in (title, body, priority, result)):
-        return _err("kanban edit: provide --title, --body, --priority, or --result", 2)
+    step = getattr(args, "step", None)
+    if all(value is None for value in (title, body, priority, result, step)):
+        return _err("kanban edit: provide --title, --body, --priority, --result, or --step", 2)
     metadata, rc = _parse_metadata_flag(raw_metadata)
     if rc:
         return rc
+    if step is not None and all(value is None for value in (title, body, priority, result)):
+        from hermes_cli import kanban_stages as kst
+        with kbc.connect_closing() as conn:
+            ok = kst.set_step_key(conn, args.task_id, None if step.lower() == "none" else step)
+        return _ok_or_err(ok, f"no such task: {args.task_id}", f"Edited {args.task_id}")
     with kbc.connect_closing() as conn:
+        if step is not None:
+            from hermes_cli import kanban_stages as kst
+            kst.set_step_key(conn, args.task_id, None if step.lower() == "none" else step)
         ok = kb.edit_task(
             conn, args.task_id, title=title, body=body, priority=priority,
             result=result, summary=summary, metadata=metadata,
@@ -982,6 +996,39 @@ def _cmd_edit(args: argparse.Namespace) -> int:
         f"cannot edit {args.task_id} (unknown id, or --result used on a task that is not done)",
         f"Edited {args.task_id}",
     )
+
+
+def _cmd_step(args: argparse.Namespace) -> int:
+    """``hermes kanban step <id> <key>|--next`` — stage move + owner handoff."""
+    from hermes_cli import kanban_stages as kst
+    if bool(args.key) == bool(getattr(args, "next_stage", False)):
+        return _err("kanban step: give exactly one of <key> or --next", 2)
+    with kbc.connect_closing() as conn:
+        task = kb.get_task(conn, args.task_id)
+        if not task:
+            return _err(f"no such task: {args.task_id}")
+        key = args.key or kst.next_stage(task.current_step_key).key
+        res = kst.move_to_stage(conn, args.task_id, key, note=getattr(args, "note", None),
+                                author=_profile_author(),
+                                keep_status=bool(getattr(args, "keep_status", False)))
+    if getattr(args, "json", False):
+        _print_json({"task_id": args.task_id, **res})
+    else:
+        print(f"Moved {args.task_id} to stage {res['to']} (from {res['from'] or '-'}): "
+              f"assignee={res['assignee'] or '-'}, status={res['status']}")
+    return 0
+
+
+def _cmd_stages(args: argparse.Namespace) -> int:
+    from hermes_cli import kanban_stages as kst
+    stages = kst.load_stages()
+    if _json_out(args, [s.__dict__ for s in stages]):
+        return 0
+    if not stages:
+        print("(no kanban.stages configured)")
+    for i, s in enumerate(stages):
+        print(f"{i + 1:>2}. {s.key:<18} owner={s.owner or '-':<26} status={s.status}")
+    return 0
 
 
 def _cmd_set_workspace(args: argparse.Namespace) -> int:
@@ -1408,7 +1455,7 @@ _HANDLERS = {
     "link": _cmd_link, "unlink": _cmd_unlink, "claim": _cmd_claim,
     "comment": _cmd_comment, "attach": _cmd_attach,
     "attachments": _cmd_attachments, "attach-rm": _cmd_attach_rm,
-    "complete": _cmd_complete, "edit": _cmd_edit, "set-workspace": _cmd_set_workspace,
+    "complete": _cmd_complete, "edit": _cmd_edit, "step": _cmd_step, "stages": _cmd_stages, "set-workspace": _cmd_set_workspace,
     "block": _cmd_block,
     "schedule": _cmd_schedule, "unblock": _cmd_unblock,
     "request-review": _cmd_request_review, "request-changes": _cmd_request_changes,

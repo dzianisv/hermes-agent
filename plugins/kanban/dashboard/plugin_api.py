@@ -328,8 +328,18 @@ def get_board(
         tenants = [r["tenant"] for r in conn.execute("SELECT DISTINCT tenant FROM tasks WHERE tenant IS NOT NULL ORDER BY tenant")]
         assignees = [r["assignee"] for r in conn.execute(
             "SELECT DISTINCT assignee FROM tasks WHERE assignee IS NOT NULL AND status != 'archived' ORDER BY assignee")]
+        # Stage filter options: configured kanban.stages order, then any other keys in use.
+        try:
+            from hermes_cli import kanban_stages
+            stages = [s.key for s in kanban_stages.load_stages()]
+        except Exception:
+            stages = []
+        stages += [r["current_step_key"] for r in conn.execute(
+            "SELECT DISTINCT current_step_key FROM tasks WHERE current_step_key IS NOT NULL "
+            "AND status != 'archived' ORDER BY current_step_key") if r["current_step_key"] not in stages]
         return {
             "columns": [{"name": name, "tasks": columns[name]} for name in columns], "tenants": tenants,
+            "stages": stages,
             "assignees": assignees, "latest_event_id": int(latest_event_id), "now": int(time.time())}
 
 
