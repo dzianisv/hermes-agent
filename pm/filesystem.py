@@ -21,8 +21,16 @@ def is_junction(path: Path) -> bool:
     return os.name == "nt" and path.lstat().st_reparse_tag == stat.IO_REPARSE_TAG_MOUNT_POINT
 
 
-def lock_fd(fd: int, *, wait: bool, timeout: float | None = None) -> bool:
-    """Take the byte lock; ``timeout`` bounds the retry loop (None waits forever, 0 tries once)."""
+def lock_fd(fd: int, *, wait: bool, timeout: float | None = None, shared: bool = False) -> bool:
+    """Take the byte lock; ``timeout`` bounds the retry loop (None waits forever, 0 tries once).
+
+    ``shared`` takes a non-exclusive (reader) lock on POSIX so concurrent readers of the
+    committed venv selection (``activate_dependencies``, called on every CLI boot) do not
+    serialize behind each other — only behind an actual writer (an install/repair holding
+    the lock exclusively). Windows has no portable shared-lock primitive via msvcrt, so
+    ``shared`` there still takes the exclusive lock (readers already reacquire per boot,
+    unlike POSIX where many concurrent short-lived CLI invocations pile up on one file).
+    """
     deadline = None if timeout is None else time.monotonic() + timeout
     if os.name == "nt":
         import msvcrt
@@ -39,9 +47,10 @@ def lock_fd(fd: int, *, wait: bool, timeout: float | None = None) -> bool:
             time.sleep(_LOCK_POLL_SECONDS)
     else:
         import fcntl
+        mode = fcntl.LOCK_SH if shared else fcntl.LOCK_EX
         while True:
             try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(fd, mode | fcntl.LOCK_NB)
                 return True
             except BlockingIOError:
                 pass

@@ -260,6 +260,12 @@ def _compute_active_pr_guard(pr_url: str) -> tuple:
         return (False, "pr_not_open")
     if (status.get("reviewDecision") or "").upper() == "CHANGES_REQUESTED":
         return (False, "pr_needs_author_action")
+    if (status.get("reviewDecision") or "").upper() == "APPROVED":
+        # Approved + open: the only remaining step is the implementer's merge
+        # (AgentPod rule: merge is the engineer's last step after independent
+        # approval). Guarding here deadlocks the card exactly like
+        # CHANGES_REQUESTED did (t_8370bfe4 sat `ready` with #5344 APPROVED).
+        return (False, "pr_approved_awaiting_author_merge")
     if _rollup_has_gating_failure(status.get("statusCheckRollup")):
         return (False, "pr_needs_author_action")
     return (True, None)
@@ -2264,7 +2270,7 @@ def check_respawn_guard(
         requeued_after = conn.execute(
             "SELECT 1 FROM task_events "
             "WHERE task_id = ? AND created_at >= ? "
-            "AND kind IN ('status', 'promoted', 'unblocked', 'reclaimed') "
+            "AND kind IN ('status', 'promoted', 'unblocked', 'reclaimed', 'done_reopened') "
             "LIMIT 1",
             (task_id, completed_at),
         ).fetchone()
@@ -2746,6 +2752,87 @@ def _call_spawn_fn(spawn_fn, task: Task, workspace: str, board: Optional[str]) -
         return spawn_fn(task, workspace)
 
 
+def _design_phase_cfg() -> Optional[dict]:
+    # Read from the root hermes home so every dispatcher process (any profile
+    # gateway, CLI) applies the same board rule.
+    try:
+        import yaml
+        from pathlib import Path
+        root = Path(os.environ.get("HERMES_ROOT_HOME") or Path.home() / ".hermes") / "config.yaml"
+        cfg = ((yaml.safe_load(root.read_text()) or {}).get("kanban") or {}).get("design_phase") or {}
+    except Exception:
+        return None
+    if not cfg or not cfg.get("enabled", True):
+        return None
+    return {
+        "impl_assignees": set(cfg.get("impl_assignees") or ["software-engineer"]),
+        "architects": set(cfg.get("architects") or []),
+        "architect": cfg.get("architect") or next(iter(cfg.get("architects") or []), None),
+        "required": list(cfg.get("required") or []),
+    }
+
+
+def _design_phase_guard(conn: sqlite3.Connection, task_id: str, assignee: str) -> Optional[str]:
+    """Return a reason and park the card when an implementation card did not come
+    through the design phase; ``None`` when it may be claimed.
+
+    Came through the design phase means ONE of: created by an architect profile;
+    child of a DONE card assigned to an architect; its DESIGN: line names a Notion
+    page/block. Then the brief must carry every ``required`` marker. Parked cards
+    go to ``scheduled`` (reversible) and are reassigned to the architect, who writes
+    the design and splits the work. Config: ``kanban.design_phase``.
+    """
+    cfg = _design_phase_cfg()
+    if cfg is None or assignee not in cfg["impl_assignees"] or not cfg["architects"]:
+        return None
+    task = _kb.get_task(conn, task_id)
+    if task is None:
+        return None
+    parts = [task.title or "", task.body or ""]
+    try:
+        parts += [c.body or "" for c in _kb.list_comments(conn, task_id)]
+    except Exception:
+        pass
+    text = "\n".join(parts)
+    ok = (task.created_by or "") in cfg["architects"]
+    if not ok:
+        for pid in _kb.parent_ids(conn, task_id):
+            parent = _kb.get_task(conn, pid)
+            if parent and parent.status == "done" and (parent.assignee or "") in cfg["architects"]:
+                ok = True
+                break
+    if not ok:
+        # Any DESIGN: line may carry the link (body, or an EM/architect comment);
+        # the guard's own park note also contains "DESIGN:" and must not mask it.
+        ok = any(re.search(r"[0-9a-f]{32}|notion\.(so|com)/", v)
+                 for v in re.findall(r"DESIGN:[ \t]*(.+)", text))
+    low = text.lower()
+    missing = [r for r in cfg["required"] if r.lower() not in low]
+    if ok and not missing:
+        return None
+    if not ok:
+        reason = "design_phase_missing"
+        note = (f"BLOCKER:DEP architect — [design-phase] implementation card did not come through the "
+                f"design phase (not created by an architect, no finished architect parent, DESIGN: names no "
+                f"Notion section). Reassigned to {cfg['architect']}: write or point to the DESIGN section, "
+                "get it reviewed, then split into implementation cards with " + "/".join(cfg["required"]) + ".")
+    else:
+        reason = "brief_incomplete"
+        note = (f"BLOCKER:DEP EM — [design-phase] brief incomplete: missing {', '.join(missing)}. "
+                "Complete the brief, then `hermes kanban unblock <id>`.")
+    try:
+        if _kb.schedule_task(conn, task_id, reason=note) and not ok and cfg["architect"]:
+            _kb.assign_task(conn, task_id, cfg["architect"])
+            # 'scheduled' is never dispatched: re-gate so the architect is
+            # spawned next tick (ready, or todo while a parent is undone).
+            _kb.unblock_task(conn, task_id)
+        _kb._append_event(conn, task_id, "respawn_guarded", {"reason": reason})
+    except Exception as exc:  # never break dispatch
+        import logging as _lg
+        _lg.getLogger(__name__).warning("design-phase guard failed for %s: %s", task_id, exc)
+    return reason
+
+
 def _dispatch_lane_task(
     conn: sqlite3.Connection,
     row: sqlite3.Row,
@@ -2780,6 +2867,15 @@ def _dispatch_lane_task(
         current = per_profile_running.get(assignee, 0)
         if current >= per_profile_cap:
             result.skipped_per_profile_capped.append((task_id, assignee, current))
+            return False
+    # Design-phase entry rule (AgentPod, Den 2026-10-04: "why is the pipeline built so
+    # you can miss the architect design phase at all?"). An implementation card is
+    # claimable only if it came out of the design phase. Checked here, before claim,
+    # so no process (CLI, cron, worker) can route work past the architect.
+    if lane == "ready" and not dry_run:
+        dp_reason = _design_phase_guard(conn, task_id, assignee)
+        if dp_reason is not None:
+            result.respawn_guarded.append((task_id, dp_reason))
             return False
     guard_exemptions: list = []
     guard_reason = check_respawn_guard(conn, task_id, lane=lane, exempt_out=guard_exemptions)

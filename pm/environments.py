@@ -302,10 +302,16 @@ def activate_dependencies(project_root: Path) -> None:
     state = install_state_dir(project_root)
     if state.is_dir():
         from hermes_cli.runtime_state import runtime_lock, recover_publication, lease_generation
-        # The lock's holder may be another profile's backend running a full dependency rebuild;
-        # this process only reads the committed selection, so it proceeds without waiting rather
-        # than leaving the backend unbound (see runtime_lock).
-        with runtime_lock(project_root) as held:
+
+        # recover_publication mutates a journal file (delete/rewrite); running it under a
+        # merely-shared lock would let two concurrent readers race on that mutation. The
+        # journal only exists mid-install (a rare, already-slow path), so pay the exclusive
+        # lock's serialization only then; the common case (no pending publication) takes a
+        # shared lock so concurrent CLI boots (profile gateways, cron pollers) reading the
+        # committed selection never queue behind each other (t_a512082a: 15s-129s variance
+        # traced to every boot taking this lock exclusively just to read).
+        pending_publication = (state / "publication.json").is_file()
+        with runtime_lock(project_root, shared=not pending_publication) as held:
             if held:
                 recover_publication(project_root)
             environment = committed_venv(project_root)

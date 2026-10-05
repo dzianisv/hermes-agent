@@ -208,11 +208,19 @@ def _receipt_reports_stale_runtime(receipt: dict, expected_sha: str | None = Non
     *before* the pull, so a finished update's plan always looks stale and must not
     retrigger a restart; consult it only for an unfinished receipt.
 
+    ``_current_checkout_sha()`` shells out to git; a receipt that is neither a
+    fleet matrix nor unfinished can never return True, so it must not pay that
+    cost on every CLI startup just to answer False (t_a512082a).
+
     See #95294.
     """
-    from hermes_cli.update_cmd import _current_checkout_sha
     if not isinstance(receipt, dict):
         return False
+    fleet = receipt.get("fleet")
+    if not (isinstance(fleet, list) and fleet) and not _receipt_looks_unfinished(receipt):
+        return False
+
+    from hermes_cli.update_cmd import _current_checkout_sha
     expected_sha = expected_sha or _current_checkout_sha()
     if not expected_sha:
         return False
@@ -222,7 +230,6 @@ def _receipt_reports_stale_runtime(receipt: dict, expected_sha: str | None = Non
 
     from hermes_cli.update_receipt import row_is_external
 
-    fleet = receipt.get("fleet")
     if isinstance(fleet, list) and fleet:
         return any(
             isinstance(entry, dict)

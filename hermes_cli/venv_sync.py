@@ -211,6 +211,40 @@ def refuse_foreign_owned_venv(project_root: Path) -> None:
             )
 
 
+_READONLY_KANBAN_VERBS = frozenset({"list", "show", "runs", "log"})
+
+
+def _is_readonly_kanban_call(argv: list[str]) -> bool:
+    """True for `hermes kanban [--board X] {list,show,runs,log} ...`.
+
+    These paths only read the board's sqlite DB; they never touch the
+    checkout's dependency state, so paying prepare_launch's venv-currency
+    subprocess round-trip on every invocation (t_a512082a: 8-25s per call,
+    the dominant cost after the git-promisor fix) buys nothing but latency
+    for callers like heartbeat/cron that poll this constantly.
+    """
+    from hermes_cli._parser import command_argv
+
+    cmd = command_argv(argv)
+    if not cmd or cmd[0] != "kanban":
+        return False
+    rest = cmd[1:]
+    i = 0
+    while i < len(rest):
+        token = rest[i]
+        if token == "--board":
+            i += 2
+            continue
+        if token.startswith("--board="):
+            i += 1
+            continue
+        if token.startswith("-"):
+            i += 1
+            continue
+        return token in _READONLY_KANBAN_VERBS
+    return False
+
+
 def prepare_launch(project_root: Path, argv: list[str]) -> Path | None:
     """Finish a self-managed source update before importing app dependencies.
 
@@ -231,7 +265,8 @@ def prepare_launch(project_root: Path, argv: list[str]) -> Path | None:
             or _METADATA_FLAGS & set(argv)
             or os.environ.get("HERMES_DISABLE_LAZY_INSTALLS", "").lower() in ("1", "true", "yes")
             or not (root / ".git").exists()
-            or not (root / "pyproject.toml").is_file()):
+            or not (root / "pyproject.toml").is_file()
+            or _is_readonly_kanban_call(argv)):
         return None
     stamp = read_install_stamp(root)
     if not stamp:

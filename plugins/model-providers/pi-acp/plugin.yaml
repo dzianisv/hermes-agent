@@ -1,0 +1,5 @@
+name: pi-acp-provider
+kind: model-provider
+version: 1.0.0
+description: pi coding agent via the pi-acp ACP adapter (npm pi-acp)
+author: Nous Research

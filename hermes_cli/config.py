@@ -3947,7 +3947,24 @@ def _inject_profile_env_vars() -> None:
         pass
 
 
-_inject_profile_env_vars()
+def _skip_provider_discovery_for_readonly_kanban() -> bool:
+    """True for read-only `kanban {list,show,runs,log}` invocations.
+
+    Provider-plugin discovery (list_providers() importing ~40 plugin
+    __init__.py files) costs seconds per CLI start (t_a512082a: measured
+    ~12s) purely to populate OPTIONAL_ENV_VARS for `hermes config`/setup
+    UI. A read-only kanban call never reads OPTIONAL_ENV_VARS, so paying
+    this at import time is pure latency for heartbeat/cron pollers.
+    """
+    try:
+        from hermes_cli.venv_sync import _is_readonly_kanban_call
+        return _is_readonly_kanban_call(sys.argv[1:])
+    except Exception:
+        return False
+
+
+if not _skip_provider_discovery_for_readonly_kanban():
+    _inject_profile_env_vars()
 
 
 def _platform_plugin_manifests():

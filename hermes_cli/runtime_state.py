@@ -35,18 +35,26 @@ LOG = logging.getLogger(__name__)
 INSTALL_LOCK_TIMEOUT_SECONDS = 10.0
 
 @contextmanager
-def runtime_lock(project: Path, *, timeout: float | None = INSTALL_LOCK_TIMEOUT_SECONDS):
+def runtime_lock(project: Path, *, timeout: float | None = INSTALL_LOCK_TIMEOUT_SECONDS,
+                  shared: bool = False):
     """Hold the per-install dependency lock; yields True when held, False when the wait expired.
 
     Callers decide what a lost race means: readers skip the work the lock guards and carry on
     (``activate_dependencies`` still selects and leases the committed generation), writers that
     cannot be skipped pass ``timeout=None`` — an install the user asked for is theirs to wait on.
+
+    ``shared=True`` takes a non-exclusive lock (POSIX only — see ``lock_fd``): every CLI
+    invocation calls this at boot purely to read the committed venv selection, and with
+    several profile gateways/pollers launching concurrently an exclusive lock here
+    serializes all of them behind whichever one got there first (t_a512082a: observed
+    15s-129s variance in `hermes kanban list` under concurrent load, traced to this lock).
+    Only a caller that never mutates install state may pass it.
     """
     state = install_state_dir(project)
     state.mkdir(parents=True, exist_ok=True)
     fd = os.open(state / ".install.lock", os.O_CREAT | os.O_RDWR, 0o600)
     try:
-        if not _lock(fd, wait=True, timeout=timeout):
+        if not _lock(fd, wait=True, timeout=timeout, shared=shared):
             LOG.warning(
                 "dependency lock still held after %ss; continuing without it (%s)",
                 timeout, state / ".install.lock")
