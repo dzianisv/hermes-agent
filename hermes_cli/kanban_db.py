@@ -109,6 +109,13 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 # Same-reason block -> unblock -> re-block cycles before routing to ``triage``.
 # Counts unblock recurrences, NOT dispatcher failures (``DEFAULT_FAILURE_LIMIT``).
 BLOCK_RECURRENCE_LIMIT = 2
+
+# Per-task run budget (issue #4), checked at the claim boundary. Overridable via
+# ``kanban.run_budget.{max_rejections,max_active_hours,max_repeat_holds}``;
+# 0 disables that limit. Counters restart only at a ``run_budget_reset`` event.
+DEFAULT_RUN_BUDGET = {"max_rejections": 3, "max_active_hours": 24, "max_repeat_holds": 5}
+# Run outcomes that hand work back with no progress (same hold repeated).
+_REPEAT_HOLD_OUTCOMES = ("blocked",)
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 
 
@@ -2224,6 +2231,104 @@ def unsatisfied_parents(conn: sqlite3.Connection, task_id: str) -> list[tuple[st
     return [(row["id"], row["status"]) for row in rows]
 
 
+def run_budget_limits() -> dict:
+    """``kanban.run_budget`` from config.yaml merged over :data:`DEFAULT_RUN_BUDGET`."""
+    limits = dict(DEFAULT_RUN_BUDGET)
+    try:
+        from hermes_cli.config import load_config_readonly
+        raw = ((load_config_readonly() or {}).get("kanban") or {}).get("run_budget") or {}
+    except Exception:
+        raw = {}
+    if isinstance(raw, dict):
+        for key in limits:
+            try:
+                if raw.get(key) is not None:
+                    limits[key] = max(0, int(raw[key]))
+            except (TypeError, ValueError):
+                pass
+    return limits
+
+
+def _run_budget_breach(conn: sqlite3.Connection, task_id: str, now: int) -> Optional[dict]:
+    """Return ``{"limit", "value", "threshold"}`` when the task spent its run
+    budget since the last ``run_budget_reset`` event, else None. ``approved``
+    reviewer handoffs are not rejections; unblock/reassign do not reset."""
+    limits = run_budget_limits()
+    reset = conn.execute(
+        "SELECT MAX(id) AS id, MAX(created_at) AS ts FROM task_events "
+        "WHERE task_id = ? AND kind = 'run_budget_reset'", (task_id,),
+    ).fetchone()
+    since = int(reset["ts"]) if reset and reset["ts"] is not None else -1
+    runs = conn.execute(
+        "SELECT outcome, started_at, ended_at FROM task_runs "
+        "WHERE task_id = ? AND ended_at IS NOT NULL AND started_at > ? ORDER BY id",
+        (task_id, since),
+    ).fetchall()
+    rejections = sum(1 for r in runs if r["outcome"] == "changes_requested")
+    if limits["max_rejections"] and rejections >= limits["max_rejections"]:
+        return {"limit": "max_rejections", "value": rejections, "threshold": limits["max_rejections"]}
+    active = sum(max(0, int(r["ended_at"]) - int(r["started_at"] or r["ended_at"])) for r in runs)
+    if limits["max_active_hours"] and active >= limits["max_active_hours"] * 3600:
+        return {"limit": "max_active_hours", "value": round(active / 3600, 1),
+                "threshold": limits["max_active_hours"]}
+    holds = 0
+    for r in reversed(runs):
+        if r["outcome"] not in _REPEAT_HOLD_OUTCOMES:
+            break
+        holds += 1
+    if limits["max_repeat_holds"] and holds >= limits["max_repeat_holds"]:
+        return {"limit": "max_repeat_holds", "value": holds, "threshold": limits["max_repeat_holds"]}
+    return None
+
+
+_RUN_BUDGET_TEXT = {
+    "max_rejections": "{value} changes_requested rejections (limit {threshold})",
+    "max_active_hours": "{value}h of cumulative run time (limit {threshold}h)",
+    "max_repeat_holds": "{value} consecutive runs ended in the same hold with no progress (limit {threshold})",
+}
+
+
+def _park_if_over_budget(
+    conn: sqlite3.Connection, task_id: str, source_status: str, now: int,
+) -> bool:
+    """Inside the claim txn: move ``source_status -> triage`` with a comment
+    and a ``run_budget_exhausted`` event when the budget is spent."""
+    breach = _run_budget_breach(conn, task_id, now)
+    if breach is None:
+        return False
+    cur = conn.execute(
+        "UPDATE tasks SET status = 'triage' WHERE id = ? AND status = ? AND claim_lock IS NULL",
+        (task_id, source_status),
+    )
+    if cur.rowcount != 1:
+        return True
+    _insert_comment(
+        conn, task_id, "kanban",
+        "Run budget exhausted: " + _RUN_BUDGET_TEXT[breach["limit"]].format(**breach)
+        + ". Parked in triage instead of spawning another run. Fix the cause, then "
+        f"`hermes kanban unblock --reset-budget {task_id}` to re-arm.",
+        now,
+    )
+    _append_event(conn, task_id, "run_budget_exhausted", {**breach, "source_status": source_status})
+    return True
+
+
+def reset_run_budget(conn: sqlite3.Connection, task_id: str, *, author: Optional[str] = None) -> bool:
+    """Owner reset: restart the run-budget counters and, when the card is in
+    ``triage``, return it to ``todo`` (parents re-gate it). False if unknown."""
+    now = int(time.time())
+    with write_txn(conn):
+        row = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if row is None:
+            return False
+        _append_event(conn, task_id, "run_budget_reset", {"by": author, "from_status": row["status"]})
+        if row["status"] == "triage":
+            conn.execute("UPDATE tasks SET status = 'todo' WHERE id = ? AND status = 'triage'", (task_id,))
+        if author:
+            _insert_comment(conn, task_id, author, "Run budget reset by owner.", now)
+    return True
+
+
 def _claim_and_open_run(
     conn: sqlite3.Connection, task_id: str, source_status: str, lock: str, expires: int, now: int,
     *, event_extra: Optional[dict] = None,
@@ -2299,6 +2404,8 @@ def claim_task(
         _reclaim_dangling_run(
             conn, task_id, statuses=("ready",), now=now, note="invariant recovery on re-claim",
         )
+        if _park_if_over_budget(conn, task_id, "ready", now):
+            return None
         run_id = _claim_and_open_run(conn, task_id, "ready", lock, expires, now)
         if run_id is None:
             return None
@@ -2328,6 +2435,8 @@ def claim_review_task(
                     conn, task_id, "dependency_wait",
                     {"reason": "parent_reopened", "source_status": "review"},
                 )
+            return None
+        if _park_if_over_budget(conn, task_id, "review", now):
             return None
         run_id = _claim_and_open_run(
             conn, task_id, "review", lock, expires, now, event_extra={"source_status": "review"},

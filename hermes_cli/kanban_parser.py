@@ -374,6 +374,9 @@ _SPECS = [
             "parks from todo/ready/running/blocked/review and resumes into the parked phase"),
     _cmd("unblock", [
         _reason("Optional reason/note — recorded as a comment before unblocking. Quote multi-word reasons."),
+        _arg("--reset-budget", action="store_true",
+             help="Owner reset of the run budget (rejections / active time / repeat holds); "
+                  "also returns a budget-parked triage card to todo. Ordinary unblock never resets it."),
         _TASK_IDS,
     ], help="Return blocked/scheduled tasks to ready, or todo while parents remain open"),
     _cmd("request-review", [
