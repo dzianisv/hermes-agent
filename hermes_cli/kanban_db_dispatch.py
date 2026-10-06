@@ -3060,11 +3060,15 @@ def _design_phase_cfg() -> Optional[dict]:
     }
 
 
-def _brief_has_marker(text: str, marker: str) -> bool:
+def _brief_marker_re(marker: str) -> "re.Pattern[str]":
     # A header line "KEY:" or "KEY (qualifier):" counts; prose mentions do not.
+    # Group 1 is the rest of the header line.
     key = marker.rstrip(":")
-    pattern = rf"^\s*{re.escape(key)}\b[^:\n]{{0,80}}:"
-    return re.search(pattern, text, re.MULTILINE | re.IGNORECASE) is not None
+    return re.compile(rf"^\s*{re.escape(key)}\b[^:\n]{{0,80}}:[ \t]*(.*)", re.MULTILINE | re.IGNORECASE)
+
+
+def _brief_has_marker(text: str, marker: str) -> bool:
+    return _brief_marker_re(marker).search(text) is not None
 
 
 def _design_phase_guard(conn: sqlite3.Connection, task_id: str, assignee: str) -> Optional[str]:
@@ -3097,11 +3101,12 @@ def _design_phase_guard(conn: sqlite3.Connection, task_id: str, assignee: str) -
                 ok = True
                 break
     if not ok:
-        # Any DESIGN: line may carry the link (body, or an EM/architect comment);
-        # the guard's own park note also contains "DESIGN:" and must not mask it.
+        # Any DESIGN header line ("DESIGN:" or "DESIGN (qualifier):") may carry the
+        # link (body, or an EM/architect comment). The guard's own park note says
+        # "DESIGN:" mid-sentence, so it is not a header and cannot mask the check.
         # A link to any Notion page (e.g. the readiness-gaps page) is not a design:
-        # with design_pages configured, the DESIGN: line must name one of them.
-        for v in re.findall(r"DESIGN:[ \t]*(.+)", text):
+        # with design_pages configured, the DESIGN line must name one of them.
+        for v in _brief_marker_re("DESIGN").findall(text):
             ids = set(re.findall(r"[0-9a-f]{32}", v.replace("-", "").lower()))
             if cfg["design_pages"]:
                 ok = bool(ids & cfg["design_pages"])

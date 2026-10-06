@@ -84,3 +84,14 @@ def test_key_mentioned_mid_sentence_does_not_count(conn):
     body = f"{DESIGN_LINE}\nSCOPE: x\nsee acceptance criteria later\nPROOF: z"
     tid = _raw_card(conn, body)
     assert disp._design_phase_guard(conn, tid, "software-engineer") == "brief_incomplete"
+
+
+def test_qualified_design_header_with_design_page_passes(conn):
+    tid = _card(conn, f"DESIGN (v7.2 §16): https://www.notion.so/{DESIGN_PAGE}")
+    assert disp._design_phase_guard(conn, tid, "software-engineer") is None
+
+
+def test_qualified_design_header_with_non_design_page_is_parked(conn):
+    tid = _card(conn, f"DESIGN (v7.2 §16): https://www.notion.so/{GAPS_PAGE}")
+    assert disp._design_phase_guard(conn, tid, "software-engineer") == "design_phase_missing"
+    assert kb.get_task(conn, tid).assignee == "architect-critic-fable"
