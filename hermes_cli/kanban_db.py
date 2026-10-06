@@ -905,10 +905,14 @@ CREATE TABLE IF NOT EXISTS tasks (
     worker_pid           INTEGER,
     -- Restart-stable fingerprint of worker_pid ("<boot/instantiation epoch>|<start time>",
     -- kanban_db_dispatch._process_fingerprint) recorded at spawn: liveness and kills require pid
-    -- AND fingerprint to agree, so a PID recycled after a reboot is never read as our worker or
-    -- signalled. NULL = legacy row (pre-fingerprint spawn); 'unverified' = capture failed at
-    -- spawn (held while live, never signalled). Column keeps its INTEGER affinity for the
-    -- start-time-only integer values older rows carry.
+    -- AND fingerprint to agree (epoch equal; start time within
+    -- kanban_db_dispatch.WORKER_START_TIME_TOLERANCE_CS = 500 cs — macOS readings drift ~1s, #117505,
+    -- so exact string equality is not the check; the gateway's START_TIME_DRIFT_TOLERANCE (200) is
+    -- not the worker tolerance). Beyond it, the argv witness `work kanban task <id>` still proves the
+    -- worker; an unreadable argv is held (never released, never signalled). A PID recycled after a
+    -- reboot is never read as our worker or signalled. NULL = legacy row (pre-fingerprint spawn);
+    -- 'unverified' = capture failed at spawn (held while live, never signalled). Column keeps its
+    -- INTEGER affinity for the start-time-only integer values older rows carry.
     worker_started_at    INTEGER,
     -- Short excerpt of the most recent failure's error text.
     last_failure_error   TEXT,
@@ -2465,13 +2469,14 @@ def release_stale_claims(
         # observable progress — reclaim even if the PID is alive (logic loop).
         heartbeat_stale = hb is not None and (now - int(hb)) > DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS
         started_at = _row_get(row, "worker_started_at")
-        if (host_local and row["worker_pid"] and _worker_alive(row["worker_pid"], started_at)
+        if (host_local and row["worker_pid"] and _worker_alive(row["worker_pid"], started_at, row["id"])
                 and not heartbeat_stale):
             _extend_live_stale_claim(conn, row, now)
             continue
 
         termination = _terminate_reclaimed_worker(
             row["worker_pid"], row["claim_lock"], signal_fn=signal_fn, started_at=started_at,
+            task_id=row["id"],
         )
         # A live worker of ours must keep its claim (else a duplicate spawns beside it).
         if _worker_survived_termination(termination):
@@ -2583,7 +2588,16 @@ def reclaim_task(
         return False
     prev_lock = row["claim_lock"]
     termination = _terminate_reclaimed_worker(
-        row["worker_pid"], prev_lock, signal_fn=signal_fn, started_at=row["worker_started_at"])
+        row["worker_pid"], prev_lock, signal_fn=signal_fn, started_at=row["worker_started_at"],
+        task_id=task_id,
+    )
+    # Same guard as the TTL path: a host-local worker that may still be ours keeps its claim, or a
+    # duplicate spawns beside it.
+    if _worker_survived_termination(termination):
+        _log.warning("kanban: manual reclaim of task %s refused: worker pid %s is still alive "
+                     "(identity unconfirmed or termination failed); claim kept",
+                     task_id, row["worker_pid"])
+        return False
     with write_txn(conn):
         retry_status = _retry_status_for_run(conn, task_id)
         cur = conn.execute(
@@ -2729,7 +2743,7 @@ def _claim_is_live(trow) -> bool:
         trow["status"] == "running"
         and trow["claim_lock"] is not None
         and trow["worker_pid"]
-        and _worker_alive(trow["worker_pid"], trow["worker_started_at"])
+        and _worker_alive(trow["worker_pid"], trow["worker_started_at"], trow["id"])
     )
 
 
@@ -2778,7 +2792,7 @@ def complete_task(
         if acceptance is not None and not record_acceptance(conn, task_id, acceptance):
             return False
         trow = conn.execute(
-            "SELECT status, claim_lock, worker_pid, worker_started_at FROM tasks WHERE id = ?",
+            "SELECT id, status, claim_lock, worker_pid, worker_started_at FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         prior_status = trow["status"] if trow else None
@@ -3398,7 +3412,7 @@ def request_review(
             if not _parents_satisfied(conn, task_id):
                 return _ret(False, "parent dependencies are not satisfied")
             trow = conn.execute(
-                "SELECT assignee, status, claim_lock, current_run_id, worker_pid, "
+                "SELECT id, assignee, status, claim_lock, current_run_id, worker_pid, "
                 "worker_started_at FROM tasks WHERE id = ?", (task_id,),
             ).fetchone()
             if trow is None:
@@ -3875,8 +3889,8 @@ def reopen_done_task(
              f"Reopened from '{prior}' to '{new_status}' for rework" + (f": {reason}" if reason else "."),
              now),
         )
-    for pid, claim_lock, started_at in descendants["terminations"]:
-        _terminate_reclaimed_worker(pid, claim_lock, started_at=started_at)
+    for pid, claim_lock, started_at, term_task_id in descendants["terminations"]:
+        _terminate_reclaimed_worker(pid, claim_lock, started_at=started_at, task_id=term_task_id)
     recompute_ready(conn)
     return True, new_status
 
@@ -3898,12 +3912,13 @@ def invalidate_descendants_for_parent_reopen(
     action), the opposite of :func:`reopen_review_task`.
 
     Returns ``{"invalidated": [{id, prior_status, new_status, resume_status}],
-    "terminations": [(worker_pid, claim_lock, worker_started_at)]}``.
+    "terminations": [(worker_pid, claim_lock, worker_started_at, task_id)]}`` — the task id lets
+    the termination prove a drifted worker by its argv token.
     """
     caller_owns_txn = bool(conn.in_transaction)
     now = int(time.time())
     invalidated: list[dict[str, Any]] = []
-    terminations: list[tuple[Optional[int], Optional[str], Optional[int]]] = []
+    terminations: list[tuple[Optional[int], Optional[str], Any, str]] = []
     with write_txn(conn, allow_nested=True):
         rows = conn.execute(
             """
@@ -3931,7 +3946,8 @@ def invalidate_descendants_for_parent_reopen(
                 resume_status = "review"
             elif previous_status == "running":
                 resume_status = _retry_status_for_run(conn, row["id"], row["current_run_id"])
-                terminations.append((row["worker_pid"], row["claim_lock"], row["worker_started_at"]))
+                terminations.append(
+                    (row["worker_pid"], row["claim_lock"], row["worker_started_at"], row["id"]))
                 run_id = _end_run(
                     conn, row["id"], outcome="reclaimed", status="todo",
                     summary=f"ancestor {task_id} reopened",
@@ -3971,8 +3987,8 @@ def invalidate_descendants_for_parent_reopen(
     if not caller_owns_txn:
         # Standalone: committed above, audit trail durable, safe to kill now.
         # Composed calls leave this to the caller post-commit.
-        for pid, claim_lock, started_at in terminations:
-            _terminate_reclaimed_worker(pid, claim_lock, started_at=started_at)
+        for pid, claim_lock, started_at, term_task_id in terminations:
+            _terminate_reclaimed_worker(pid, claim_lock, started_at=started_at, task_id=term_task_id)
     return {"invalidated": invalidated, "terminations": terminations}
 
 
@@ -4079,7 +4095,8 @@ def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> b
         )
         _append_event(conn, task_id, "archived", None, run_id=run_id)
     if was_running:
-        termination = _terminate_reclaimed_worker(prev_pid, prev_lock, signal_fn=signal_fn, started_at=prev_started)
+        termination = _terminate_reclaimed_worker(
+            prev_pid, prev_lock, signal_fn=signal_fn, started_at=prev_started, task_id=task_id)
         with write_txn(conn):
             _append_event(conn, task_id, "archive_worker_termination", termination, run_id=run_id)
     # ``archived`` parents no longer block children; promote them now.
