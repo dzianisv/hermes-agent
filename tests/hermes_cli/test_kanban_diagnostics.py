@@ -221,3 +221,57 @@ def test_severity_at_or_above_uses_threshold_semantics():
     assert kd.severity_at_or_above("error", "critical") is False
     assert kd.severity_at_or_above("mystery", "warning") is False
     assert kd.severity_at_or_above("warning", None) is True
+
+
+# ---------------------------------------------------------------------------
+# repeated_failures after a handoff cleared last_failure_error
+#
+# request_review / request_changes clear the task-scoped error text but keep
+# consecutive_failures; the diagnostic must fall back (read-only) to the run
+# history instead of claiming no error was recorded.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("status", ["review", "ready"])
+def test_repeated_failures_falls_back_to_run_history_error(kanban_home, status):
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="streak", assignee="worker")
+        assert kb.claim_task(conn, tid) is not None
+        with kb.write_txn(conn):
+            kb._end_run(conn, tid, outcome="crashed", status="crashed", error="401 auth failed")
+            conn.execute(
+                "UPDATE tasks SET status = ?, claim_lock = NULL, consecutive_failures = 5, "
+                "last_failure_error = NULL WHERE id = ?", (status, tid),
+            )
+        row = conn.execute("SELECT * FROM tasks WHERE id = ?", (tid,)).fetchone()
+        runs = list(conn.execute(
+            "SELECT * FROM task_runs WHERE task_id = ? ORDER BY id", (tid,),
+        ).fetchall())
+        run_id = runs[-1]["id"]
+        diags = [d for d in kd.compute_task_diagnostics(row, [], runs) if d.kind == "repeated_failures"]
+        assert len(diags) == 1
+        diag = diags[0]
+        assert "(no error recorded)" not in diag.title
+        assert f"(historical, run {run_id})" in diag.title
+        assert "401 auth failed" in diag.title and "401 auth failed" in diag.detail
+        assert "run history" in diag.detail
+        assert diag.data["last_error"] is None
+        assert diag.data["historical_error"] == "401 auth failed"
+        # Read-only: neither the error text nor the streak is written back.
+        after = conn.execute(
+            "SELECT last_failure_error, consecutive_failures FROM tasks WHERE id = ?", (tid,),
+        ).fetchone()
+        assert after["last_failure_error"] is None
+        assert after["consecutive_failures"] == 5
+    finally:
+        conn.close()
+
+
+def test_repeated_failures_prefers_task_error_over_history():
+    task = _task(consecutive_failures=5, last_failure_error="current boom")
+    runs = [_run("crashed", run_id=1, error="old boom")]
+    diags = kd._rule_repeated_failures(task, [], runs, int(time.time()), {"failure_threshold": 3})
+    assert len(diags) == 1
+    assert "current boom" in diags[0].title and "historical" not in diags[0].title
+    assert diags[0].data["historical_error"] is None

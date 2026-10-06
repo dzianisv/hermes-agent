@@ -3451,7 +3451,8 @@ def request_review(
                        current_step_key = 'review',
                        claim_lock    = NULL,
                        claim_expires = NULL,
-                       worker_pid    = NULL
+                       worker_pid    = NULL,
+                       last_failure_error = NULL
                 """ + assignee_sql + """
                  WHERE id = ?
                    AND status IN ('running', 'ready')
@@ -3545,6 +3546,8 @@ def request_changes(
         new_status = _landing_status_after_parents(conn, task_id)
         # consecutive_failures deliberately PRESERVED: a review transition is
         # not evidence the pathology cleared; only complete_task resets it.
+        # last_failure_error IS cleared: it is task-scoped text from an earlier
+        # run and would otherwise read as a current blocker after the handoff.
         cur = conn.execute(
             """
             UPDATE tasks
@@ -3553,7 +3556,8 @@ def request_changes(
                    current_step_key = 'development',
                    claim_lock = NULL,
                    claim_expires = NULL,
-                   worker_pid = NULL, worker_started_at = NULL
+                   worker_pid = NULL, worker_started_at = NULL,
+                   last_failure_error = NULL
              WHERE id = ? AND status = 'running' AND current_run_id = ?
             """,
             (new_status, implementer, task_id, int(current_run_id)),

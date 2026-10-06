@@ -71,6 +71,14 @@ _RESPAWN_BLOCKER_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Latest-run outcomes whose ``last_failure_error`` is a diagnosis the
+# ``_RESPAWN_BLOCKER_RE`` check may trust. ``crashed`` carries captured worker
+# stdout (context, not a diagnosis); ``reclaimed`` is a stale-lock diagnostic;
+# ``rate_limited`` has its own earlier cooldown path; handoff outcomes
+# (``review_requested``, ``changes_requested``, ``approved``, ...) are not
+# failures, so the task-scoped text they inherit is stale.
+_BLOCKER_DIAGNOSTIC_OUTCOMES = frozenset({"timed_out", "spawn_failed", "gave_up"})
+
 # Within this window a completed run counts as "recent proof"; don't re-spawn.
 _RESPAWN_GUARD_SUCCESS_WINDOW = 3600  # 1 hour
 
@@ -2127,7 +2135,9 @@ def check_respawn_guard(
     checked BEFORE ``blocker_auth`` because the requeue stamps a quota-flavored
     ``last_failure_error`` that would otherwise park the task forever — that
     path never increments ``consecutive_failures``), ``"blocker_auth"``
-    (quota/auth pattern; the breaker still trips eventually), then for the
+    (quota/auth pattern, trusted only when no run has ended or the latest
+    ended run's outcome is in ``_BLOCKER_DIAGNOSTIC_OUTCOMES``; the breaker
+    still trips eventually), then for the
     ready lane only ``"recent_success"`` (completed run within the window, unless
     a re-queue event arrived after it — a deliberate re-run) and ``"active_pr"``
     (PR URL in a recent comment; re-spawning risks a duplicate PR — unless a
@@ -2176,13 +2186,17 @@ def check_respawn_guard(
         # (spaced by the cooldown) until quota returns or a real run supersedes it.
         return None
 
-    # 2. Quota / auth blocker: retrying immediately will not help.  A plain
-    # crash is different: its persisted error includes the worker's last
-    # captured output, which is context rather than a diagnosis and may contain
-    # benign commands such as ``claude auth status`` (#117097).
+    # 2. Quota / auth blocker: retrying immediately will not help.  Scoped to
+    # a latest run that stamped a diagnosis: a crash's persisted error is the
+    # worker's captured output (may contain ``claude auth status``, #117097),
+    # and after a handoff the column is stale text from an earlier run.
     err = _kb._lossy_text(row["last_failure_error"])
     latest_outcome = latest_run["outcome"] if latest_run is not None else None
-    if err and latest_outcome != "crashed" and _RESPAWN_BLOCKER_RE.search(err):
+    if (
+        err
+        and (latest_run is None or latest_outcome in _BLOCKER_DIAGNOSTIC_OUTCOMES)
+        and _RESPAWN_BLOCKER_RE.search(err)
+    ):
         return "blocker_auth"
 
     # Review-lane spawns stop here: a recent completed run and a fresh PR URL
