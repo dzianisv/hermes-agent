@@ -115,7 +115,7 @@ def decompose_triage_task(
     now = int(time.time())
     with write_txn(conn):
         root_row = conn.execute(
-            "SELECT id, status, tenant, workspace_kind, workspace_path "
+            "SELECT id, status, tenant, workspace_kind, workspace_path, project_id "
             "FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if root_row is None or root_row["status"] != "triage":
@@ -182,7 +182,22 @@ def _insert_decomposed_child(
     """
     from hermes_cli.kanban_db import (
         _new_task_id, _canonical_assignee, _append_event,
+        check_outcome_key, _open_task_for_outcome_key, _fold_into_outcome_key,
     )
+
+    # Same outcome_key rule as create_task (policy + one OPEN task per
+    # (project, key)); the partial UNIQUE index backstops any race. A keyed
+    # child is scoped to the root's project so it cannot dodge a board-level key.
+    outcome_key = check_outcome_key(child.get("outcome_key"))
+    child_project = root_row["project_id"] if outcome_key else None
+    if outcome_key:
+        existing = _open_task_for_outcome_key(conn, child_project, outcome_key)
+        if existing:
+            _fold_into_outcome_key(
+                conn, existing, title=child["title"], body=child.get("body"),
+                author=author or "decomposer", outcome_key=outcome_key, now=now,
+            )
+            return existing
 
     root_ws_kind = root_row["workspace_kind"] or "scratch"
     child_ws_kind = child.get("workspace_kind") or root_ws_kind
@@ -199,12 +214,12 @@ def _insert_decomposed_child(
     conn.execute(
         "INSERT INTO tasks "
         "(id, title, body, assignee, status, workspace_kind, "
-        " workspace_path, tenant, created_at, created_by) "
-        "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?)",
+        " workspace_path, tenant, created_at, created_by, outcome_key, project_id) "
+        "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?, ?)",
         (
             new_id, child["title"].strip(), body if isinstance(body, str) else None,
             _canonical_assignee(child.get("assignee")), child_ws_kind, child_ws_path,
-            root_row["tenant"], now, (author or "decomposer"),
+            root_row["tenant"], now, (author or "decomposer"), outcome_key, child_project,
         ),
     )
     _append_event(

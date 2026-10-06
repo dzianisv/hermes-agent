@@ -194,6 +194,10 @@ _SPECS = [
         _arg("--idempotency-key",
              help="Dedup key. If a non-archived task with this key exists, "
                   "its id is returned instead of creating a duplicate."),
+        _arg("--outcome-key",
+             help="Outcome identity (e.g. G3). At most one OPEN task per "
+                  "(project, key): a duplicate create comments on the existing "
+                  "task and returns it. Required when kanban.require_outcome_key=true."),
         _arg("--max-runtime",
              help="Per-task runtime cap. Accepts seconds (300) or durations (90s, "
                   "30m, 2h, 1d). When exceeded, the dispatcher SIGTERMs (then "

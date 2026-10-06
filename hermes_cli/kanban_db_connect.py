@@ -797,6 +797,9 @@ _EARLY_TASK_COLUMNS = (
     ("idempotency_key", "idempotency_key TEXT"),
 )
 
+# Release-blocker / outcome identity: at most ONE open task per (project, key).
+_OUTCOME_KEY_COLUMN = ("outcome_key", "outcome_key TEXT")
+
 # (new column, ddl, legacy source column, copy statement) — see the
 # RENAME-avoidance note in ``_migrate_add_optional_columns``.
 _RENAMED_TASK_COLUMNS = (
@@ -904,6 +907,17 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_tenant ON tasks(tenant)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_idempotency ON tasks(idempotency_key)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_session_id ON tasks(session_id)")
+    if _OUTCOME_KEY_COLUMN[0] not in _column_names(conn, "tasks"):
+        _add_column_if_missing(conn, "tasks", *_OUTCOME_KEY_COLUMN)
+    # COALESCE: SQLite treats NULLs as distinct in UNIQUE indexes, so a NULL
+    # project would never conflict. Closed statuses free the key.
+    from hermes_cli.kanban_db import OUTCOME_KEY_CLOSED_STATUSES as _closed
+    _closed_sql = ", ".join(f"'{s}'" for s in sorted(_closed))
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_tasks_open_outcome_key "
+        "ON tasks(COALESCE(project_id, ''), outcome_key) "
+        f"WHERE outcome_key IS NOT NULL AND status NOT IN ({_closed_sql})"
+    )
 
     # task_events.run_id back-fills as NULL for historical events (they predate
     # runs and can't be attributed).
