@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import os
 import subprocess
+import threading
 import time
 from pathlib import Path
 
@@ -432,3 +433,113 @@ def test_describe_suppression_keeps_most_severe_pressure(order):
     assert kbd.describe_suppression(disk) == "disk_pressure=critical"
     mem = [kbd.DispatchResult(memory_pressure=lvl) for lvl in order]
     assert kbd.describe_suppression(mem) == "memory_pressure=critical"
+
+
+# ---------------------------------------------------------------------------
+# Bounded filesystem probes
+# ---------------------------------------------------------------------------
+
+
+def _alive_probe_threads():
+    return [t for t in threading.enumerate() if t.name == "kanban-disk-probe" and t.is_alive()]
+
+
+def _quiet_swap_used(monkeypatch):
+    monkeypatch.setattr(
+        kbd.subprocess, "run", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 1, stdout=""),
+    )
+    monkeypatch.setattr("gateway.lifecycle_ledger.sample_memory", lambda: {})
+
+
+def _assert_stall_degrades_then_recovers(monkeypatch, release):
+    monkeypatch.setattr(kbd, "DISK_GUARD_PROBE_TIMEOUT_SECONDS", 0.2)
+    start = time.monotonic()
+    sample = kbd._disk_sample()
+    assert sample == {}
+    assert time.monotonic() - start < 1.0
+    assert kbd._disk_pressure_level(sample) == "unknown"
+
+    start = time.monotonic()
+    assert kbd._disk_sample() == {}
+    assert time.monotonic() - start < 1.0
+    assert len(_alive_probe_threads()) == 1
+
+    release.set()
+    for t in _alive_probe_threads():
+        t.join(5)
+    assert not _alive_probe_threads()
+    assert "free_bytes" in kbd._disk_sample()
+
+
+@pytest.mark.real_disk_guard
+def test_stalled_free_probe_degrades_to_unknown(kanban_home, tmp_path, monkeypatch):
+    monkeypatch.setattr(kbd, "_SWAP_DIR", tmp_path / "absent")
+    _quiet_swap_used(monkeypatch)
+    release = threading.Event()
+
+    def blocking_usage(path):
+        release.wait(10)
+        return _Usage(100 * GIB)
+
+    monkeypatch.setattr(kbd.shutil, "disk_usage", blocking_usage)
+    try:
+        _assert_stall_degrades_then_recovers(monkeypatch, release)
+    finally:
+        release.set()
+
+
+@pytest.mark.real_disk_guard
+def test_stalled_swap_listing_degrades_to_unknown(kanban_home, tmp_path, monkeypatch):
+    monkeypatch.setattr(kbd, "_SWAP_DIR", tmp_path)
+    _quiet_swap_used(monkeypatch)
+    monkeypatch.setattr(kbd.shutil, "disk_usage", lambda p: _Usage(100 * GIB))
+    release = threading.Event()
+    real_scandir = os.scandir
+
+    def blocking_scandir(path):
+        release.wait(10)
+        return real_scandir(path)
+
+    monkeypatch.setattr(kbd.os, "scandir", blocking_scandir)
+    try:
+        _assert_stall_degrades_then_recovers(monkeypatch, release)
+    finally:
+        release.set()
+
+
+@pytest.mark.real_disk_guard
+def test_dispatch_with_stalled_probe_does_not_hang(
+    kanban_home, all_assignees_spawnable, tmp_path, monkeypatch,
+):
+    """A stalled mount must not block the serial dispatcher tick: the guard
+    reads "unknown" and imposes no restriction."""
+    monkeypatch.setattr(kbd, "DISK_GUARD_PROBE_TIMEOUT_SECONDS", 0.2)
+    monkeypatch.setattr(kbd, "_SWAP_DIR", tmp_path / "absent")
+    _quiet_swap_used(monkeypatch)
+    release = threading.Event()
+
+    def blocking_usage(path):
+        release.wait(10)
+        return _Usage(FLOOR // 2)
+
+    monkeypatch.setattr(kbd.shutil, "disk_usage", blocking_usage)
+    spawns = []
+
+    def fake_spawn(task, workspace, board=None):
+        spawns.append(task.id)
+        return 42
+
+    try:
+        with kbc.connect() as conn:
+            for t in ("a", "b", "c"):
+                kb.create_task(conn, title=t, assignee="alice")
+            start = time.monotonic()
+            res = kbd.dispatch_once(conn, spawn_fn=fake_spawn)
+            elapsed = time.monotonic() - start
+        assert elapsed < 2.0
+        assert len(spawns) == 3
+        assert res.disk_pressure is None
+    finally:
+        release.set()
+        for t in _alive_probe_threads():
+            t.join(5)

@@ -8,6 +8,7 @@ late-bound via ``_kb`` (import-cycle breaking) so monkeypatching
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import json
 import math
 import os
@@ -18,6 +19,7 @@ import sqlite3
 import stat as _stat
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from dataclasses import field
@@ -2715,6 +2717,15 @@ DISK_GUARD_FRESH_SWAP_SECONDS = 3600
 _GIB_BYTES = 1024 ** 3
 _SWAPUSAGE_USED_RE = re.compile(r"used\s*=\s*([0-9]+(?:\.[0-9]+)?)\s*([KMG])", re.IGNORECASE)
 _SWAPUSAGE_UNITS = {"K": 1024, "M": 1024 ** 2, "G": 1024 ** 3}
+DISK_GUARD_PROBE_TIMEOUT_SECONDS = 2.0
+
+# Last filesystem-probe thread. Python cannot kill a thread stuck in a kernel
+# call (and a subprocess in D-state is just as unkillable), so a stalled probe
+# is abandoned rather than killed; while it is still alive no new probe starts,
+# bounding abandoned threads to one. In-process probes also keep the
+# monkeypatch-based tests meaningful.
+_disk_probe_lock = threading.Lock()
+_disk_probe_thread: Optional[threading.Thread] = None
 
 
 def _disk_free_bytes(board: Optional[str] = None) -> Optional[int]:
@@ -2805,10 +2816,37 @@ def _disk_sample(board: Optional[str] = None) -> dict:
     modified in the last hour) and, when known, ``swap_used_bytes``. A failed
     swapfile probe yields ``swap_probe_failed: True`` and no quantum.
     """
-    free = _disk_free_bytes(board)
+    global _disk_probe_thread
+    holder: dict = {}
+
+    def _probe() -> None:
+        holder["free"] = _disk_free_bytes(board)
+        if holder["free"] is not None:
+            holder["files"] = _swapfiles()
+        holder["done"] = True
+
+    with _disk_probe_lock:
+        previous = _disk_probe_thread
+        if previous is not None and previous.is_alive():
+            _kb._log.debug("kanban disk guard: previous filesystem probe still stalled; disk pressure unknown")
+            return {}
+        # Run under the caller's contextvars so profile-scoped HERMES_HOME holds.
+        ctx = contextvars.copy_context()
+        thread = threading.Thread(target=ctx.run, args=(_probe,), name="kanban-disk-probe", daemon=True)
+        _disk_probe_thread = thread
+        thread.start()
+    thread.join(DISK_GUARD_PROBE_TIMEOUT_SECONDS)
+    if thread.is_alive() or not holder.get("done"):
+        if thread.is_alive():
+            _kb._log.warning(
+                "kanban disk guard: filesystem probe exceeded %.1fs; disk pressure unknown",
+                DISK_GUARD_PROBE_TIMEOUT_SECONDS,
+            )
+        return {}
+    free = holder["free"]
     if free is None:
         return {}
-    files = _swapfiles()
+    files = holder["files"]
     sample: dict = {"free_bytes": free}
     if files is None:
         sample["swap_probe_failed"] = True
