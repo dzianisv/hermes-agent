@@ -15,6 +15,7 @@ import re
 import shutil
 import signal
 import sqlite3
+import stat as _stat
 import subprocess
 import sys
 import time
@@ -346,6 +347,18 @@ class DispatchResult:
     Reclaim/promotion bookkeeping still ran; deferred tasks stay queued."""
 
 
+_PRESSURE_SEVERITY = {"critical": 2, "elevated": 1}
+
+
+def _most_severe_pressure(current: Optional[str], new: Optional[str]) -> Optional[str]:
+    """Keep the worse of two pressure levels (critical > elevated > other)."""
+    if not new:
+        return current
+    if not current:
+        return new
+    return new if _PRESSURE_SEVERITY.get(new, 0) > _PRESSURE_SEVERITY.get(current, 0) else current
+
+
 def describe_suppression(results: Iterable[Optional["DispatchResult"]]) -> str:
     """One line naming why the tick(s) held ready work back, or ``""``.
 
@@ -368,10 +381,8 @@ def describe_suppression(results: Iterable[Optional["DispatchResult"]]) -> str:
             counts["rate_limited"] = counts.get("rate_limited", 0) + len(res.rate_limited)
         if res.skipped_locked:
             counts["skipped_locked"] = counts.get("skipped_locked", 0) + 1
-        if res.memory_pressure:
-            pressure = res.memory_pressure
-        if res.disk_pressure:
-            disk_pressure = res.disk_pressure
+        pressure = _most_severe_pressure(pressure, res.memory_pressure)
+        disk_pressure = _most_severe_pressure(disk_pressure, res.disk_pressure)
     parts = [f"{k}={v}" for k, v in sorted(counts.items())]
     if pressure:
         parts.append(f"memory_pressure={pressure}")
@@ -2727,11 +2738,26 @@ def _swapfiles() -> Optional[list[os.stat_result]]:
     """Stats of ``swapfile*`` in the swap dir; ``[]`` when there are none (Linux,
     zero quantum), ``None`` when the probe itself failed (unreadable dir/file) —
     a failed probe must not masquerade as "no swap"."""
+    # os.scandir, not Path.glob: glob swallows PermissionError and returns
+    # nothing, which would turn an unreadable dir into a zero quantum.
     try:
-        return [p.stat() for p in _SWAP_DIR.glob("swapfile*") if p.is_file()]
+        with os.scandir(_SWAP_DIR) as entries:
+            names = [e.name for e in entries if e.name.startswith("swapfile")]
+    except FileNotFoundError:
+        return []
     except Exception:
         _kb._log.debug("kanban disk guard: swapfile probe of %s failed", _SWAP_DIR, exc_info=True)
         return None
+    stats: list[os.stat_result] = []
+    try:
+        for name in names:
+            st = (_SWAP_DIR / name).stat()
+            if _stat.S_ISREG(st.st_mode):
+                stats.append(st)
+    except Exception:
+        _kb._log.debug("kanban disk guard: swapfile probe of %s failed", _SWAP_DIR, exc_info=True)
+        return None
+    return stats
 
 
 def _sysctl_swap_used_bytes() -> Optional[int]:
@@ -2748,7 +2774,13 @@ def _sysctl_swap_used_bytes() -> Optional[int]:
     match = _SWAPUSAGE_USED_RE.search(proc.stdout or "")
     if not match:
         return None
-    return int(float(match.group(1)) * _SWAPUSAGE_UNITS[match.group(2).upper()])
+    try:
+        used = float(match.group(1)) * _SWAPUSAGE_UNITS[match.group(2).upper()]
+        if not math.isfinite(used) or used < 0:
+            return None
+        return int(used)
+    except (ValueError, OverflowError, KeyError):
+        return None
 
 
 def _meminfo_swap_used_bytes() -> Optional[int]:

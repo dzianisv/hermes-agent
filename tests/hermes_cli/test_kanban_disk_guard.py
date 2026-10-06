@@ -316,12 +316,12 @@ def test_disk_sample_swap_probe_failure_fails_open(
 
 
 @pytest.mark.real_disk_guard
-def test_swap_glob_failure_is_probe_failure_not_absent(tmp_path, monkeypatch):
-    def boom(self, pattern):
-        raise OSError("glob failed")
+def test_swap_listing_failure_is_probe_failure_not_absent(tmp_path, monkeypatch):
+    def boom(path):
+        raise PermissionError("listing failed")
 
     monkeypatch.setattr(kbd, "_SWAP_DIR", tmp_path)
-    monkeypatch.setattr(Path, "glob", boom)
+    monkeypatch.setattr(kbd.os, "scandir", boom)
     assert kbd._swapfiles() is None
     monkeypatch.undo()
     monkeypatch.setattr(kbd, "_SWAP_DIR", tmp_path / "absent")
@@ -370,3 +370,65 @@ def test_disk_sample_and_dispatch_gate_on_the_named_board(
         res = kbd.dispatch_once(conn, spawn_fn=fake_spawn, board="b")
     assert not spawns
     assert res.disk_pressure == "critical"
+
+
+@pytest.mark.real_disk_guard
+def test_unreadable_swap_dir_is_probe_failure(kanban_home, tmp_path, monkeypatch):
+    """A real chmod-000 swap dir must fail the probe, not read as zero quantum."""
+    swap_dir = tmp_path / "vm"
+    swap_dir.mkdir()
+    with open(swap_dir / "swapfile0", "wb") as fh:
+        fh.truncate(GIB)
+    monkeypatch.setattr(kbd, "_SWAP_DIR", swap_dir)
+    monkeypatch.setattr(
+        kbd.subprocess, "run", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 1, stdout=""),
+    )
+    monkeypatch.setattr("gateway.lifecycle_ledger.sample_memory", lambda: {})
+    os.chmod(swap_dir, 0)
+    try:
+        try:
+            with os.scandir(swap_dir):
+                readable = True
+        except PermissionError:
+            readable = False
+        if readable:
+            pytest.skip("chmod 000 does not block listing here (root?)")
+        assert kbd._swapfiles() is None
+        sample = kbd._disk_sample()
+        assert sample["swap_probe_failed"] is True
+        assert "quantum_bytes" not in sample
+    finally:
+        os.chmod(swap_dir, 0o755)
+
+
+@pytest.mark.real_disk_guard
+def test_absent_swap_dir_is_zero_quantum(kanban_home, tmp_path, monkeypatch):
+    monkeypatch.setattr(kbd, "_SWAP_DIR", tmp_path / "absent")
+    monkeypatch.setattr(
+        kbd.subprocess, "run", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 1, stdout=""),
+    )
+    monkeypatch.setattr("gateway.lifecycle_ledger.sample_memory", lambda: {})
+    assert kbd._swapfiles() == []
+    sample = kbd._disk_sample()
+    assert sample["quantum_bytes"] == 0
+    assert "swap_probe_failed" not in sample
+
+
+@pytest.mark.real_disk_guard
+def test_sysctl_overflowing_used_value_is_rejected(kanban_home, tmp_path, monkeypatch):
+    out = "total = 1.00M  used = " + "9" * 400 + "M  free = 1.00M"
+    monkeypatch.setattr(
+        kbd.subprocess, "run", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, stdout=out),
+    )
+    monkeypatch.setattr(kbd, "_SWAP_DIR", tmp_path / "absent")
+    monkeypatch.setattr("gateway.lifecycle_ledger.sample_memory", lambda: {})
+    assert kbd._sysctl_swap_used_bytes() is None
+    assert "swap_used_bytes" not in kbd._disk_sample()
+
+
+@pytest.mark.parametrize("order", [("critical", "elevated"), ("elevated", "critical")])
+def test_describe_suppression_keeps_most_severe_pressure(order):
+    disk = [kbd.DispatchResult(disk_pressure=lvl) for lvl in order]
+    assert kbd.describe_suppression(disk) == "disk_pressure=critical"
+    mem = [kbd.DispatchResult(memory_pressure=lvl) for lvl in order]
+    assert kbd.describe_suppression(mem) == "memory_pressure=critical"
