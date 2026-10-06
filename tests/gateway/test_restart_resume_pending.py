@@ -925,7 +925,7 @@ async def test_warmup_disabled_by_nonpositive_timeout(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_restart_notifies_home_channel_even_without_active_sessions():
+async def test_restart_skips_home_channel_without_in_flight_work(monkeypatch, caplog):
     runner, adapter = make_restart_runner()
     runner._restart_requested = True
     runner.config.platforms[Platform.TELEGRAM].home_channel = HomeChannel(
@@ -933,11 +933,43 @@ async def test_restart_notifies_home_channel_even_without_active_sessions():
         chat_id="home-42",
         name="Ops Home",
     )
+    monkeypatch.setattr(runner, "_active_cron_job_count", lambda: 0)
+    monkeypatch.setattr(runner, "_active_api_run_count", lambda: 0)
+
+    with caplog.at_level("INFO"):
+        await runner._notify_active_sessions_of_shutdown()
+
+    assert adapter.sent == []
+    assert "skipped: no in-flight work" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_restart_notifies_home_channel_with_in_flight_work(monkeypatch):
+    runner, adapter = make_restart_runner()
+    runner._restart_requested = True
+    session_key = "agent:main:telegram:dm:777"
+    runner.session_store._entries[session_key] = MagicMock(
+        origin=SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="777",
+            chat_type="dm",
+            user_id="u1",
+        )
+    )
+    runner._running_agents[session_key] = MagicMock()
+    runner.config.platforms[Platform.TELEGRAM].home_channel = HomeChannel(
+        platform=Platform.TELEGRAM,
+        chat_id="home-42",
+        name="Ops Home",
+    )
+    monkeypatch.setattr(runner, "_active_cron_job_count", lambda: 0)
+    monkeypatch.setattr(runner, "_active_api_run_count", lambda: 0)
 
     await runner._notify_active_sessions_of_shutdown()
 
-    assert len(adapter.sent) == 1
-    assert "restarting" in adapter.sent[0] and "Send any message" in adapter.sent[0]
+    home_msgs = [content for chat_id, content, _ in adapter.sent_calls if chat_id == "home-42"]
+    assert len(home_msgs) == 1
+    assert "restarting" in home_msgs[0] and "Send any message" in home_msgs[0]
 
 
 @pytest.mark.asyncio
