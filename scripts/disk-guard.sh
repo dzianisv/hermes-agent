@@ -687,6 +687,7 @@ user_tmp_root() { printf '%s' "${TMPDIR:-/tmp}" | sed 's:/$::'; }
 reclaim_user_tmp() { # $1 = age in days
   local root freed_before freed_after
   root=$(user_tmp_root)
+  # no-tmp: ok — pattern guarding against pruning the system tmp root
   case "$root" in /tmp|/private/tmp|''|/) return 0 ;; esac
   [ -d "$root" ] || return 0
   freed_before=$(free_mb)
