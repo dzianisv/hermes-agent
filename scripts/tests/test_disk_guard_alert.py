@@ -16,7 +16,9 @@ from pathlib import Path
 
 import pytest
 
-SCRIPT = Path(os.path.expanduser("~/.hermes/scripts/disk_guard_alert.py"))
+SCRIPT = Path(os.environ.get(
+    "DISK_GUARD_ALERT_SCRIPT",
+    os.path.expanduser("~/.hermes/scripts/disk_guard_alert.py")))
 spec = importlib.util.spec_from_file_location("disk_guard_alert", SCRIPT)
 dga = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(dga)
@@ -27,6 +29,8 @@ def _isolated_state(tmp_path, monkeypatch):
     """Every test gets its own dedupe state; otherwise a real state file on
     this host silently suppresses the alert the test is asserting."""
     monkeypatch.setenv("DISK_GUARD_STATE", str(tmp_path / "state.json"))
+    # The RED path measures swap; keep the 2s `top` probe out of every test.
+    monkeypatch.setenv("DISK_GUARD_SKIP_TOP", "1")
 
 
 # ------------------------------------------------------------- free space ---
@@ -456,3 +460,88 @@ def test_dry_run_never_delivers_but_reports(monkeypatch, tmp_path, capsys):
     assert rc == 1
     assert "DISK GUARD RED" in capsys.readouterr().out
     assert not state.exists(), "dry-run must not write dedupe state"
+
+
+# ------------------------------------------------------------- swap term ---
+# CLASS (card t_515b8493): ~30GiB of macOS swap shared the APFS container with
+# the data volume, so free space decayed while the page blamed scratch. The page
+# must name swap when swap explains at least half of the shortfall to target.
+
+TOP_OUT = ("Processes: 1\n\nCMPRS COMMAND\n20G   fseventsd\n7680M  com.apple.Virtua\n")
+
+
+def _fake_run(swap_dir_rows):
+    def run(argv, timeout=30):
+        if argv[0] == "top":
+            return TOP_OUT
+        if argv[0] == "stat":
+            return swap_dir_rows
+        return ""
+    return run
+
+
+def _swap_page(monkeypatch, capsys, tmp_path, swap_gi, free="0.3"):
+    monkeypatch.delenv("DISK_GUARD_SKIP_TOP", raising=False)
+    monkeypatch.delenv("DISK_GUARD_RECLAIM_TARGET_GI", raising=False)
+    monkeypatch.setenv("DISK_GUARD_FAKE_FREE_GI", free)
+    monkeypatch.setenv("DISK_GUARD_FAKE_SWAP_GI", swap_gi)
+    d = tmp_path / "vm"
+    d.mkdir()
+    for i in range(3):
+        (d / f"swapfile{i}").write_text("")
+    monkeypatch.setenv("DISK_GUARD_SWAP_DIR", str(d))
+    now = int(time.time())
+    rows = f"1073741824 {now - 100}\n1073741824 {now - 200}\n1073741824 {now - 200000}\n"
+    monkeypatch.setattr(dga, "_run", _fake_run(rows))
+    assert dga.main(["--dry-run"]) == 1
+    return capsys.readouterr().out
+
+
+def test_swap_dominated_shortfall_names_swap_as_cause(monkeypatch, capsys, tmp_path):
+    out = _swap_page(monkeypatch, capsys, tmp_path, "20")
+    first = out.strip().splitlines()[0]
+    assert "cause: swap pressure, not scratch" in first
+    assert first[:120].startswith("DISK GUARD RED")
+    swap = [ln for ln in out.splitlines() if ln.startswith("Swap:")]
+    assert swap == ["Swap: used 20.0 Gi in 3 swapfiles (grew by 2 in 24h); "
+                    "top compressed: fseventsd:20.0G,com.apple.Virtua:7.5G"]
+
+
+def test_no_swap_means_no_swap_line_and_no_cause(monkeypatch, capsys, tmp_path):
+    out = _swap_page(monkeypatch, capsys, tmp_path, "0")
+    assert "Swap:" not in out
+    assert "cause: swap pressure" not in out
+
+
+def test_minor_swap_is_reported_but_not_blamed(monkeypatch, capsys, tmp_path):
+    out = _swap_page(monkeypatch, capsys, tmp_path, "5")
+    assert any(ln.startswith("Swap: used 5.0 Gi") for ln in out.splitlines())
+    assert "cause:" not in out.strip().splitlines()[0]
+
+
+def test_fake_swap_alone_is_a_fixture_that_cannot_page(monkeypatch):
+    monkeypatch.delenv("DISK_GUARD_FAKE_FREE_GI", raising=False)
+    monkeypatch.setenv("DISK_GUARD_FAKE_SWAP_GI", "20")
+    assert dga.fixture_active() is True
+    with pytest.raises(RuntimeError, match="DISK_GUARD_FAKE_SWAP_GI"):
+        dga.deliver_telegram("x")
+    with pytest.raises(RuntimeError, match="DISK_GUARD_FAKE_SWAP_GI"):
+        dga.deliver_kanban_cto("x", key="k")
+
+
+def test_swap_info_degrades_to_none_when_every_probe_fails(monkeypatch, tmp_path):
+    monkeypatch.delenv("DISK_GUARD_FAKE_SWAP_GI", raising=False)
+    monkeypatch.delenv("DISK_GUARD_SKIP_TOP", raising=False)
+    monkeypatch.setenv("DISK_GUARD_SWAP_DIR", str(tmp_path))
+    (tmp_path / "swapfile0").write_text("")
+    monkeypatch.setattr(dga, "_run", lambda *a, **k: "")
+    assert dga.swap_info() == {"used_gi": None, "files": None, "quantum_gi": None,
+                               "grew_24h": None, "top": None}
+
+
+def test_swap_used_parses_sysctl_swapusage(monkeypatch):
+    monkeypatch.delenv("DISK_GUARD_FAKE_SWAP_GI", raising=False)
+    real = "total = 4096.00M  used = 2741.50M  free = 1354.50M  (encrypted)\n"
+    monkeypatch.setattr(dga, "_run",
+                        lambda argv, timeout=30: real if argv[0] == "sysctl" else "")
+    assert dga.swap_info()["used_gi"] == pytest.approx(2741.5 / 1024, abs=0.01)

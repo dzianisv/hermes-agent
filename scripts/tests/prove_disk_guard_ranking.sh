@@ -22,11 +22,20 @@
 #      both: local STT model gone, three projects forced to reinstall. A
 #      remediation list that recommends what the automation refuses to do is
 #      worse than no list.
+#   R6 the swap term is REPORTED (card t_515b8493): swap competes for the same
+#      APFS container, so a check-only run below target must name swap in its
+#      shortfall line, and reclaim_to_target's exhausted line must too. Fixture
+#      figures only; nothing is deleted.
+#   R7 every swap probe degrades silently: failing sysctl/top, a hanging top
+#      (bounded by the 10s timeout) and an unreadable swap dir still exit 0.
 #
 # Run: bash ~/.hermes/scripts/tests/prove_disk_guard_ranking.sh
+#      PROVE_SWAP_ONLY=1 (or --only-swap) runs just R6/R7, skipping the slow du scan.
 set -uo pipefail
 
-GUARD="$HOME/.hermes/scripts/disk-guard.sh"
+GUARD="${DISK_GUARD_SCRIPT:-$HOME/.hermes/scripts/disk-guard.sh}"
+[ "${1:-}" = "--only-swap" ] && PROVE_SWAP_ONLY=1
+SWAP_ONLY="${PROVE_SWAP_ONLY:-0}"
 fail=0
 check() { if [ "$2" = "$3" ]; then echo "PASS $1 ($3)"; else echo "FAIL $1: expected '$2' got '$3'"; fail=1; fi; }
 
@@ -34,6 +43,7 @@ SANDBOX=$(mktemp -d "$HOME/.hermes/logs/ranking-proof.XXXXXX")
 cleanup() { kill "${live_pid:-}" 2>/dev/null; rm -rf "$SANDBOX"; }
 trap cleanup EXIT
 
+if [ "$SWAP_ONLY" != 1 ]; then
 # Plant a big dir under a REAL scratch root, plus trivia that must not rank.
 BIG="$HOME/workspace/AgentPod-worktrees/zzz-ranking-proof-big"
 SMALL="$HOME/workspace/AgentPod-worktrees/zzz-ranking-proof-small"
@@ -115,5 +125,51 @@ done <<EOF
 $prot
 EOF
 check "R5b no protected path is listed as reclaimable" "0" "$prot_hit"
+fi
+
+# --- R6: swap is reported as a measured term (fixture figures, no deletion).
+r6_out=$(DISK_GUARD_FAKE_FREE_GI=10 DISK_GUARD_FAKE_SWAP_GI=28.8 DISK_GUARD_SKIP_TOP=1 \
+         bash "$GUARD" 2>&1); r6_rc=$?
+echo "--- R6 guard output ---"; printf '%s\n' "$r6_out"; echo "----------------------"
+check "R6a check-only output reports swap_used=28.8Gi" "yes" \
+      "$(printf '%s\n' "$r6_out" | grep -q 'swap_used=28\.8Gi' && echo yes || echo no)"
+check "R6b below_target line names swap" "yes" \
+      "$(printf '%s\n' "$r6_out" | grep -q 'below_target:.*swap holds' && echo yes || echo no)"
+check "R6c swap term never changes the exit code" "0" "$r6_rc"
+
+# R6d: the reclaim_to_target exhausted line, driven through the library seam
+# with the deleting classes stubbed out so NOTHING is removed.
+r6d_out=$(
+  export DISK_GUARD_FAKE_FREE_GI=10 DISK_GUARD_FAKE_SWAP_GI=28.8 DISK_GUARD_SKIP_TOP=1
+  DISK_GUARD_LIB=1 . "$GUARD" >/dev/null 2>&1
+  reclaim_user_tmp() { :; }
+  reclaim_tmp() { :; }
+  reclaim_to_target 2>&1
+)
+echo "--- R6d reclaim_to_target output ---"; printf '%s\n' "$r6d_out"; echo "----------------------"
+check "R6d reclaim_to_target names swap capped at the shortfall" "yes" \
+      "$(printf '%s\n' "$r6d_out" | grep -q 'of which swap holds 15\.0Gi' && echo yes || echo no)"
+
+# --- R7: failure paths degrade silently and stay bounded.
+STUBS="$SANDBOX/stubs"; mkdir -p "$STUBS"
+printf '#!/bin/sh\nexit 1\n' > "$STUBS/sysctl"
+printf '#!/bin/sh\nsleep 30\nexit 1\n' > "$STUBS/top"
+chmod +x "$STUBS/sysctl" "$STUBS/top"
+r7_start=$(date +%s)
+r7_out=$(env -u DISK_GUARD_FAKE_SWAP_GI -u DISK_GUARD_SKIP_TOP PATH="$STUBS:$PATH" \
+         DISK_GUARD_SWAP_DIR=/nonexistent DISK_GUARD_FAKE_FREE_GI=10 \
+         bash "$GUARD" 2>&1); r7_rc=$?
+r7_secs=$(( $(date +%s) - r7_start ))
+echo "--- R7 guard output (${r7_secs}s) ---"; printf '%s\n' "$r7_out"; echo "----------------------"
+check "R7a failing probes never change the exit code" "0" "$r7_rc"
+check "R7b failed sysctl reports swap_used=unknown" "yes" \
+      "$(printf '%s\n' "$r7_out" | grep -q 'swap_used=unknown' && echo yes || echo no)"
+check "R7c unreadable swap dir reports swapfiles=unreadable" "yes" \
+      "$(printf '%s\n' "$r7_out" | grep -q 'swapfiles=unreadable' && echo yes || echo no)"
+check "R7d failed/hung top omits compressor_top" "0" \
+      "$(printf '%s\n' "$r7_out" | grep -c 'compressor_top=')"
+# One top probe per check-only run, bounded at 10s, plus slack.
+check "R7e hung top is bounded by the timeout" "yes" \
+      "$([ "$r7_secs" -le 15 ] && echo yes || echo no)"
 
 exit "$fail"

@@ -53,13 +53,136 @@ RECLAIM=0
 
 log() { printf '%s %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$*"; }
 
-free_mb() { df -m /System/Volumes/Data 2>/dev/null | awk 'NR==2{print $4}'; }
+# DISK_GUARD_FAKE_FREE_GI is a FIXTURE: it lets a harness drive the below-target
+# and below-floor reporting without filling the volume. It is never allowed to
+# drive a deletion (see the --reclaim fence at the bottom of this script).
+free_mb() {
+  if [ -n "${DISK_GUARD_FAKE_FREE_GI:-}" ]; then
+    awk -v g="$DISK_GUARD_FAKE_FREE_GI" 'BEGIN{printf "%d\n", g*1024+0.5}'
+    return 0
+  fi
+  df -m /System/Volumes/Data 2>/dev/null | awk 'NR==2{print $4}'
+}
 # FLOAT GiB. An integer `free_mb/1024` floored 1708MiB to "1Gi" and made the
 # 0.5 comparison a lie at the only magnitude that matters.
-free_gi() { awk -v m="$(free_mb)" 'BEGIN{printf "%.2f", m/1024}'; }
+free_gi() {
+  if [ -n "${DISK_GUARD_FAKE_FREE_GI:-}" ]; then
+    awk -v g="$DISK_GUARD_FAKE_FREE_GI" 'BEGIN{printf "%.2f", g}'
+    return 0
+  fi
+  awk -v m="$(free_mb)" 'BEGIN{printf "%.2f", m/1024}'
+}
 # Float-exact comparison: `[ 0.60 -lt 0.5 ]` is a bash INTEGER error, which
 # silently skips the branch and reports green on a dying host.
 lt() { awk -v a="$1" -v b="$2" 'BEGIN{exit !(a+0 < b+0)}'; }
+
+# Bounded probe: dg_timeout <seconds> cmd... . A diagnostic probe that hangs
+# would hang the guard itself, so every swap probe goes through this. launchd's
+# PATH may not carry Homebrew's (g)timeout; perl's alarm survives exec and is
+# always present on macOS, so the bound holds either way.
+dg_timeout() {
+  local s=$1 t; shift
+  t=$(command -v gtimeout || command -v timeout)
+  if [ -n "$t" ]; then "$t" "$s" "$@"
+  elif command -v perl >/dev/null 2>&1; then perl -e 'alarm shift; exec @ARGV' "$s" "$@"
+  else "$@"
+  fi
+}
+
+# --- measured term: macOS swap. MEASURED 2026-10 (card t_515b8493): ~30GiB of
+# /System/Volumes/VM/swapfile* (1GiB each) shares the APFS container with the
+# data volume, so free space decayed while every scratch class reported
+# nothing to reclaim. Swap is a MEASUREMENT here, never a reclaim class: the
+# guard reports it so the shortfall is explained, and it can never page or
+# change the exit code. Every probe is time-bounded and degrades silently.
+swap_used_gi() { # prints numeric Gi (one decimal) or nothing
+  if [ -n "${DISK_GUARD_FAKE_SWAP_GI:-}" ]; then
+    printf '%s' "$DISK_GUARD_FAKE_SWAP_GI"; return 0
+  fi
+  local raw
+  raw=$(dg_timeout 5 sysctl -n vm.swapusage 2>/dev/null) || return 0
+  printf '%s\n' "$raw" | awk '{
+    for (i = 1; i < NF; i++) if ($i == "used" && $(i+1) == "=") {
+      v = $(i+2); u = substr(v, length(v)); n = v + 0
+      if (v !~ /^[0-9.]+[KMG]$/) exit
+      g = (u == "G") ? n : (u == "M") ? n/1024 : n/1048576
+      printf "%.1f", g; exit
+    }
+  }'
+  return 0
+}
+
+swap_files_term() { # "swapfiles=NxQ.QGi newest=<iso>" or "swapfiles=unreadable"
+  local dir="${DISK_GUARD_SWAP_DIR:-/System/Volumes/VM}" f out sz mt
+  local n=0 maxb=0 newest=0
+  for f in "$dir"/swapfile*; do
+    [ -f "$f" ] || continue
+    case "$(basename "$f")" in *.*) continue ;; esac
+    out=$(dg_timeout 5 stat -f '%z %m' "$f" 2>/dev/null) || continue
+    sz=${out%% *}; mt=${out##* }
+    case "$sz$mt" in ''|*[!0-9]*) continue ;; esac
+    n=$((n + 1))
+    [ "$sz" -gt "$maxb" ] && maxb=$sz
+    [ "$mt" -gt "$newest" ] && newest=$mt
+  done
+  if [ "$n" -eq 0 ]; then printf 'swapfiles=unreadable'; return 0; fi
+  printf 'swapfiles=%sx%sGi' "$n" "$(awk -v b="$maxb" 'BEGIN{printf "%.1f", b/1073741824}')"
+  out=$(date -r "$newest" '+%Y-%m-%dT%H:%M:%S%z' 2>/dev/null) && printf ' newest=%s' "$out"
+  return 0
+}
+
+compressor_top_term() { # "compressor_top=a:X.XG,b:Y.YG" or nothing
+  [ "${DISK_GUARD_SKIP_TOP:-0}" = 1 ] && return 0
+  local out
+  out=$(dg_timeout 10 top -l1 -stats cmprs,command -o cmprs -n 2 2>/dev/null) || return 0
+  printf '%s\n' "$out" | awk '
+    /^CMPRS[[:space:]]+COMMAND/ { h = 1; next }
+    h && NF >= 2 && c < 2 {
+      v = $1; sub(/[+-]$/, "", v); u = substr(v, length(v)); n = v + 0
+      if (v ~ /^[0-9.]+G$/) g = n
+      else if (v ~ /^[0-9.]+M$/) g = n / 1024
+      else if (v ~ /^[0-9.]+K$/) g = n / 1048576
+      else if (v ~ /^[0-9.]+B?$/) g = n / 1073741824
+      else { bad = 1; exit }
+      $1 = ""; sub(/^[ \t]+/, ""); sub(/[ \t]+$/, ""); gsub(/[ \t]+/, "_")
+      s = s (c ? "," : "") $0 ":" sprintf("%.1f", g) "G"; c++
+    }
+    END { if (!bad && c > 0) printf "compressor_top=%s", s }'
+  return 0
+}
+
+swap_term() { # one line of space-separated fields; always exit 0
+  local u t line
+  u=$(swap_used_gi)
+  if [ -n "$u" ]; then line="swap_used=${u}Gi"; else line="swap_used=unknown"; fi
+  line="$line $(swap_files_term)"
+  t=$(compressor_top_term)
+  [ -n "$t" ] && line="$line $t"
+  printf '%s\n' "$line"
+  return 0
+}
+
+# Shortfall clause shared by every target-shortfall line. $1 = free Gi now.
+# Swap is capped at the shortfall: it explains the gap, never more than it.
+swap_shortfall_clause() {
+  local s y
+  s=$(awk -v t="$RECLAIM_TARGET_GI" -v n="$1" 'BEGIN{d=t-n; if(d<0)d=0; printf "%.2f", d}')
+  y=$(swap_used_gi)
+  if printf '%s' "$y" | grep -Eq '^[0-9]+(\.[0-9]+)?$'; then
+    y=$(awk -v y="$y" -v s="$s" 'BEGIN{if(y+0>s+0)y=s; printf "%.1f", y}')Gi
+  else
+    y=unknown
+  fi
+  printf 'shortfall to target %sGi, of which swap holds %s (not reclaimable by this guard — needs memory pressure relief or reboot)' "$s" "$y"
+}
+
+# Check-only runs never escalate, so they never logged WHY free sat under the
+# target. Report it (silent, informational) — never part of the paging branch.
+report_check_only_shortfall() { # $1 = free Gi after
+  [ "$RECLAIM" = 0 ] || return 0
+  lt "$1" "$RECLAIM_TARGET_GI" || return 0
+  log "below_target: ${1}Gi < ${RECLAIM_TARGET_GI}Gi (check-only); $(swap_shortfall_clause "$1")"
+}
 
 # --- derived fact 1: which task ids are dead (terminal or absent from the DB)
 # Every kanban DB on the host, default board first. A card id is only a name;
@@ -568,7 +691,7 @@ reclaim_to_target() {
   reclaim_user_tmp 0
   now=$(free_gi)
   lt "$now" "$RECLAIM_TARGET_GI" && \
-    log "below_target: still ${now}Gi after escalation; sanctioned scratch is exhausted (silent by design — only FLOOR_GI pages)"
+    log "below_target: still ${now}Gi after escalation; sanctioned scratch exhausted; $(swap_shortfall_clause "$now") (silent by design — only FLOOR_GI pages)"
   return 0
 }
 
@@ -742,22 +865,33 @@ before=$(free_gi)
 # entirely for a full day.
 [ "${DISK_GUARD_LIB:-0}" = 1 ] && return 0 2>/dev/null
 
-log "free=${before}Gi floor=${FLOOR_GI}Gi target=${RECLAIM_TARGET_GI}Gi"
+swap_before=$(swap_term)
+log "free=${before}Gi floor=${FLOOR_GI}Gi target=${RECLAIM_TARGET_GI}Gi ${swap_before}"
 
+# A fixture figure must never drive a real deletion.
+if [ "$RECLAIM" = 1 ] && [ -n "${DISK_GUARD_FAKE_FREE_GI:-}" ]; then
+  log "fixture: DISK_GUARD_FAKE_FREE_GI set — reclaim disabled (no deletion from a fixture figure)"
+  RECLAIM=0
+fi
 
 if [ "$RECLAIM" = 1 ]; then
   run_reclaim_classes
 fi
 
 after=$(free_gi)
-log "free=${after}Gi (reclaimed $(awk -v a="$after" -v b="$before" 'BEGIN{printf "%.2f", a-b}')Gi)"
+# Re-measure only when a reclaim ran in between; a check-only run is one
+# instant, and a second top probe would just double a hung probe's bound.
+swap_after=$swap_before
+[ "$RECLAIM" = 1 ] && swap_after=$(swap_term)
+log "free=${after}Gi (reclaimed $(awk -v a="$after" -v b="$before" 'BEGIN{printf "%.2f", a-b}')Gi) ${swap_after}"
+report_check_only_shortfall "$after"
 
 # The ONLY paging decision. RECLAIM_TARGET_GI deliberately does not appear
 # below this line: a capacity shortfall is handled silently above, and letting
 # the target reach this branch is exactly how the guard paged 67 times in 13h.
 if lt "$after" "$FLOOR_GI"; then
   below_floor=1
-  log "FAIL: ${after}Gi free is below the ${FLOOR_GI}Gi floor."
+  log "FAIL: ${after}Gi free is below the ${FLOOR_GI}Gi floor. ${swap_after}"
   log "An ENOSPC host silently breaks every agent tool call and watchdog."
   log "Top reclaimable, largest first (live-pid paths excluded):"
   top_reclaimable 8 | awk -F'\t' '{printf "  %sMB  %s\n", $1, $2}'
@@ -768,5 +902,5 @@ if lt "$after" "$FLOOR_GI"; then
   exit 1
 fi
 
-log "OK: ${after}Gi free."
+log "OK: ${after}Gi free. ${swap_after}"
 exit 0
