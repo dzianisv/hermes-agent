@@ -2306,7 +2306,9 @@ def check_respawn_guard(
             "WHERE task_id = ? AND created_at > ? "
             # ``unblocked``: an operator clearing a block after the PR comment is a
             # deliberate re-queue (card t_6a6ac2d3 deadlocked ~170 ticks without it).
-            "AND kind IN ('assigned', 'changes_requested', 'review_approved', 'review_reopened', 'unblocked')",
+            # ``done_reopened``: an operator reopen-done after the PR comment is
+            # likewise a deliberate re-queue (same class as ``unblocked``).
+            "AND kind IN ('assigned', 'changes_requested', 'review_approved', 'review_reopened', 'unblocked', 'done_reopened')",
             (task_id, int(c["created_at"] or 0)),
         ).fetchall()
         if any(_is_handoff_event(e["kind"], e["payload"]) for e in events):
