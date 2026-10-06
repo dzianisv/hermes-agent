@@ -9,6 +9,7 @@ engine works on sqlite3.Row objects as well as dataclasses.
 
 from __future__ import annotations
 
+import json
 import time
 from pathlib import Path
 
@@ -257,7 +258,8 @@ def test_repeated_failures_falls_back_to_run_history_error(kanban_home, status):
         assert "401 auth failed" in diag.title and "401 auth failed" in diag.detail
         assert "run history" in diag.detail
         assert diag.data["last_error"] is None
-        assert diag.data["historical_error"] == "401 auth failed"
+        assert diag.data["historical_run_id"] == run_id
+        assert "historical_error" not in diag.data
         # Read-only: neither the error text nor the streak is written back.
         after = conn.execute(
             "SELECT last_failure_error, consecutive_failures FROM tasks WHERE id = ?", (tid,),
@@ -274,4 +276,29 @@ def test_repeated_failures_prefers_task_error_over_history():
     diags = kd._rule_repeated_failures(task, [], runs, int(time.time()), {"failure_threshold": 3})
     assert len(diags) == 1
     assert "current boom" in diags[0].title and "historical" not in diags[0].title
-    assert diags[0].data["historical_error"] is None
+    assert diags[0].data["historical_run_id"] is None
+
+
+_FAKE_BEARER = "sk-test-FAKE0123456789abcdefABCDEF"
+_FAKE_ENV_KEY = "sk-proj-FAKE0123456789abcdefABCDEFGHIJ"
+
+
+def test_repeated_failures_historical_error_is_redacted():
+    """Historical run text is raw worker output shown board-wide; credentials never leak."""
+    task = _task(consecutive_failures=5, last_failure_error=None)
+    error = (
+        f'curl -H "Authorization: Bearer {_FAKE_BEARER}" https://api.example.com\n'
+        f"OPENAI_API_KEY={_FAKE_ENV_KEY} 401 auth failed"
+    )
+    runs = [_run("crashed", run_id=7, error=error)]
+    diags = kd._rule_repeated_failures(task, [], runs, int(time.time()), {"failure_threshold": 3})
+    assert len(diags) == 1
+    diag = diags[0]
+    assert "(historical, run 7)" in diag.title
+    assert "run history (run 7)" in diag.detail
+    assert diag.data["historical_run_id"] == 7
+    payload = json.dumps(diag.data)
+    for secret in (_FAKE_BEARER, _FAKE_ENV_KEY):
+        assert secret not in diag.title
+        assert secret not in diag.detail
+        assert secret not in payload

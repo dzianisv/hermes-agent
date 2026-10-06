@@ -432,7 +432,12 @@ def _rule_repeated_failures(task, events, runs, now, cfg) -> list[Diagnostic]:
             f"Fix the assignee profile's provider credentials/model, then unblock the task."
         )
     elif historical_run is not None:
-        hist_snippet = _error_snippet(_task_field(historical_run, "error"))
+        from agent.redact import redact_sensitive_text
+
+        # Historical run text is raw worker output serialized board-wide: redact it.
+        hist_snippet = redact_sensitive_text(
+            _error_snippet(_task_field(historical_run, "error")), force=True,
+        )
         hist_id = _task_field(historical_run, "id")
         title = (
             f"Agent {outcome_label} x{failures} (historical, run {hist_id}): "
@@ -467,8 +472,8 @@ def _rule_repeated_failures(task, events, runs, now, cfg) -> list[Diagnostic]:
             "consecutive_failures": failures,
             "most_recent_outcome": most_recent_outcome,
             "last_error": last_err,
-            "historical_error": (
-                _task_field(historical_run, "error") if historical_run is not None else None
+            "historical_run_id": (
+                _task_field(historical_run, "id") if historical_run is not None else None
             ),
             "failure_threshold": threshold,
             "failure_limit": failure_limit,
