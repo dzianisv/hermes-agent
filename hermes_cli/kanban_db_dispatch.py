@@ -2668,6 +2668,46 @@ def dispatch_once(
     return result
 
 
+def _profile_default_cwd(profile: Optional[str]) -> Optional[Path]:
+    """The profile's ``terminal.cwd`` (its shared default checkout), if set."""
+    if not profile:
+        return None
+    try:
+        import yaml
+        from hermes_cli.profiles import get_profile_dir
+        cfg = yaml.safe_load((get_profile_dir(profile) / "config.yaml").read_text()) or {}
+        cwd = str(((cfg.get("terminal") or {}).get("cwd")) or "").strip()
+    except Exception:
+        return None
+    if not cwd or cwd in {".", "~"}:
+        return None
+    return Path(cwd).expanduser().resolve(strict=False)
+
+
+def _workspace_conflict(
+    conn: sqlite3.Connection, task_id: str, workspace, assignee: Optional[str],
+) -> Optional[str]:
+    """Why ``task_id`` must not spawn in ``workspace``, else ``None`` (#25).
+
+    Refuses a path another running card already uses, and the assignee
+    profile's shared default checkout (``terminal.cwd``): a card there would
+    overwrite files of every other card and of the operator's own checkout.
+    """
+    ws = Path(str(workspace)).expanduser().resolve(strict=False)
+    default = _profile_default_cwd(assignee)
+    if default is not None and ws == default:
+        return f"{ws} is profile {assignee!r}'s shared default checkout (terminal.cwd); use a per-card worktree"
+    rows = conn.execute(
+        "SELECT id, workspace_path FROM tasks WHERE status = 'running' AND id != ? "
+        "AND workspace_path IS NOT NULL", (task_id,),
+    ).fetchall()
+    for row in rows:
+        other = Path(row["workspace_path"]).expanduser().resolve(strict=False)
+        if other == ws:
+            return f"{ws} is in use by running card {row['id']}"
+    return None
+
+
 def _call_spawn_fn(spawn_fn, task: Task, workspace: str, board: Optional[str]) -> Optional[int]:
     """Back-compat: older spawn_fn signatures (and test stubs) accept only
     ``(task, workspace)``; pass ``board`` only when the callable supports it."""
@@ -2761,6 +2801,14 @@ def _dispatch_lane_task(
     except Exception as exc:
         if _record_task_failure(
             conn, claimed.id, f"workspace: {exc}",
+            outcome="spawn_failed", failure_limit=failure_limit, release_claim=True, end_run=True,
+        ):
+            result.auto_blocked.append(claimed.id)
+        return False
+    conflict = _workspace_conflict(conn, claimed.id, workspace, claimed.assignee)
+    if conflict:
+        if _record_task_failure(
+            conn, claimed.id, f"workspace: {conflict}",
             outcome="spawn_failed", failure_limit=failure_limit, release_claim=True, end_run=True,
         ):
             result.auto_blocked.append(claimed.id)

@@ -536,6 +536,33 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> t
     return requested, branch_name
 
 
+def _isolate_shared_checkout(task: Task, path: Path, *, board: Optional[str] = None) -> Optional[Path]:
+    """A ``dir`` path inside a repo's MAIN checkout -> a per-card worktree.
+
+    Cards created with ``dir:<repo>`` (often the assignee profile's
+    ``terminal.cwd``) used to run in the shared checkout, so parallel cards
+    overwrote each other's files (#25). Materialize
+    ``<workspaces-root>/<task-id>/<repo-name>`` on branch ``wt/<task-id>`` and
+    return the same sub-path inside it. ``None`` when the path is not in git or
+    is already a linked worktree (e.g. the persisted result of a previous call).
+    """
+    if not path.exists():
+        return None
+    repo_root = _git_toplevel(path)
+    if repo_root is None or _is_linked_worktree_checkout(path):
+        return None
+    try:
+        rel = path.resolve(strict=False).relative_to(repo_root)
+    except ValueError:
+        rel = Path()
+    branch_name = (task.branch_name or "").strip() or f"wt/{task.id}"
+    target = _kb.workspaces_root(board=board) / task.id / repo_root.name
+    _ensure_git_worktree(repo_root, target, branch_name)
+    out = target / rel
+    out.mkdir(parents=True, exist_ok=True)
+    return out
+
+
 def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
     """Resolve (and create if needed) the workspace for a task.
 
@@ -571,6 +598,9 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
                 f"{task.workspace_path!r}; use an absolute path "
                 f"(relative paths are ambiguous against the dispatcher's CWD)"
             )
+        isolated = _isolate_shared_checkout(task, p, board=board)
+        if isolated is not None:
+            return isolated
     else:
         raise ValueError(f"unknown workspace_kind: {kind}")
     p.mkdir(parents=True, exist_ok=True)
