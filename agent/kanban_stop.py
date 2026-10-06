@@ -61,6 +61,59 @@ def session_called_kanban_terminal(messages: Iterable[dict] | None) -> bool:
     return False
 
 
+def _bound_run_id() -> Optional[int]:
+    raw = (os.environ.get("HERMES_KANBAN_RUN_ID") or "").strip()
+    try:
+        return int(raw) if raw else None
+    except ValueError:
+        return None
+
+
+def bound_run_disposition(task_id: Optional[str] = None) -> str:
+    """Persisted disposition of the dispatcher-bound run, read-only (opened ``mode=ro``).
+
+    ``"active"``  — this run is still the task's current, open run: the worker has not
+                    recorded a status, so a same-session correction is warranted.
+    ``"settled"`` — the run is closed (completed / blocked / review hand-off /
+                    scheduled / changes requested / reclaimed or reassigned) or a
+                    successor run owns the card. Nothing for this session to do; never
+                    nudge it into touching a successor's run.
+    ``"unknown"`` — no bound run id or the board is unreadable.
+
+    The transcript is NOT consulted: a ``kanban_complete`` call the tool rejected (or
+    whose result never arrived) leaves the run ``active`` and must still be corrected.
+    """
+    run_id = _bound_run_id()
+    tid = (task_id or os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+    if run_id is None or not tid:
+        return "unknown"
+    try:
+        import sqlite3
+
+        from hermes_cli.kanban_db import kanban_db_path
+
+        path = kanban_db_path()
+        if not path.exists():
+            return "unknown"
+        conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=2)
+        try:
+            run = conn.execute(
+                "SELECT task_id, status, ended_at FROM task_runs WHERE id = ?", (run_id,)
+            ).fetchone()
+            task = conn.execute(
+                "SELECT status, current_run_id FROM tasks WHERE id = ?", (tid,)
+            ).fetchone()
+        finally:
+            conn.close()
+    except Exception:
+        return "unknown"
+    if run is None or task is None or run[0] != tid:
+        return "unknown"
+    if run[2] is None and run[1] == "running" and task[1] == run_id and task[0] == "running":
+        return "active"
+    return "settled"
+
+
 def build_kanban_stop_nudge(
     *,
     messages: Iterable[dict] | None = None,
@@ -70,16 +123,22 @@ def build_kanban_stop_nudge(
 ) -> Optional[str]:
     """Synthetic follow-up when a kanban worker exits without a terminal tool; ``None`` when
     the guard should not fire (not a kanban worker, already completed/blocked, budget exhausted)."""
-    if (
-        not kanban_stop_nudge_enabled()
-        or attempts >= max_attempts
-        or session_called_kanban_terminal(messages)
-    ):
+    if not kanban_stop_nudge_enabled() or attempts >= max_attempts:
+        return None
+    # The board, not the transcript, is the status source (#3): a terminal tool the board
+    # rejected leaves the run open. Only a still-active bound run is nudged; a settled run
+    # (handed off, or superseded by a successor) is left alone. When the run cannot be read,
+    # fall back to the transcript so an unbound worker is not nudged forever — the
+    # dispatcher's bounded protocol-violation budget still catches a real silent exit.
+    disposition = bound_run_disposition(task_id)
+    if disposition == "settled":
+        return None
+    if disposition == "unknown" and session_called_kanban_terminal(messages):
         return None
 
     tid = (task_id or os.environ.get("HERMES_KANBAN_TASK") or "").strip() or "this task"
-    # The transcript is the status source: this text is only reached when the session made no
-    # handoff call, so it never tells a worker to close a card it already sent to review.
+    # Reached only while the bound run is still open, so it never tells a worker to close a
+    # card it already sent to review.
     return (
         "[System: You are a Hermes kanban worker. A plain-text reply is NOT a "
         "terminal state for the board.\n\n"
@@ -99,4 +158,4 @@ def build_kanban_stop_nudge(
     )
 
 
-__all__ = ["build_kanban_stop_nudge", "kanban_stop_nudge_enabled", "session_called_kanban_terminal"]
+__all__ = ["bound_run_disposition", "build_kanban_stop_nudge", "kanban_stop_nudge_enabled", "session_called_kanban_terminal"]
