@@ -294,7 +294,10 @@ class CopilotACPClient:
         # An explicit [] means "no args" (e.g. pi-acp); only None falls back to copilot's defaults.
         explicit = acp_args if acp_args is not None else args
         self._acp_args = list(explicit) if explicit is not None else _resolve_args()
-        self._acp_cwd = str(Path(acp_cwd or os.getcwd()).resolve())
+        # None = resolve per spawn from the agent's terminal workdir (see _current_acp_cwd), so the ACP
+        # agent (pi, copilot) starts in the task's repo and loads that repo's AGENTS.md.
+        self._explicit_acp_cwd = acp_cwd
+        self._acp_cwd = self._current_acp_cwd()
         self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create_chat_completion))
         self.is_closed = False
         # Clients are cached and shared across concurrent callers (auxiliary tasks, async
@@ -348,7 +351,31 @@ class CopilotACPClient:
         )
         return _completion_to_stream_chunks(completion) if stream else completion
 
+    def _current_acp_cwd(self) -> str:
+        """Explicit acp_cwd, else the live terminal tool cwd (follows `cd` into the card's checkout),
+        else the kanban workspace, else the configured agent cwd (session override / TERMINAL_CWD)."""
+        if self._explicit_acp_cwd:
+            return str(Path(self._explicit_acp_cwd).resolve())
+        candidates: list[str] = []
+        try:
+            from tools.terminal_tool import _active_environments
+            candidates += [str(getattr(env, "cwd", "") or "") for env in reversed(list(_active_environments.values()))]
+        except Exception:
+            pass
+        candidates.append(os.environ.get("HERMES_KANBAN_WORKSPACE", ""))
+        try:
+            from agent.runtime_cwd import resolve_agent_cwd
+            candidates.append(str(resolve_agent_cwd()))
+        except Exception:
+            pass
+        for cand in candidates:
+            if cand and os.path.isabs(cand) and os.path.isdir(cand):
+                return str(Path(cand).resolve())
+        return str(Path(os.getcwd()).resolve())
+
     def _spawn(self) -> subprocess.Popen[str]:
+        self._acp_cwd = self._current_acp_cwd()
+        logger.info("ACP spawn cwd=%s command=%s", self._acp_cwd, self._acp_command)
         # Fast-fail when the CLI rejects --acp (else the parent waits the full child timeout for stdout that
         # never arrives). ``None`` falls through to the spawn's established start error.
         if _acp_supported(self._acp_command, self._acp_args) is False:
