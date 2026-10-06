@@ -452,6 +452,12 @@ KANBAN_CREATE_SCHEMA = _schema(
                 "— a specifier profile is expected to flesh out "
                 "the body before work starts."
         )),
+        "outcome_key": _prop("string", (
+                "Outcome identity (e.g. 'G3'). At most one OPEN task per "
+                "(project, key): a duplicate create adds a comment to the "
+                "existing task and returns it with deduped=true. Required "
+                "when kanban.require_outcome_key is on."
+        )),
         "idempotency_key": _prop("string", (
                 "If a non-archived task with this key already "
                 "exists, return that task's id instead of creating "

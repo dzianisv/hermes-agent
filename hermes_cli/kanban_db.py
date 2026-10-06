@@ -102,6 +102,89 @@ def _git_out(cwd: Path, *args: str, timeout: int = 30) -> Optional[str]:
 
 VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
 VALID_INITIAL_STATUSES = {"running", "blocked"}
+# Terminal statuses: a task in one of these no longer holds its outcome_key.
+OUTCOME_KEY_CLOSED_STATUSES = ("archived", "done")
+
+
+class CreatedTaskId(str):
+    """Task id returned by ``create_task``; ``deduped`` is True when the create
+    was folded into an existing open task with the same outcome_key."""
+
+    deduped: bool = False
+
+    def __new__(cls, value: str, deduped: bool = False):
+        obj = super().__new__(cls, value)
+        obj.deduped = deduped
+        return obj
+
+
+class OutcomeKeyError(ValueError):
+    """Board requires an outcome_key (or the key fails the configured pattern)."""
+
+
+def _outcome_key_policy(board: Optional[str]) -> tuple[bool, Optional[str]]:
+    """(require, pattern): board.json ``require_outcome_key``/``outcome_key_pattern``
+    win, else config.yaml ``kanban.*``. Defaults: not required, no pattern."""
+    require, pattern = None, None
+    try:
+        meta = _board_meta_for(board)
+        require = meta.get("require_outcome_key")
+        pattern = meta.get("outcome_key_pattern")
+    except Exception:
+        pass
+    if require is None or pattern is None:
+        try:
+            from hermes_cli.config import load_config_readonly
+            cfg = (load_config_readonly() or {}).get("kanban", {}) or {}
+        except Exception:
+            cfg = {}
+        if require is None:
+            require = cfg.get("require_outcome_key")
+        if pattern is None:
+            pattern = cfg.get("outcome_key_pattern")
+    return bool(require), (str(pattern) if pattern else None)
+
+
+def check_outcome_key(outcome_key: Optional[str], board: Optional[str] = None) -> Optional[str]:
+    """Normalise ``outcome_key`` and enforce the board policy; raises OutcomeKeyError."""
+    key = str(outcome_key).strip() if outcome_key is not None else ""
+    key = key or None
+    require, pattern = _outcome_key_policy(board)
+    if require:
+        if key is None:
+            raise OutcomeKeyError(
+                "outcome_key is required on this board (kanban.require_outcome_key=true); "
+                "pass --outcome-key <KEY> (e.g. G3) naming the outcome this task delivers"
+            )
+        if pattern and not re.search(pattern, key):
+            raise OutcomeKeyError(
+                f"outcome_key {key!r} does not match kanban.outcome_key_pattern {pattern!r}"
+            )
+    return key
+
+
+def _open_task_for_outcome_key(
+    conn: sqlite3.Connection, project_id: Optional[str], outcome_key: str,
+) -> Optional[str]:
+    closed = ", ".join("?" for _ in OUTCOME_KEY_CLOSED_STATUSES)
+    row = conn.execute(
+        "SELECT id FROM tasks WHERE outcome_key = ? AND COALESCE(project_id, '') = ? "
+        f"AND status NOT IN ({closed}) LIMIT 1",
+        (outcome_key, project_id or "", *OUTCOME_KEY_CLOSED_STATUSES),
+    ).fetchone()
+    return row[0] if row else None
+
+
+def _fold_into_outcome_key(
+    conn: sqlite3.Connection, existing_id: str, *, title: str, body: Optional[str],
+    author: Optional[str], outcome_key: str, now: int,
+) -> None:
+    """Record the would-be duplicate on the surviving task (caller holds the txn)."""
+    text = f"Duplicate create folded here (outcome_key={outcome_key}).\nTitle: {title.strip()}"
+    if body:
+        text += f"\n\n{body}"
+    _insert_comment(conn, existing_id, author or "kanban", text, now)
+    _append_event(conn, existing_id, "deduped", {"outcome_key": outcome_key, "title": title.strip()})
 
 # Typed block reasons (routing in ``_route_block``); ``None`` = legacy un-typed.
 VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
@@ -740,6 +823,7 @@ class Task:
     completion_contract: Optional[str] = None
     # Unix time a ``scheduled`` card auto-wakes (promote_due_scheduled); NULL = manual unblock.
     scheduled_wake_at: Optional[int] = None
+    outcome_key: Optional[str] = None   # one OPEN task per (project, key); see create_task
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -770,6 +854,7 @@ _TASK_OPTIONAL_COLUMNS = (
     "branch_name", "project_id", "tenant", "result", "idempotency_key", "worker_pid",
     "max_runtime_seconds", "last_heartbeat_at", "current_run_id", "workflow_template_id",
     "current_step_key", "max_retries", "session_id", "completion_contract", "scheduled_wake_at",
+    "outcome_key",
 )
 # Text columns where "" is stored/read as "not set".
 _TASK_EMPTY_IS_NULL_COLUMNS = (
@@ -1271,8 +1356,13 @@ def create_task(
     project_source_task_id: Optional[str] = None,
     creator_task_id: Optional[str] = None,
     completion_contract: Optional[str] = None,
-) -> str:
+    outcome_key: Optional[str] = None,
+) -> "CreatedTaskId":
     """Create a task (optionally under ``parents``); returns its id.
+
+    ``outcome_key``: at most one OPEN task per (project, key) — enforced by a
+    partial UNIQUE index. A duplicate create comments on the existing task and
+    returns its id as a ``CreatedTaskId`` with ``deduped=True``.
 
     Status: ``ready`` unless a parent is not ``done`` (``todo``); ``triage=True``
     forces ``triage``; ``initial_status="blocked"`` parks it for human ops.
@@ -1324,6 +1414,7 @@ def create_task(
     )
     parents = tuple(p for p in parents if p)
     skills_list = _normalize_task_skills(skills)
+    outcome_key = check_outcome_key(outcome_key, board)
 
     # Idempotency check BEFORE the write txn (no lock held); a concurrent-create
     # race may insert twice, the next lookup stabilises on the newest.
@@ -1352,6 +1443,12 @@ def create_task(
             # allow_nested: graph builders compose create_task under one outer
             # commit so the dispatcher never sees a half-built graph.
             with write_txn(conn, allow_nested=True):
+                if outcome_key:
+                    existing = _open_task_for_outcome_key(conn, project_id, outcome_key)
+                    if existing:
+                        _fold_into_outcome_key(conn, existing, title=title, body=body,
+                                               author=created_by, outcome_key=outcome_key, now=now)
+                        return CreatedTaskId(existing, deduped=True)
                 task_status, tenant = initial_task_state(conn, parents, initial_status, triage, tenant)
                 # Project worktree: fresh dir under the repo + deterministic
                 # branch, instead of the random ``wt/<id>`` worker fallback.
@@ -1370,8 +1467,9 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id, completion_contract
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id, completion_contract,
+                        outcome_key
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id, title.strip(), body, assignee, task_status, priority,
@@ -1381,6 +1479,7 @@ def create_task(
                         json.dumps(skills_list) if skills_list is not None else None,
                         _opt_int(max_retries), model_override, provider_override, reasoning_effort,
                         1 if goal_mode else 0, _opt_int(goal_max_turns), session_id, completion_contract,
+                        outcome_key,
                     ),
                 )
                 for pid in parents:
@@ -1426,8 +1525,16 @@ def create_task(
                 # ACK-edge: the originating channel hears a child BLOCK, not just the fan-in.
                 inherit_creator_origin(conn, task_id, creator_task_id, created_at=now)
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
-            return task_id
+            return CreatedTaskId(task_id)
         except sqlite3.IntegrityError:
+            # A concurrent create won the (project, outcome_key) slot: fold into it.
+            if outcome_key and not conn.in_transaction:
+                with write_txn(conn):
+                    existing = _open_task_for_outcome_key(conn, project_id, outcome_key)
+                    if existing:
+                        _fold_into_outcome_key(conn, existing, title=title, body=body,
+                                               author=created_by, outcome_key=outcome_key, now=now)
+                        return CreatedTaskId(existing, deduped=True)
             if attempt == 1:
                 raise
     raise RuntimeError("unreachable")

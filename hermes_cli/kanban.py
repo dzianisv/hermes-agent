@@ -368,7 +368,8 @@ def _cmd_create(args: argparse.Namespace) -> int:
         return _err(f"kanban: --max-retries must be >= 1 (got {max_retries}); "
                     "use 1 to trip on the first failure.", 2)
     with kbc.connect_closing() as conn:
-        task_id = kb.create_task(
+        task_id = _create_or_report(
+            kb.create_task,
             conn, title=args.title, body=body, assignee=args.assignee,
             created_by=args.created_by or _profile_author(),
             workspace_kind=ws_kind, workspace_path=ws_path, branch_name=branch_name,
@@ -384,7 +385,18 @@ def _cmd_create(args: argparse.Namespace) -> int:
             initial_status=getattr(args, "initial_status", "running"),
             creator_task_id=(os.environ.get("HERMES_KANBAN_TASK")
                              if is_dispatcher_owned_worker_context() else None),
+            outcome_key=getattr(args, "outcome_key", None),
         )
+        if task_id is None:
+            return 2
+        deduped = bool(getattr(task_id, "deduped", False))
+        if deduped:
+            task = kb.get_task(conn, task_id)
+            if getattr(args, "json", False):
+                _print_json({**_task_to_dict(task), "deduped": True})
+            else:
+                print(f"deduped into {task_id}  ({task.status}, outcome_key={task.outcome_key})")
+            return 0
         task = kb.get_task(conn, task_id)
         # Gateway sessions that run `hermes kanban create` (rather than the kanban_create
         # tool) get the same completion/block notifications; no-op for plain CLI/cron.
@@ -401,6 +413,16 @@ def _cmd_create(args: argparse.Namespace) -> int:
             if not running and message:
                 print(f"\n⚠  {message}", file=sys.stderr)
     return 0
+
+
+def _create_or_report(create, conn, **kwargs):
+    """Run ``create_task``; an outcome-key policy violation prints a clear error
+    and returns None (caller exits 2)."""
+    try:
+        return create(conn, **kwargs)
+    except kb.OutcomeKeyError as exc:
+        _err(f"kanban create: {exc}", 2)
+        return None
 
 
 def _cmd_swarm(args: argparse.Namespace) -> int:
