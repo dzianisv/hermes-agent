@@ -9,6 +9,7 @@ imposes no restriction (fail-open).
 
 from __future__ import annotations
 
+import logging
 import os
 import subprocess
 import time
@@ -19,6 +20,9 @@ import pytest
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_db_connect as kbc
+from hermes_cli import config as hermes_config
+
+_REAL_LOAD_CONFIG_READONLY = hermes_config.load_config_readonly
 
 GIB = 1024 ** 3
 FLOOR = GIB // 2  # default 0.5 GiB
@@ -41,12 +45,15 @@ def kanban_home(tmp_path, monkeypatch):
     return home
 
 
-def _sample(free, q=Q, fresh=0):
-    return {"free_bytes": free, "quantum_bytes": q, "swap_fresh_files": fresh}
+def _sample(free, q=Q, fresh=0, files=None):
+    return {
+        "free_bytes": free, "quantum_bytes": q, "swap_fresh_files": fresh,
+        "swap_files": fresh if files is None else files,
+    }
 
 
 def _dispatch_three(monkeypatch, sample):
-    monkeypatch.setattr(kbd, "_disk_sample", lambda: sample)
+    monkeypatch.setattr(kbd, "_disk_sample", lambda *a, **k: sample)
     spawns = []
 
     def fake_spawn(task, workspace, board=None):
@@ -103,9 +110,26 @@ def test_floor_default_and_env(monkeypatch):
     assert kbd._disk_floor_bytes() == 2 * GIB
     # 1.5 GiB free: ok at the 0.5 GiB default floor, critical at a 2 GiB floor.
     assert kbd._disk_pressure_level(_sample(GIB + GIB // 2, q=0)) == "critical"
-    for bad in ("0", "-1", "abc"):
+    for bad in ("0", "-1", "abc", "1e308", "inf", "nan"):
         monkeypatch.setenv("DISK_GUARD_FLOOR_GI", bad)
         assert kbd._disk_floor_bytes() == FLOOR
+
+
+def test_floor_overflowing_config_falls_through_without_raising(monkeypatch):
+    for bad in (1e308, float("inf"), float("nan"), "1e308"):
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config_readonly", lambda bad=bad: {"kanban": {"disk_floor_gi": bad}}
+        )
+        assert kbd._disk_floor_bytes() == FLOOR
+
+
+def test_floor_read_from_real_config_yaml(kanban_home, monkeypatch):
+    """``kanban.disk_floor_gi`` in the profile's config.yaml reaches the guard
+    through the real loader (registered in DEFAULT_CONFIG, read at call time)."""
+    monkeypatch.setattr("hermes_cli.config.load_config_readonly", _REAL_LOAD_CONFIG_READONLY)
+    hermes_config._LOAD_CONFIG_CACHE.clear()
+    (kanban_home / "config.yaml").write_text("kanban:\n  disk_floor_gi: 2\n")
+    assert kbd._disk_floor_bytes() == 2 * GIB
 
 
 def test_floor_config_wins_over_env(monkeypatch):
@@ -142,6 +166,25 @@ def test_dispatch_critical_disk_spawns_nothing_and_defers(
     assert res.disk_pressure == "critical"
     assert set(statuses.values()) == {"ready"}
     assert "disk_pressure=critical" in kbd.describe_suppression([res])
+
+
+def test_dispatch_critical_disk_log_names_swap_used_total_and_fresh(
+    kanban_home, all_assignees_spawnable, monkeypatch, caplog,
+):
+    sample = _sample(FLOOR + Q // 2, fresh=2, files=4)
+    sample["swap_used_bytes"] = int(3.51 * GIB)
+    with caplog.at_level(logging.WARNING):
+        _dispatch_three(monkeypatch, sample)
+    assert (
+        "disk pressure critical (free 1.00 GiB, floor 0.50 GiB, swapfile quantum 1.00 GiB, "
+        "swap used 3.51 GiB in 4 swapfiles (2 created in last hour))"
+    ) in caplog.text
+
+
+def test_detail_without_swap_used_still_counts_swapfiles():
+    detail = kbd._disk_pressure_detail(_sample(FLOOR, fresh=1, files=3))
+    assert "swap used" not in detail
+    assert detail.endswith("3 swapfiles (1 created in last hour)")
 
 
 def test_dispatch_elevated_disk_spawns_exactly_one(
@@ -230,3 +273,100 @@ def test_disk_sample_empty_when_free_unknown(kanban_home, monkeypatch):
     monkeypatch.setattr(kbd.shutil, "disk_usage", boom)
     assert kbd._disk_sample() == {}
     assert kbd._disk_pressure_level() == "unknown"
+
+
+@pytest.mark.real_disk_guard
+def test_disk_sample_swap_probe_failure_fails_open(
+    kanban_home, all_assignees_spawnable, tmp_path, monkeypatch, caplog,
+):
+    """An unreadable swap dir is a probe failure, not "no swapfiles": the
+    quantum is unknown, so the guard fails open explicitly and says so."""
+    swap_dir = tmp_path / "vm"
+    swap_dir.mkdir()
+    _fake_swapfiles(swap_dir)
+    monkeypatch.setattr(kbd, "_SWAP_DIR", swap_dir)
+    monkeypatch.setattr(
+        kbd.subprocess, "run", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 1, stdout=""),
+    )
+    monkeypatch.setattr("gateway.lifecycle_ledger.sample_memory", lambda: {})
+    # Free space that would be critical with ANY quantum or a zero quantum.
+    monkeypatch.setattr(kbd.shutil, "disk_usage", lambda p: _Usage(FLOOR // 2))
+    real_stat = Path.stat
+
+    def failing_stat(self, *a, **k):
+        if self.name.startswith("swapfile"):
+            raise PermissionError("operation not permitted")
+        return real_stat(self, *a, **k)
+
+    monkeypatch.setattr(Path, "stat", failing_stat)
+    sample = kbd._disk_sample()
+    assert sample["swap_probe_failed"] is True
+    assert sample["free_bytes"] == FLOOR // 2
+    assert "quantum_bytes" not in sample
+    assert kbd._disk_pressure_level(sample) == "unknown"
+
+    with caplog.at_level(logging.WARNING):
+        res, spawns, _ = _dispatch_three(monkeypatch, sample)
+    assert len(spawns) == 3
+    assert res.disk_pressure is None
+    probe_logs = [r for r in caplog.records if "swapfile probe" in r.getMessage()]
+    assert len(probe_logs) == 1
+    assert probe_logs[0].levelno == logging.WARNING
+    assert "free 0.25 GiB" in probe_logs[0].getMessage()
+
+
+@pytest.mark.real_disk_guard
+def test_swap_glob_failure_is_probe_failure_not_absent(tmp_path, monkeypatch):
+    def boom(self, pattern):
+        raise OSError("glob failed")
+
+    monkeypatch.setattr(kbd, "_SWAP_DIR", tmp_path)
+    monkeypatch.setattr(Path, "glob", boom)
+    assert kbd._swapfiles() is None
+    monkeypatch.undo()
+    monkeypatch.setattr(kbd, "_SWAP_DIR", tmp_path / "absent")
+    assert kbd._swapfiles() == []
+
+
+class _Usage:
+    def __init__(self, free):
+        self.free = free
+        self.total = self.used = 0
+
+
+@pytest.mark.real_disk_guard
+def test_disk_sample_and_dispatch_gate_on_the_named_board(
+    kanban_home, all_assignees_spawnable, monkeypatch,
+):
+    """Free space is read on the dispatched board's workspaces filesystem,
+    not the current board's."""
+    monkeypatch.delenv("HERMES_KANBAN_WORKSPACES_ROOT", raising=False)
+    monkeypatch.setattr(kbd, "_SWAP_DIR", kanban_home / "no-swap")
+    monkeypatch.setattr(
+        kbd.subprocess, "run", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 1, stdout=""),
+    )
+    monkeypatch.setattr("gateway.lifecycle_ledger.sample_memory", lambda: {})
+    kb.create_board("b")
+    root_default = kb.workspaces_root("default")
+    root_b = kb.workspaces_root("b")
+    assert root_default != root_b
+    root_default.mkdir(parents=True, exist_ok=True)
+    root_b.mkdir(parents=True, exist_ok=True)
+    free_by_root = {str(root_default): 100 * GIB, str(root_b): FLOOR // 2}
+    monkeypatch.setattr(kbd.shutil, "disk_usage", lambda p: _Usage(free_by_root[str(p)]))
+
+    assert kb.get_current_board() == "default"
+    assert kbd._disk_sample().get("free_bytes") == 100 * GIB
+    assert kbd._disk_sample(board="b")["free_bytes"] == FLOOR // 2
+
+    spawns = []
+
+    def fake_spawn(task, workspace, board=None):
+        spawns.append(task.id)
+        return 42
+
+    with kbc.connect(board="b") as conn:
+        kb.create_task(conn, title="on b", assignee="alice")
+        res = kbd.dispatch_once(conn, spawn_fn=fake_spawn, board="b")
+    assert not spawns
+    assert res.disk_pressure == "critical"

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import math
 import os
 import re
 import shutil
@@ -2705,11 +2706,11 @@ _SWAPUSAGE_USED_RE = re.compile(r"used\s*=\s*([0-9]+(?:\.[0-9]+)?)\s*([KMG])", r
 _SWAPUSAGE_UNITS = {"K": 1024, "M": 1024 ** 2, "G": 1024 ** 3}
 
 
-def _disk_free_bytes() -> Optional[int]:
-    """Free bytes on the kanban workspaces filesystem, else the home filesystem."""
+def _disk_free_bytes(board: Optional[str] = None) -> Optional[int]:
+    """Free bytes on ``board``'s workspaces filesystem, else the home filesystem."""
     candidates: list[Path] = []
     with contextlib.suppress(Exception):
-        candidates.append(_kb.workspaces_root())
+        candidates.append(_kb.workspaces_root(board))
     with contextlib.suppress(Exception):
         candidates.append(Path.home())
     for path in candidates:
@@ -2722,11 +2723,15 @@ def _disk_free_bytes() -> Optional[int]:
     return None
 
 
-def _swapfiles() -> list[os.stat_result]:
+def _swapfiles() -> Optional[list[os.stat_result]]:
+    """Stats of ``swapfile*`` in the swap dir; ``[]`` when there are none (Linux,
+    zero quantum), ``None`` when the probe itself failed (unreadable dir/file) —
+    a failed probe must not masquerade as "no swap"."""
     try:
         return [p.stat() for p in _SWAP_DIR.glob("swapfile*") if p.is_file()]
     except Exception:
-        return []
+        _kb._log.debug("kanban disk guard: swapfile probe of %s failed", _SWAP_DIR, exc_info=True)
+        return None
 
 
 def _sysctl_swap_used_bytes() -> Optional[int]:
@@ -2758,23 +2763,27 @@ def _meminfo_swap_used_bytes() -> Optional[int]:
     return used_kib * 1024
 
 
-def _disk_sample() -> dict:
+def _disk_sample(board: Optional[str] = None) -> dict:
     """Best-effort disk/swap snapshot (bytes), ``{}`` when free space is unknown.
 
     Module-level seam — conftest patches it to ``{}`` so dispatch results do
-    not depend on the CI runner's disk. Keys: ``free_bytes``, ``quantum_bytes``
-    (largest swapfile, 0 without a swap dir), ``swap_fresh_files`` (swapfiles
-    modified in the last hour) and, when known, ``swap_used_bytes``.
+    not depend on the CI runner's disk. Keys: ``free_bytes`` (``board``'s
+    workspaces filesystem), ``quantum_bytes`` (largest swapfile, 0 without
+    swapfiles), ``swap_files`` / ``swap_fresh_files`` (all swapfiles / those
+    modified in the last hour) and, when known, ``swap_used_bytes``. A failed
+    swapfile probe yields ``swap_probe_failed: True`` and no quantum.
     """
-    free = _disk_free_bytes()
+    free = _disk_free_bytes(board)
     if free is None:
         return {}
     files = _swapfiles()
-    sample: dict = {"free_bytes": free, "quantum_bytes": 0, "swap_fresh_files": 0}
-    with contextlib.suppress(Exception):
-        sample["quantum_bytes"] = max((st.st_size for st in files), default=0)
-    with contextlib.suppress(Exception):
+    sample: dict = {"free_bytes": free}
+    if files is None:
+        sample["swap_probe_failed"] = True
+    else:
         cutoff = time.time() - DISK_GUARD_FRESH_SWAP_SECONDS
+        sample["quantum_bytes"] = max((st.st_size for st in files), default=0)
+        sample["swap_files"] = len(files)
         sample["swap_fresh_files"] = sum(1 for st in files if st.st_mtime >= cutoff)
     swap_used = _sysctl_swap_used_bytes()
     if swap_used is None:
@@ -2784,14 +2793,21 @@ def _disk_sample() -> dict:
     return sample
 
 
-def _positive_float(raw: Any) -> Optional[float]:
-    if isinstance(raw, bool):
+def _floor_gi_to_bytes(raw: Any) -> Optional[int]:
+    """Positive finite GiB value → bytes; ``None`` for anything invalid,
+    including values whose byte conversion is non-finite or overflows."""
+    if raw is None or isinstance(raw, bool):
         return None
     try:
-        value = float(raw)
-    except (TypeError, ValueError):
+        gi = float(raw)
+        if not math.isfinite(gi) or gi <= 0:
+            return None
+        raw_bytes = gi * _GIB_BYTES
+        if not math.isfinite(raw_bytes):
+            return None
+        return int(raw_bytes)
+    except (TypeError, ValueError, OverflowError):
         return None
-    return value if value > 0 and value != float("inf") else None
 
 
 def _disk_floor_bytes() -> int:
@@ -2799,19 +2815,19 @@ def _disk_floor_bytes() -> int:
 
     Invalid or non-positive values fall through to the next source.
     """
-    gi: Optional[float] = None
+    floor: Optional[int] = None
     try:
         from hermes_cli.config import load_config_readonly
         kanban = (load_config_readonly() or {}).get("kanban", {})
         if isinstance(kanban, dict):
-            gi = _positive_float(kanban.get("disk_floor_gi"))
+            floor = _floor_gi_to_bytes(kanban.get("disk_floor_gi"))
     except Exception:
-        gi = None
-    if gi is None:
-        gi = _positive_float(os.environ.get("DISK_GUARD_FLOOR_GI"))
-    if gi is None:
-        gi = DISK_GUARD_DEFAULT_FLOOR_GI
-    return int(gi * _GIB_BYTES)
+        floor = None
+    if floor is None:
+        floor = _floor_gi_to_bytes(os.environ.get("DISK_GUARD_FLOOR_GI"))
+    if floor is None:
+        floor = int(DISK_GUARD_DEFAULT_FLOOR_GI * _GIB_BYTES)
+    return floor
 
 
 def _disk_pressure_level(sample: Optional[Mapping[str, Any]] = None) -> str:
@@ -2820,11 +2836,12 @@ def _disk_pressure_level(sample: Optional[Mapping[str, Any]] = None) -> str:
     With a swap quantum ``q``: critical at ``free <= floor + q`` (the next
     swapfile can fill the disk), elevated at ``free <= floor + 2q + fresh*q``.
     Without one (Linux, no swapfiles): critical at ``free <= floor``, elevated
-    at ``free <= 2*floor``. ``unknown`` imposes no restriction.
+    at ``free <= 2*floor``. ``unknown`` imposes no restriction — including a
+    failed swapfile probe, where the quantum cannot be known (explicit fail-open).
     """
     if sample is None:
         sample = _disk_sample()
-    if not sample:
+    if not sample or sample.get("swap_probe_failed"):
         return "unknown"
     free = sample.get("free_bytes")
     if isinstance(free, bool) or not isinstance(free, int):
@@ -2850,9 +2867,13 @@ def _disk_pressure_detail(sample: Mapping[str, Any]) -> str:
     parts = [f"free {free_gi:.2f} GiB", f"floor {_disk_floor_bytes() / _GIB_BYTES:.2f} GiB"]
     if sample.get("quantum_bytes"):
         parts.append(f"swapfile quantum {sample['quantum_bytes'] / _GIB_BYTES:.2f} GiB")
+    swap = (
+        f"{sample.get('swap_files') or 0} swapfiles "
+        f"({sample.get('swap_fresh_files') or 0} created in last hour)"
+    )
     if "swap_used_bytes" in sample:
-        parts.append(f"swap used {sample['swap_used_bytes'] / _GIB_BYTES:.2f} GiB")
-    parts.append(f"{sample.get('swap_fresh_files') or 0} swapfiles created in last hour")
+        swap = f"swap used {sample['swap_used_bytes'] / _GIB_BYTES:.2f} GiB in {swap}"
+    parts.append(swap)
     return ", ".join(parts)
 
 
@@ -3269,8 +3290,14 @@ def _tick_spawn_budget(
     # Disk-pressure guard: same shape as memory. A full disk kills running
     # workers and the host's swap, so critical spawns nothing; elevated at
     # most one. "unknown" (free space unreadable) imposes no restriction.
-    disk_sample = _disk_sample()
+    disk_sample = _disk_sample(board=board)
     disk_level = _disk_pressure_level(disk_sample)
+    if disk_sample.get("swap_probe_failed"):
+        _kb._log.warning(
+            "kanban dispatch: disk guard swapfile probe of %s failed (free %.2f GiB); "
+            "swap quantum unknown, imposing no disk spawn restriction this tick",
+            _SWAP_DIR, (disk_sample.get("free_bytes") or 0) / _GIB_BYTES,
+        )
     if disk_level == "critical":
         result.disk_pressure = disk_level
         _kb._log.warning(

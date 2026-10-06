@@ -452,7 +452,7 @@ def _neutralize_kanban_disk_guard(request, monkeypatch):
         from hermes_cli import kanban_db_dispatch as _kbd_mod
     except Exception:
         return
-    monkeypatch.setattr(_kbd_mod, "_disk_sample", lambda: {}, raising=False)
+    monkeypatch.setattr(_kbd_mod, "_disk_sample", lambda *a, **k: {}, raising=False)
 
 
 @pytest.fixture(autouse=True)
