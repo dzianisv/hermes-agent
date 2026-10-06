@@ -159,6 +159,15 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
     "HERMES_SESSION_SOURCE",
     "HERMES_SESSION_KEY",
     "HERMES_GATEWAY_SESSION",
+    # Supervisor-identity vars are inherited by any launchd/systemd/s6-spawned Hermes worker and
+    # flip restart/supervisor routing in gateway/restart.py readers launchd_job_label,
+    # is_gateway_supervisor_process and is_supervised_gateway_launch.
+    "HERMES_LAUNCHD_LABEL",
+    "HERMES_GATEWAY_EXTERNAL_SUPERVISOR",
+    "HERMES_S6_SUPERVISED_CHILD",
+    "HERMES_SUPERVISED_CHILD",
+    "XPC_SERVICE_NAME",
+    "INVOCATION_ID",
     "HERMES_CRON_SESSION",
     "_HERMES_GATEWAY",
     "HERMES_PLATFORM",
