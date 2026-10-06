@@ -64,6 +64,19 @@ def _run(argv, timeout=30):
         return ""
 
 
+def _run_rc(argv, timeout=30):
+    """(returncode, stdout); returncode is None on timeout or launch failure.
+
+    For probes where partial output is NOT a measurement: callers must treat
+    any rc != 0 as unknown rather than parse what was printed before failing.
+    """
+    try:
+        p = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, p.stdout
+    except Exception:
+        return None, ""
+
+
 # ----------------------------------------------------------- measurement ---
 
 def free_gi():
@@ -115,15 +128,19 @@ def _swap_used_gi():
 def _swap_files(now):
     """(count, average GiB, files written in the last 24h) or (None,)*3.
 
-    Enumeration lives INSIDE the _run seam with a single 5s bound: an
+    Enumeration lives INSIDE the _run_rc seam with a single 5s bound: an
     os.listdir on a wedged volume blocks with no timeout, and a per-file stat
-    loop multiplies the bound by the file count. The shell expands the glob;
-    an unmatched glob is passed through literally and fails stat (rc!=0).
+    loop multiplies the bound by the file count. The child shell expands the
+    glob and execs stat, so a timeout kill hits stat itself (no orphan holding
+    the pipe). ANY non-zero exit is unknown: an unmatched glob, a timeout, or
+    a stat that printed some rows and then failed (a partial count would
+    understate swap as if it were measured).
     """
     d = os.environ.get("DISK_GUARD_SWAP_DIR") or SWAP_DIR
-    out = _run(["/bin/sh", "-c", 'stat -f "%z %m %N" "$1"/swapfile*', "_", d],
-               timeout=5)
-    if not out:
+    rc, out = _run_rc(
+        ["/bin/sh", "-c", 'exec stat -f "%z %m %N" "$1"/swapfile*', "_", d],
+        timeout=5)
+    if rc != 0 or not out:
         return None, None, None
     rows = []
     for line in out.splitlines():

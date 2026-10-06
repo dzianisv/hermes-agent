@@ -22,6 +22,9 @@ SCRIPT = Path(os.environ.get("DISK_GUARD_ALERT_SCRIPT")
 spec = importlib.util.spec_from_file_location("disk_guard_alert", SCRIPT)
 dga = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(dga)
+# FLOOR_GI / RECLAIM_TARGET_GI are read from THIS checkout's guard, not the
+# deployed copy: a change under review must be checked against itself.
+GUARD_SH = Path(__file__).resolve().parents[1] / "disk-guard.sh"
 
 
 @pytest.fixture(autouse=True)
@@ -104,7 +107,7 @@ def test_every_deployed_floor_agrees_with_the_decision():
 
     found["disk_guard_alert.py"] = float(dga.DEFAULT_FLOOR_GI)
 
-    sh = (root / "scripts" / "disk-guard.sh").read_text()
+    sh = GUARD_SH.read_text()
     m = _re.search(r'FLOOR_GI="\$\{DISK_GUARD_FLOOR_GI:-' + _NUM + r'\}"', sh)
     assert m, "disk-guard.sh no longer declares FLOOR_GI the way this guard parses"
     found["disk-guard.sh"] = float(m.group(1))
@@ -143,7 +146,7 @@ def test_reclaim_target_is_higher_than_the_paging_floor_and_never_pages():
     alert rate the owner cut on 2026-09-22). Both are DERIVED from the file.
     """
     import re as _re
-    sh = Path(os.path.expanduser("~/.hermes/scripts/disk-guard.sh")).read_text()
+    sh = GUARD_SH.read_text()
 
     m = _re.search(r'RECLAIM_TARGET_GI="\$\{DISK_GUARD_RECLAIM_TARGET_GI:-'
                    + _NUM + r'\}"', sh)
@@ -485,13 +488,19 @@ def _fake_run(swap_dir_rows):
     def run(argv, timeout=30):
         if argv[0] == "top":
             return TOP_OUT
-        if argv[0] == "/bin/sh" and "stat" in argv[2]:
-            return swap_dir_rows
         return ""
     return run
 
 
-def _swap_page(monkeypatch, capsys, tmp_path, swap_gi, free="0.3"):
+def _fake_run_rc(swap_dir_rows, rc=0):
+    def run_rc(argv, timeout=30):
+        if argv[0] == "/bin/sh" and "stat" in argv[2]:
+            return rc, swap_dir_rows
+        return 1, ""
+    return run_rc
+
+
+def _swap_page(monkeypatch, capsys, tmp_path, swap_gi, free="0.3", rc=0):
     monkeypatch.delenv("DISK_GUARD_SKIP_TOP", raising=False)
     monkeypatch.delenv("DISK_GUARD_RECLAIM_TARGET_GI", raising=False)
     monkeypatch.setenv("DISK_GUARD_FAKE_FREE_GI", free)
@@ -505,6 +514,7 @@ def _swap_page(monkeypatch, capsys, tmp_path, swap_gi, free="0.3"):
             # a sibling the guard must ignore (not a swapfile proper)
             f"9999999999 {now} {d}/swapfile.lock\n")
     monkeypatch.setattr(dga, "_run", _fake_run(rows))
+    monkeypatch.setattr(dga, "_run_rc", _fake_run_rc(rows, rc))
     assert dga.main(["--dry-run"]) == 1
     return capsys.readouterr().out
 
@@ -547,6 +557,7 @@ def test_swap_info_degrades_to_none_when_every_probe_fails(monkeypatch, tmp_path
     monkeypatch.setenv("DISK_GUARD_SWAP_DIR", str(tmp_path))
     (tmp_path / "swapfile0").write_text("")
     monkeypatch.setattr(dga, "_run", lambda *a, **k: "")
+    monkeypatch.setattr(dga, "_run_rc", lambda *a, **k: (1, ""))
     assert dga.swap_info() == {"used_gi": None, "files": None, "quantum_gi": None,
                                "grew_24h": None, "top": None}
 
@@ -562,22 +573,55 @@ def test_swap_used_parses_sysctl_swapusage(monkeypatch):
 def test_swap_files_reports_the_average_of_actual_sizes(monkeypatch):
     rows = ("1073741824 100 /vm/swapfile0\n"
             "3221225472 200 /vm/swapfile1\n")
-    monkeypatch.setattr(dga, "_run", lambda argv, timeout=30: rows)
+    monkeypatch.setattr(dga, "_run_rc", lambda argv, timeout=30: (0, rows))
     assert dga._swap_files(300) == (2, pytest.approx(2.0), 2)
+
+
+def test_swap_files_partial_output_with_failure_is_unknown(
+        monkeypatch, capsys, tmp_path):
+    """stat printed one valid row and then exited 1: that is NOT a 1-file
+    measurement. The tuple is unknown and the page says so."""
+    out = _swap_page(monkeypatch, capsys, tmp_path, "20", rc=1)
+    assert dga._swap_files(time.time()) == (None, None, None)
+    assert "Swap: used 20.0 Gi in unknown swapfiles (grew by unknown in 24h)" in out
+    assert "in 1 swapfiles" not in out and "in 4 swapfiles" not in out
+
+
+def test_swap_files_full_output_rc0_is_parsed(monkeypatch, capsys, tmp_path):
+    out = _swap_page(monkeypatch, capsys, tmp_path, "20", rc=0)
+    assert dga._swap_files(time.time()) == (3, pytest.approx(1.0), 2)
+    assert "Swap: used 20.0 Gi in 3 swapfiles (grew by 2 in 24h)" in out
+
+
+def test_swap_files_real_hung_stat_is_bounded(monkeypatch, tmp_path):
+    """Real seam, real child: a PATH `stat` that sleeps past the 5s bound is
+    reached through /bin/sh, killed at the bound, and reported unknown."""
+    stubs = tmp_path / "stubs"
+    stubs.mkdir()
+    (stubs / "stat").write_text("#!/bin/sh\nexec sleep 30\n")
+    (stubs / "stat").chmod(0o755)
+    d = tmp_path / "vm"
+    d.mkdir()
+    (d / "swapfile0").write_bytes(b"x")
+    monkeypatch.setenv("PATH", f"{stubs}:{os.environ['PATH']}")
+    monkeypatch.setenv("DISK_GUARD_SWAP_DIR", str(d))
+    t0 = time.monotonic()
+    assert dga._swap_files(time.time()) == (None, None, None)
+    assert time.monotonic() - t0 < 5 + 3
 
 
 def test_swap_files_timeout_degrades_and_page_is_still_composed(
         monkeypatch, capsys, tmp_path):
-    """_run returns None on a timed-out probe: the swap line degrades, nothing
-    raises, and the RED page is still rendered."""
+    """_run_rc returns (None, "") on a timed-out probe: the swap line
+    degrades, nothing raises, and the RED page is still rendered."""
     monkeypatch.setenv("DISK_GUARD_FAKE_FREE_GI", "0.3")
     monkeypatch.setenv("DISK_GUARD_FAKE_SWAP_GI", "20")
     seen = []
 
     def run(argv, timeout=30):
         seen.append((argv, timeout))
-        return None
-    monkeypatch.setattr(dga, "_run", run)
+        return None, ""
+    monkeypatch.setattr(dga, "_run_rc", run)
     assert dga._swap_files(time.time()) == (None, None, None)
     assert dga.main(["--dry-run"]) == 1
     out = capsys.readouterr().out
@@ -594,9 +638,9 @@ def test_swap_files_missing_dir_degrades(monkeypatch, tmp_path):
 
 def test_swap_files_never_enumerates_outside_the_bounded_seam(
         monkeypatch, tmp_path):
-    """os.listdir has no timeout; enumeration must go through _run only."""
+    """os.listdir has no timeout; enumeration must go through _run_rc only."""
     def boom(*a, **k):
-        raise AssertionError("os.listdir called outside the _run seam")
+        raise AssertionError("os.listdir called outside the _run_rc seam")
     monkeypatch.setattr(dga.os, "listdir", boom)
     d = tmp_path / "vm"
     d.mkdir()
