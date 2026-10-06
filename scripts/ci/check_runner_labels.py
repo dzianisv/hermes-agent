@@ -26,7 +26,12 @@ DEFAULT_BASELINE = SCRIPT_DIR / "runner_labels_baseline.txt"
 CORE_LABEL = re.compile(r"[A-Za-z0-9_.-]+-core\b")
 KEY_LINE = re.compile(r"^(\s*)(?:-\s+)?(runs-on|runner)\s*:(.*)$")
 LIST_ITEM = re.compile(r"^(\s*)-\s+(.*)$")
-GUARD = "github.repository_owner == 'NousResearch' && '{label}'"
+GUARDED = re.compile(
+    r"github\.repository_owner\s*==\s*'NousResearch'\s*&&\s*"
+    r"'(?P<org>[^']+)'\s*\|\|\s*'(?P<fallback>[^']+)'"
+)
+BARE = "bare"
+FALLBACK = "fallback"
 
 
 def strip_comment(line: str) -> str:
@@ -43,13 +48,27 @@ def strip_comment(line: str) -> str:
     return line
 
 
-def offending_labels(value: str) -> list[str]:
-    """Return ``-core`` labels in *value* not guarded by the NousResearch check."""
-    return [
-        label
-        for label in CORE_LABEL.findall(value)
-        if GUARD.format(label=label) not in value
+def classify_offenders(value: str) -> list[tuple[str, str]]:
+    """Return ``(label, kind)`` for every org-only ``-core`` label forks would get.
+
+    A guarded ``owner == 'NousResearch' && '<org>' || '<fallback>'`` span is
+    fine only if its fallback is not itself a ``-core`` label. Once all guarded
+    spans are removed, any ``-core`` label left over is unguarded (bare, or
+    guarded with no ``|| '<hosted>'`` fallback).
+    """
+    offenders = [
+        (m.group("fallback"), FALLBACK)
+        for m in GUARDED.finditer(value)
+        if CORE_LABEL.fullmatch(m.group("fallback"))
     ]
+    remainder = GUARDED.sub(" ", value)
+    offenders.extend((label, BARE) for label in CORE_LABEL.findall(remainder))
+    return offenders
+
+
+def offending_labels(value: str) -> list[str]:
+    """Return ``-core`` labels in *value* that a fork would be asked to run on."""
+    return [label for label, _ in classify_offenders(value)]
 
 
 def iter_values(text: str):
@@ -81,12 +100,12 @@ def iter_values(text: str):
             i += 1
 
 
-def scan_file(path: Path) -> list[tuple[int, str]]:
+def scan_file(path: Path) -> list[tuple[int, str, str]]:
     text = path.read_text(encoding="utf-8-sig")
     return [
-        (lineno, label)
+        (lineno, label, kind)
         for lineno, value in iter_values(text)
-        for label in offending_labels(value)
+        for label, kind in classify_offenders(value)
     ]
 
 
@@ -123,12 +142,18 @@ def main(argv: list[str] | None = None) -> int:
             if offenders:
                 seen_baseline_offenders.add(path.name)
             continue
-        for lineno, label in offenders:
+        for lineno, label, kind in offenders:
             failed = True
-            print(
-                f"{path}:{lineno}: hard-coded org runner label '{label}' "
-                "outside github.repository_owner == 'NousResearch' guard"
-            )
+            if kind == FALLBACK:
+                print(
+                    f"{path}:{lineno}: fork fallback runner label '{label}' "
+                    "is an org-only label; use a GitHub-hosted runner"
+                )
+            else:
+                print(
+                    f"{path}:{lineno}: hard-coded org runner label '{label}' "
+                    "outside github.repository_owner == 'NousResearch' guard"
+                )
 
     scanned_names = {p.name for p in files}
     for name in sorted(baseline - seen_baseline_offenders):

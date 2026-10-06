@@ -1,5 +1,6 @@
 """scripts/ci/check_runner_labels.py: bare org-only ``*-core`` runner labels fail; guarded ones pass."""
 
+import importlib.util
 import subprocess
 import sys
 from pathlib import Path
@@ -99,3 +100,37 @@ def test_stale_baseline_entry_fails(tmp_path):
     res = _run("--root", str(tmp_path), "--baseline", str(baseline))
     assert res.returncode == 1
     assert "stale baseline entry 'green.yml'" in res.stdout
+
+
+def _load_module():
+    spec = importlib.util.spec_from_file_location("check_runner_labels", SCRIPT)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_core_fork_fallback_is_an_offender():
+    mod = _load_module()
+    value = "${{ github.repository_owner == 'NousResearch' && 'ubuntu-latest-32-core' || 'ubuntu-latest-32-core' }}"
+    assert mod.offending_labels(value) == ["ubuntu-latest-32-core"]
+
+
+def test_guard_without_hosted_fallback_is_an_offender():
+    mod = _load_module()
+    value = "${{ github.repository_owner == 'NousResearch' && 'ubuntu-latest-32-core' }}"
+    assert mod.offending_labels(value)
+
+
+def test_guard_with_hosted_fallback_is_clean():
+    mod = _load_module()
+    value = "${{ github.repository_owner == 'NousResearch' && 'ubuntu-latest-32-core' || 'ubuntu-latest' }}"
+    assert mod.offending_labels(value) == []
+
+
+def test_matrix_core_fallback_fails_with_file_and_line(tmp_path):
+    text = GREEN.replace("|| 'windows-11-arm'", "|| 'windows-latest-32-arm-core'")
+    path = _write(tmp_path, "fallback.yml", text)
+    res = _run("--root", str(tmp_path), "--no-baseline")
+    assert res.returncode == 1
+    assert f"{path}:12: fork fallback runner label 'windows-latest-32-arm-core'" in res.stdout
+    assert f"{path}:6:" not in res.stdout
