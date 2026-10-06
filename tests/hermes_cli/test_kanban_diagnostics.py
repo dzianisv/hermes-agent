@@ -9,6 +9,7 @@ engine works on sqlite3.Row objects as well as dataclasses.
 
 from __future__ import annotations
 
+import json
 import time
 from pathlib import Path
 
@@ -221,3 +222,137 @@ def test_severity_at_or_above_uses_threshold_semantics():
     assert kd.severity_at_or_above("error", "critical") is False
     assert kd.severity_at_or_above("mystery", "warning") is False
     assert kd.severity_at_or_above("warning", None) is True
+
+
+# ---------------------------------------------------------------------------
+# repeated_failures after a handoff cleared last_failure_error
+#
+# request_review / request_changes clear the task-scoped error text but keep
+# consecutive_failures; the diagnostic must fall back (read-only) to the run
+# history instead of claiming no error was recorded.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("status", ["review", "ready"])
+def test_repeated_failures_falls_back_to_run_history_error(kanban_home, status):
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="streak", assignee="worker")
+        assert kb.claim_task(conn, tid) is not None
+        with kb.write_txn(conn):
+            kb._end_run(conn, tid, outcome="crashed", status="crashed", error="401 auth failed")
+            conn.execute(
+                "UPDATE tasks SET status = ?, claim_lock = NULL, consecutive_failures = 5, "
+                "last_failure_error = NULL WHERE id = ?", (status, tid),
+            )
+        row = conn.execute("SELECT * FROM tasks WHERE id = ?", (tid,)).fetchone()
+        runs = list(conn.execute(
+            "SELECT * FROM task_runs WHERE task_id = ? ORDER BY id", (tid,),
+        ).fetchall())
+        run_id = runs[-1]["id"]
+        diags = [d for d in kd.compute_task_diagnostics(row, [], runs) if d.kind == "repeated_failures"]
+        assert len(diags) == 1
+        diag = diags[0]
+        assert "(no error recorded)" not in diag.title
+        assert f"(historical, run {run_id})" in diag.title
+        assert "401 auth failed" in diag.title and "401 auth failed" in diag.detail
+        assert "run history" in diag.detail
+        assert diag.data["last_error"] is None
+        assert diag.data["historical_run_id"] == run_id
+        assert "historical_error" not in diag.data
+        # Read-only: neither the error text nor the streak is written back.
+        after = conn.execute(
+            "SELECT last_failure_error, consecutive_failures FROM tasks WHERE id = ?", (tid,),
+        ).fetchone()
+        assert after["last_failure_error"] is None
+        assert after["consecutive_failures"] == 5
+    finally:
+        conn.close()
+
+
+def test_repeated_failures_prefers_task_error_over_history():
+    task = _task(consecutive_failures=5, last_failure_error="current boom")
+    runs = [_run("crashed", run_id=1, error="old boom")]
+    diags = kd._rule_repeated_failures(task, [], runs, int(time.time()), {"failure_threshold": 3})
+    assert len(diags) == 1
+    assert "current boom" in diags[0].title and "historical" not in diags[0].title
+    assert diags[0].data["historical_run_id"] is None
+
+
+_FAKE_BEARER = "sk-test-FAKE0123456789abcdefABCDEF"
+_FAKE_ENV_KEY = "sk-proj-FAKE0123456789abcdefABCDEFGHIJ"
+
+
+def test_repeated_failures_historical_error_is_redacted():
+    """Historical run text is raw worker output shown board-wide; credentials never leak."""
+    task = _task(consecutive_failures=5, last_failure_error=None)
+    error = (
+        f'curl -H "Authorization: Bearer {_FAKE_BEARER}" https://api.example.com\n'
+        f"OPENAI_API_KEY={_FAKE_ENV_KEY} 401 auth failed"
+    )
+    runs = [_run("crashed", run_id=7, error=error)]
+    diags = kd._rule_repeated_failures(task, [], runs, int(time.time()), {"failure_threshold": 3})
+    assert len(diags) == 1
+    diag = diags[0]
+    assert "(historical, run 7)" in diag.title
+    assert "run history (run 7)" in diag.detail
+    assert diag.data["historical_run_id"] == 7
+    payload = json.dumps(diag.data)
+    for secret in (_FAKE_BEARER, _FAKE_ENV_KEY):
+        assert secret not in diag.title
+        assert secret not in diag.detail
+        assert secret not in payload
+
+
+def _historical_diag(error: str):
+    """Book one crashed run with ``error``, clear the task field (handoff), and
+    return the board's repeated_failures diagnostic plus its serialized form."""
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="historical", assignee="worker")
+        assert kb.claim_task(conn, tid) is not None
+        with kb.write_txn(conn):
+            kb._end_run(conn, tid, outcome="crashed", status="crashed", error=error)
+            conn.execute(
+                "UPDATE tasks SET status = 'ready', claim_lock = NULL, consecutive_failures = 5, "
+                "last_failure_error = NULL WHERE id = ?", (tid,),
+            )
+        row = conn.execute("SELECT * FROM tasks WHERE id = ?", (tid,)).fetchone()
+        runs = list(conn.execute("SELECT * FROM task_runs WHERE task_id = ? ORDER BY id", (tid,)))
+    finally:
+        conn.close()
+    diags = [d for d in kd.compute_task_diagnostics(row, [], runs) if d.kind == "repeated_failures"]
+    assert len(diags) == 1
+    diag = diags[0]
+    assert f"(historical, run {runs[-1]['id']})" in diag.title
+    return diag, (diag.title, diag.detail, json.dumps(diag.to_dict()))
+
+
+def _slices(secret: str, width: int) -> set[str]:
+    return {secret[i:i + width] for i in range(len(secret) - width + 1)}
+
+
+def test_historical_error_redacts_url_query_credential(kanban_home):
+    secret = "opaqueDemoCredential0123456789"
+    _diag, surfaces = _historical_diag(
+        f"request failed: GET https://api.example.com/v1/x?api_key={secret}&foo=1"
+    )
+    for text in surfaces:
+        assert secret not in text
+        assert "opaqueDemo" not in text and "Credential0123" not in text
+        assert not any(s in text for s in _slices(secret, 8))
+
+
+def test_historical_error_redacts_token_straddling_the_snippet_cut(kanban_home):
+    """A token cut at the 500-char snippet boundary is still recognised whole."""
+    body = "Zq7Wm2Xr9Lk4Pv8Ns3Jd6Hb1Tf5Yc0Ga2Ue7Ri4O"
+    assert len(body) == 40
+    before_cut = 12
+    filler = "x" * (500 - len(" sk-proj-") - before_cut)
+    _diag, surfaces = _historical_diag(f"{filler} sk-proj-{body} tail")
+    # Truncate-then-redact masked the cut token with this interior slice as its "tail".
+    leaked_by_truncation = body[before_cut - 4:before_cut]
+    for text in surfaces:
+        assert body not in text
+        assert not any(s in text for s in _slices(body, 8))
+        assert leaked_by_truncation not in text
