@@ -145,6 +145,28 @@ def _outcome_key_policy(board: Optional[str]) -> tuple[bool, Optional[str]]:
     return bool(require), (str(pattern) if pattern else None)
 
 
+def board_for_conn(conn: sqlite3.Connection) -> Optional[str]:
+    """Slug of the board whose DB ``conn`` is attached to, or None when the
+    file is not a recognisable board DB (pinned/ad-hoc path). Policy must
+    follow the connection, not the process's *current* board."""
+    try:
+        row = conn.execute("PRAGMA database_list").fetchone()
+        path = row[2] if row else None
+    except Exception:
+        return None
+    if not path:
+        return None
+    try:
+        p = Path(path).resolve()
+        if p == kanban_db_path(DEFAULT_BOARD).resolve():
+            return DEFAULT_BOARD
+        if p.name == "kanban.db" and p.parent.parent == boards_root().resolve():
+            return _slug_or_default(p.parent.name)
+    except Exception:
+        return None
+    return None
+
+
 def check_outcome_key(outcome_key: Optional[str], board: Optional[str] = None) -> Optional[str]:
     """Normalise ``outcome_key`` and enforce the board policy; raises OutcomeKeyError."""
     key = str(outcome_key).strip() if outcome_key is not None else ""
@@ -173,6 +195,48 @@ def _open_task_for_outcome_key(
         (outcome_key, project_id or "", *OUTCOME_KEY_CLOSED_STATUSES),
     ).fetchone()
     return row[0] if row else None
+
+
+def outcome_key_reopen_conflicts(
+    conn: sqlite3.Connection, task_ids: Iterable[str],
+) -> list[tuple[str, str, str]]:
+    """For closed tasks about to reopen, ``(task_id, outcome_key, owner_id)``
+    where another OPEN task already holds the key (released then reused)."""
+    conflicts = []
+    for tid in task_ids:
+        row = conn.execute(
+            "SELECT outcome_key, project_id, status FROM tasks WHERE id = ?", (tid,),
+        ).fetchone()
+        if row is None or not row["outcome_key"] or row["status"] not in OUTCOME_KEY_CLOSED_STATUSES:
+            continue
+        owner = _open_task_for_outcome_key(conn, row["project_id"], row["outcome_key"])
+        if owner and owner != tid:
+            conflicts.append((tid, row["outcome_key"], owner))
+    return conflicts
+
+
+def format_outcome_key_conflicts(conflicts: list[tuple[str, str, str]]) -> str:
+    return "; ".join(
+        f"cannot reopen {tid}: outcome_key {key!r} is now owned by open task {owner} "
+        f"(close/archive {owner} or clear its outcome_key first)"
+        for tid, key, owner in conflicts
+    )
+
+
+def reopen_affected_task_ids(conn: sqlite3.Connection, task_id: str) -> list[str]:
+    """``task_id`` plus every descendant a done-reopen would retract."""
+    rows = conn.execute(
+        """
+        WITH RECURSIVE descendants(id) AS (
+            SELECT child_id FROM task_links WHERE parent_id = ?
+            UNION
+            SELECT l.child_id FROM task_links l JOIN descendants d ON d.id = l.parent_id
+        )
+        SELECT t.id FROM descendants d JOIN tasks t ON t.id = d.id WHERE t.status = 'done'
+        """,
+        (task_id,),
+    ).fetchall()
+    return [task_id, *(r[0] for r in rows)]
 
 
 def _fold_into_outcome_key(
@@ -1416,7 +1480,8 @@ def create_task(
     )
     parents = tuple(p for p in parents if p)
     skills_list = _normalize_task_skills(skills)
-    outcome_key = check_outcome_key(outcome_key, board)
+    # The connection's board is the real target; ``board`` is only a hint.
+    outcome_key = check_outcome_key(outcome_key, board_for_conn(conn) or board)
 
     # Idempotency check BEFORE the write txn (no lock held); a concurrent-create
     # race may insert twice, the next lookup stabilises on the newest.
@@ -3897,6 +3962,12 @@ def reopen_done_task(
             return False, (
                 f"task {task_id} is {prior!r}; reopen-done only applies to 'done' or 'archived'"
             )
+        # A released outcome_key may have been reused by another open task;
+        # reopening (this task or a done descendant) would violate the
+        # one-open-per-key index. Refuse before any write, naming the owner.
+        conflicts = outcome_key_reopen_conflicts(conn, reopen_affected_task_ids(conn, task_id))
+        if conflicts:
+            return False, format_outcome_key_conflicts(conflicts)
         _reclaim_dangling_run(
             conn, task_id, statuses=("done", "archived"), now=now,
             note="invariant recovery on done reopen",

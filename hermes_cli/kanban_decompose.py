@@ -55,7 +55,8 @@ Output a single JSON object with this exact shape:
         "title": "<concrete task title, imperative voice, <= 80 chars>",
         "body":  "<detailed spec for the worker on this child task>",
         "assignee": "<profile name from the roster, or null for default>",
-        "parents": [<int>, ...]
+        "parents": [<int>, ...],
+        "outcome_key": "<optional stable outcome id, e.g. G3; omit unless the task names one>"
       },
       ...
     ]
@@ -261,7 +262,10 @@ def _clean_children(task_id: str, raw_tasks: list, routing: _Routing) -> tuple[l
         parents = entry.get("parents") or []
         if not isinstance(parents, list):
             parents = []
+        outcome_key = entry.get("outcome_key")
+        outcome_key = outcome_key.strip() if isinstance(outcome_key, str) else None
         children.append({
+            "outcome_key": outcome_key or None,
             "title": title.strip()[:200],
             "body": body.strip() if isinstance(body, str) else "",
             "assignee": chosen,

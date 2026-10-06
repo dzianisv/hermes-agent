@@ -913,6 +913,23 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     # project would never conflict. Closed statuses free the key.
     from hermes_cli.kanban_db import OUTCOME_KEY_CLOSED_STATUSES as _closed
     _closed_sql = ", ".join(f"'{s}'" for s in sorted(_closed))
+    # Pre-existing duplicates would make CREATE UNIQUE INDEX fail with an
+    # opaque IntegrityError. Name them instead; never rewrite user data.
+    dupes = conn.execute(
+        "SELECT COALESCE(project_id, '') AS proj, outcome_key, GROUP_CONCAT(id, ', ') AS ids "
+        f"FROM tasks WHERE outcome_key IS NOT NULL AND status NOT IN ({_closed_sql}) "
+        "GROUP BY 1, 2 HAVING COUNT(*) > 1"
+    ).fetchall()
+    if dupes:
+        detail = "; ".join(
+            f"outcome_key {d[1]!r}" + (f" (project {d[0]})" if d[0] else "") + f": tasks {d[2]}"
+            for d in dupes
+        )
+        raise RuntimeError(
+            "kanban migration: cannot enforce one open task per outcome_key — duplicate "
+            f"open tasks exist: {detail}. Close/archive all but one, or clear the extra "
+            "outcome_key values, then rerun."
+        )
     conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS uq_tasks_open_outcome_key "
         "ON tasks(COALESCE(project_id, ''), outcome_key) "

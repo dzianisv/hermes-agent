@@ -36,6 +36,8 @@ class SwarmWorkerSpec:
     skills: list[str] = field(default_factory=list)
     priority: int = 0
     max_runtime_seconds: Optional[int] = None
+    # None derives "<swarm outcome_key>/worker-<n>" when the swarm has a key.
+    outcome_key: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -119,8 +121,13 @@ def create_swarm(
     workspace_path: Optional[str] = None,
     priority: int = 0,
     idempotency_key: Optional[str] = None,
+    outcome_key: Optional[str] = None,
 ) -> SwarmCreated:
-    """Atomically create a durable, immediately dispatchable Kanban swarm."""
+    """Atomically create a durable, immediately dispatchable Kanban swarm.
+
+    ``outcome_key`` keys the root; workers/verifier/synthesizer derive
+    ``<key>/worker-<n>``, ``<key>/verify``, ``<key>/synthesize`` (a worker's
+    own ``outcome_key`` wins) so swarms work on require_outcome_key boards."""
     activation_summary = "Swarm topology planned; root remains the shared blackboard."
     activated = False
     with kb.write_txn(conn):
@@ -129,7 +136,7 @@ def create_swarm(
             synthesizer_assignee=synthesizer_assignee, root_title=root_title,
             verifier_title=verifier_title, synthesizer_title=synthesizer_title, tenant=tenant,
             created_by=created_by, workspace_kind=workspace_kind, workspace_path=workspace_path,
-            priority=priority, idempotency_key=idempotency_key,
+            priority=priority, idempotency_key=idempotency_key, outcome_key=outcome_key,
         )
         root = kb.get_task(conn, created.root_id)
         if root is not None and root.status == "blocked":
@@ -167,6 +174,7 @@ def _create_swarm_uncommitted(
     verifier_assignee: str, synthesizer_assignee: str, root_title: Optional[str],
     verifier_title: str, synthesizer_title: str, tenant: Optional[str], created_by: str,
     workspace_kind: Optional[str], workspace_path: Optional[str], priority: int, idempotency_key: Optional[str],
+    outcome_key: Optional[str] = None,
 ) -> SwarmCreated:
     """Create the swarm graph inside the caller's transaction: planning root
     (``blocked`` until the caller activates it), parallel workers, a verifier
@@ -195,8 +203,13 @@ def _create_swarm_uncommitted(
         priority=priority,
         idempotency_key=idempotency_key,
         initial_status="blocked",
+        outcome_key=outcome_key,
         **common,
     )
+    base_key = (outcome_key or "").strip() or None
+
+    def _sub_key(suffix: str, explicit: Optional[str] = None) -> Optional[str]:
+        return explicit or (f"{base_key}/{suffix}" if base_key else None)
 
     # Idempotency may return an existing root: recover its topology from the
     # blackboard instead of duplicating the graph.
@@ -219,9 +232,10 @@ def _create_swarm_uncommitted(
             priority=spec.priority or priority,
             skills=spec.skills or None,
             max_runtime_seconds=spec.max_runtime_seconds,
+            outcome_key=_sub_key(f"worker-{i}", spec.outcome_key),
             **common,
         )
-        for spec in worker_specs
+        for i, spec in enumerate(worker_specs, start=1)
     ]
     verifier = kb.create_task(
         conn,
@@ -236,6 +250,7 @@ def _create_swarm_uncommitted(
         parents=worker_ids,
         priority=priority,
         skills=["requesting-code-review"],
+        outcome_key=_sub_key("verify"),
         **common,
     )
     synthesizer = kb.create_task(
@@ -250,6 +265,7 @@ def _create_swarm_uncommitted(
         parents=[verifier],
         priority=priority,
         skills=["humanizer"],
+        outcome_key=_sub_key("synthesize"),
         **common,
     )
 

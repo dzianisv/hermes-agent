@@ -418,6 +418,7 @@ class CreateTaskBody(BaseModel):
     provider_override: Optional[str] = None
     reasoning_effort: Optional[str] = None  # none|minimal|…|ultra; None inherits the profile's level
     project_id: Optional[str] = None  # None inherits the board's scoped project (if any)
+    outcome_key: Optional[str] = None  # one OPEN task per (project, key); duplicates fold
 
 
 @router.post("/tasks")
@@ -427,6 +428,8 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
         task_id = kanban_db.create_task(conn, created_by="dashboard", board=board, **payload.model_dump())
         task = kanban_db.get_task(conn, task_id)
         body: dict[str, Any] = {"task": _task_dict(task) if task else None}
+        if getattr(task_id, "deduped", False):
+            body["deduped"] = True
         # Dispatcher-presence warning so the UI can banner a ready+assigned task that would
         # otherwise sit idle (no gateway / dispatch_in_gateway=false); triage/todo are expected
         # to wait, unassigned tasks can't dispatch anyway. Probe the request's active home: the
@@ -745,6 +748,11 @@ def _set_status_direct(conn: sqlite3.Connection, task_id: str, new_status: str) 
             return False
         was_running = prev["status"] == "running"
         reopening_satisfied_parent = prev["status"] in {"done", "archived"} and effective_status not in {"done", "archived"}
+        if reopening_satisfied_parent:
+            conflicts = kanban_db.outcome_key_reopen_conflicts(
+                conn, kanban_db.reopen_affected_task_ids(conn, task_id))
+            if conflicts:
+                raise HTTPException(status_code=409, detail=kanban_db.format_outcome_key_conflicts(conflicts))
         cur = conn.execute(
             "UPDATE tasks SET status = ?, "
             "  claim_lock = CASE WHEN ? = 'running' THEN claim_lock ELSE NULL END, "
