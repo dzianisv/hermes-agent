@@ -3060,6 +3060,13 @@ def _design_phase_cfg() -> Optional[dict]:
     }
 
 
+def _brief_has_marker(text: str, marker: str) -> bool:
+    # A header line "KEY:" or "KEY (qualifier):" counts; prose mentions do not.
+    key = marker.rstrip(":")
+    pattern = rf"^\s*{re.escape(key)}\b[^:\n]{{0,80}}:"
+    return re.search(pattern, text, re.MULTILINE | re.IGNORECASE) is not None
+
+
 def _design_phase_guard(conn: sqlite3.Connection, task_id: str, assignee: str) -> Optional[str]:
     """Return a reason and park the card when an implementation card did not come
     through the design phase; ``None`` when it may be claimed.
@@ -3102,8 +3109,7 @@ def _design_phase_guard(conn: sqlite3.Connection, task_id: str, assignee: str) -
                 ok = bool(ids) or bool(re.search(r"notion\.(so|com)/", v))
             if ok:
                 break
-    low = text.lower()
-    missing = [r for r in cfg["required"] if r.lower() not in low]
+    missing = [r for r in cfg["required"] if not _brief_has_marker(text, r)]
     if ok and not missing:
         return None
     if not ok:
