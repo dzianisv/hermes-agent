@@ -1888,6 +1888,9 @@ DEFAULT_CONFIG = {
         # Auto-block after this many consecutive non-success attempts (spawn_failed, timed_out,
         # crashed) for the same task/profile. Reassignment resets the streak.
         "failure_limit": 2,
+        # Floor in GiB for the dispatcher disk guard (no spawns at <= floor + one swapfile quantum
+        # free). None -> env DISK_GUARD_FLOOR_GI -> 0.5.
+        "disk_floor_gi": None,
         # Worker stdout/stderr log rotation at spawn time (2 MiB + one backup). Raise to keep more
         # early failure evidence from long-running workers.
         "worker_log_rotate_bytes": 2 * 1024 * 1024,
