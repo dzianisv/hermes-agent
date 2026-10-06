@@ -2591,6 +2591,33 @@ def _extend_run_claim(conn: sqlite3.Connection, task_id: str, expires: int) -> O
     return run_id
 
 
+# Host sleep detection (#5): wall clock keeps advancing while the machine sleeps
+# but ``time.monotonic`` does not (mach_absolute_time on macOS, CLOCK_MONOTONIC
+# on Linux). A frozen worker cannot heartbeat, so the wall-clock heartbeat age
+# must be credited with the time slept or every live worker looks wedged on wake.
+_SLEEP_JUMP_MIN_SECONDS = 60
+_clock_sample: Optional[tuple] = None  # (wall, monotonic) at the last tick
+_sleep_intervals: list = []  # [(wake_wall, slept_seconds)], bounded
+
+
+def _note_clock_sample(wall: float, mono: float) -> None:
+    """Record a (wall, monotonic) sample; log a sleep interval on a wall jump."""
+    global _clock_sample
+    prev = _clock_sample
+    _clock_sample = (wall, mono)
+    if prev is None:
+        return
+    slept = (wall - prev[0]) - (mono - prev[1])
+    if slept >= _SLEEP_JUMP_MIN_SECONDS:
+        _sleep_intervals.append((wall, slept))
+        del _sleep_intervals[:-64]
+
+
+def _slept_seconds_since(ts: float) -> float:
+    """Seconds the host slept after wall-clock ``ts`` (as seen by this process)."""
+    return sum(slept for wake, slept in _sleep_intervals if wake > ts)
+
+
 def release_stale_claims(
     conn: sqlite3.Connection, *, signal_fn=None, failure_limit: Optional[int] = None,
 ) -> int:
@@ -2620,7 +2647,9 @@ def release_stale_claims(
     ``enforce_max_runtime`` and ``detect_crashed_workers`` remain the upper bounds for genuinely wedged or
     dead workers.
     """
-    now = int(time.time())
+    wall = time.time()
+    _note_clock_sample(wall, time.monotonic())
+    now = int(wall)
     reclaimed = 0
     host_prefix = _host_prefix()
     stale = conn.execute(
@@ -2635,7 +2664,10 @@ def release_stale_claims(
         hb = row["last_heartbeat_at"]
         # Backstop: a heartbeat older than the max-stale threshold means no
         # observable progress — reclaim even if the PID is alive (logic loop).
-        heartbeat_stale = hb is not None and (now - int(hb)) > DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS
+        # Time the host slept is not worker silence (#5): credit it back.
+        heartbeat_stale = hb is not None and (
+            now - int(hb) - _slept_seconds_since(int(hb))
+        ) > DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS
         started_at = _row_get(row, "worker_started_at")
         if (host_local and row["worker_pid"] and _worker_alive(row["worker_pid"], started_at)
                 and not heartbeat_stale):
