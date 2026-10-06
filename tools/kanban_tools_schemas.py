@@ -252,6 +252,30 @@ KANBAN_REQUEST_REVIEW_SCHEMA = _schema(
     ["summary"],
 )
 
+_REVIEW_RECORD_PROP = {
+    "type": "object",
+    "description": (
+        "One FULL review pass. Rejected if head_sha is missing or any item is "
+        "UNREVIEWED. Reuse prior finding ids; new findings on a re-review need class."
+    ),
+    "properties": {
+        "base_sha": {"type": "string"},
+        "head_sha": {"type": "string", "description": "Exact commit SHA reviewed."},
+        "items": {"type": "array", "description": "Every acceptance item.", "items": {
+            "type": "object", "required": ["id", "verdict", "evidence"], "properties": {
+                "id": {"type": "string"},
+                "verdict": {"type": "string", "enum": ["PASS", "FAIL", "UNREVIEWED"]},
+                "evidence": {"type": "string"}}}},
+        "findings": {"type": "array", "items": {
+            "type": "object", "required": ["id", "summary"], "properties": {
+                "id": {"type": "string", "description": "Stable id, e.g. F1."},
+                "summary": {"type": "string"}, "evidence": {"type": "string"},
+                "class": {"type": "string", "enum": [
+                    "pre-existing-miss", "regression", "changed-requirement"]}}}},
+    },
+    "required": ["head_sha", "items"],
+}
+
 KANBAN_REQUEST_CHANGES_SCHEMA = _schema(
     "kanban_request_changes",
     (
@@ -267,8 +291,9 @@ KANBAN_REQUEST_CHANGES_SCHEMA = _schema(
                 "Specific, actionable changes the implementer must make "
                 "before requesting another review."
         )),
+        "review_record": _REVIEW_RECORD_PROP,
     },
-    ["reason"],
+    ["reason", "review_record"],
 )
 
 KANBAN_APPROVE_SCHEMA = _schema(
@@ -285,8 +310,9 @@ KANBAN_APPROVE_SCHEMA = _schema(
         "task_id": _prop("string", _DESC_TASK_ID_DEFAULT),
         "summary": _prop("string", "What was approved and at which exact head/SHA."),
         "merger": _prop("string", "Optional profile that merges; defaults to the implementer."),
+        "review_record": _REVIEW_RECORD_PROP,
     },
-    ["summary"],
+    ["summary", "review_record"],
 )
 
 KANBAN_HEARTBEAT_SCHEMA = _schema(

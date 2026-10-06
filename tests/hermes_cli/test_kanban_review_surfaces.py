@@ -68,6 +68,10 @@ def test_review_tools_redact_handoff_and_route_changes(
     changed = json.loads(
         tools._handle_request_changes({
             "reason": f"Add a boundary assertion; leaked={change_secret}",
+            "review_record": {
+                "head_sha": "abc1234",
+                "items": [{"id": "AC1", "verdict": "FAIL", "evidence": "no boundary test"}],
+            },
         })
     )
     assert changed["ok"] is True

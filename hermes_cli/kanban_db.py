@@ -994,6 +994,19 @@ CREATE TABLE IF NOT EXISTS task_comments (
     created_at INTEGER NOT NULL
 );
 
+-- Structured reviewer verdicts (#11): one full-pass record per
+-- kanban_request_changes / kanban_approve, stored whole (never truncated
+-- like comments/summaries) so the next review can diff head-to-head.
+CREATE TABLE IF NOT EXISTS task_review_records (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id    TEXT NOT NULL,
+    run_id     INTEGER,
+    verdict    TEXT NOT NULL,
+    head_sha   TEXT NOT NULL,
+    record     TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS task_events (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     task_id    TEXT NOT NULL,
@@ -3508,8 +3521,109 @@ def _nonblank_str(value: Any) -> Optional[str]:
     return value if isinstance(value, str) and value.strip() else None
 
 
+REVIEW_ITEM_VERDICTS = ("PASS", "FAIL", "UNREVIEWED")
+REVIEW_FINDING_CLASSES = ("pre-existing-miss", "regression", "changed-requirement")
+_SHA_RE = re.compile(r"^[0-9a-fA-F]{7,64}$")
+
+
+def latest_review_record(conn: sqlite3.Connection, task_id: str) -> Optional[dict]:
+    """Newest stored review record for ``task_id`` (with ``verdict``), or None."""
+    row = conn.execute(
+        "SELECT verdict, record FROM task_review_records WHERE task_id = ? "
+        "ORDER BY id DESC LIMIT 1", (task_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    rec = _json_dict(row["record"])
+    rec["verdict"] = row["verdict"]
+    return rec
+
+
+def validate_review_record(
+    conn: sqlite3.Connection, task_id: str, record: Any, *, verdict: str,
+) -> tuple[Optional[dict], Optional[str]]:
+    """Normalize a reviewer record (#11). A record is one FULL pass: exact
+    head SHA, every acceptance item PASS/FAIL with evidence (no UNREVIEWED),
+    findings with stable unique ids. On re-review every finding id not in the
+    prior record must carry a ``class``. Returns ``(record, None)`` or
+    ``(None, error)``."""
+    if not isinstance(record, dict):
+        return None, "review_record must be an object"
+    head = str(record.get("head_sha") or "").strip()
+    if not _SHA_RE.match(head):
+        return None, "review_record.head_sha is required (the exact commit SHA reviewed)"
+    base = str(record.get("base_sha") or "").strip()
+    if base and not _SHA_RE.match(base):
+        return None, "review_record.base_sha must be a commit SHA"
+    items_in = record.get("items")
+    if not isinstance(items_in, list) or not items_in:
+        return None, "review_record.items must list every acceptance item with a verdict"
+    items, seen = [], set()
+    for it in items_in:
+        if not isinstance(it, dict) or not str(it.get("id") or "").strip():
+            return None, "each review_record.items entry needs an id"
+        iid = str(it["id"]).strip()
+        v = str(it.get("verdict") or "").strip().upper()
+        if v not in REVIEW_ITEM_VERDICTS:
+            return None, f"item {iid}: verdict must be one of {', '.join(REVIEW_ITEM_VERDICTS)}"
+        if v == "UNREVIEWED":
+            return None, (f"item {iid} is UNREVIEWED: review every acceptance item in "
+                          "this pass before submitting a verdict")
+        ev = str(it.get("evidence") or "").strip()
+        if not ev:
+            return None, f"item {iid}: evidence is required"
+        if iid in seen:
+            return None, f"duplicate item id {iid}"
+        seen.add(iid)
+        items.append({"id": iid, "verdict": v, "evidence": ev})
+    prior = latest_review_record(conn, task_id)
+    prior_ids = {str(f.get("id")) for f in (prior or {}).get("findings") or [] if isinstance(f, dict)}
+    findings_in = record.get("findings") or []
+    if not isinstance(findings_in, list):
+        return None, "review_record.findings must be a list"
+    findings, fseen = [], set()
+    for f in findings_in:
+        if not isinstance(f, dict) or not str(f.get("id") or "").strip():
+            return None, "each finding needs a stable id (reuse the prior id for the same issue)"
+        fid = str(f["id"]).strip()
+        if fid in fseen:
+            return None, f"duplicate finding id {fid}"
+        fseen.add(fid)
+        summary = str(f.get("summary") or "").strip()
+        if not summary:
+            return None, f"finding {fid}: summary is required"
+        out = {"id": fid, "summary": summary, "evidence": str(f.get("evidence") or "").strip()}
+        cls = str(f.get("class") or "").strip()
+        if cls and cls not in REVIEW_FINDING_CLASSES:
+            return None, f"finding {fid}: class must be one of {', '.join(REVIEW_FINDING_CLASSES)}"
+        if prior is not None and fid not in prior_ids and not cls:
+            return None, (f"finding {fid} is new since the prior review at "
+                          f"{prior.get('head_sha')}: set class to one of "
+                          f"{', '.join(REVIEW_FINDING_CLASSES)}")
+        if cls:
+            out["class"] = cls
+        findings.append(out)
+    fails = [i["id"] for i in items if i["verdict"] == "FAIL"]
+    if verdict == "approved" and fails:
+        return None, f"cannot approve with FAIL items: {', '.join(fails)}"
+    if verdict == "changes_requested" and not fails and not findings:
+        return None, "request_changes needs at least one FAIL item or finding"
+    rec = {"base_sha": base or None, "head_sha": head, "items": items, "findings": findings}
+    return redact_review_value(rec), None
+
+
+def _store_review_record(conn, task_id, run_id, verdict, record) -> None:
+    conn.execute(
+        "INSERT INTO task_review_records (task_id, run_id, verdict, head_sha, record, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (task_id, run_id, verdict, record["head_sha"],
+         json.dumps(record, ensure_ascii=False), int(time.time())),
+    )
+
+
 def request_changes(
     conn: sqlite3.Connection, task_id: str, *, reason: str, expected_run_id: Optional[int] = None,
+    review_record: Optional[dict] = None,
 ) -> tuple[bool, Optional[str]]:
     """Close an active reviewer run (claimed from ``review``) and hand the task
     back to the implementer from the latest ``review_requested`` event, parent
@@ -3542,6 +3656,12 @@ def request_changes(
         if implementer is None:
             return False, "review handoff has no valid implementer provenance"
         reviewer = _canonical_assignee(_nonblank_str(task_row["assignee"]))
+        record = None
+        if review_record is not None:
+            record, err = validate_review_record(
+                conn, task_id, review_record, verdict="changes_requested")
+            if err:
+                return False, err
 
         new_status = _landing_status_after_parents(conn, task_id)
         # consecutive_failures deliberately PRESERVED: a review transition is
@@ -3576,15 +3696,19 @@ def request_changes(
                 "implementer": implementer,
                 "reviewer": reviewer,
                 "status": new_status,
+                **({"head_sha": record["head_sha"]} if record else {}),
             },
             run_id=run_id,
         )
+        if record:
+            _store_review_record(conn, task_id, run_id, "changes_requested", record)
     return True, implementer
 
 
 def approve_for_merge(
     conn: sqlite3.Connection, task_id: str, *, summary: str,
     expected_run_id: Optional[int] = None, merger: Optional[str] = None,
+    review_record: Optional[dict] = None,
 ) -> tuple[bool, Optional[str]]:
     """Reviewer verdict "approved, now merge" (#26). Closes the active review
     run as ``approved`` (reviewer provenance stays on the run and event), moves
@@ -3616,6 +3740,11 @@ def approve_for_merge(
         if target is None:
             return False, "review handoff has no implementer provenance; pass merger="
         reviewer = _canonical_assignee(_nonblank_str(task_row["assignee"]))
+        record = None
+        if review_record is not None:
+            record, err = validate_review_record(conn, task_id, review_record, verdict="approved")
+            if err:
+                return False, err
         new_status = _landing_status_after_parents(conn, task_id)
         cur = conn.execute(
             """
@@ -3633,9 +3762,12 @@ def approve_for_merge(
         _append_event(
             conn, task_id, "review_approved",
             {"summary": _first_line(summary, 400), "implementer": implementer,
-             "reviewer": reviewer, "merger": target, "status": new_status, "stage": "merge"},
+             "reviewer": reviewer, "merger": target, "status": new_status, "stage": "merge",
+             **({"head_sha": record["head_sha"]} if record else {})},
             run_id=run_id,
         )
+        if record:
+            _store_review_record(conn, task_id, run_id, "approved", record)
     return True, target
 
 
@@ -4183,6 +4315,7 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     _ctx_prior_attempts(lines, conn, task_id, now)
     _ctx_parent_results(lines, conn, task_id, now)
     _ctx_role_history(lines, conn, task, now)
+    _ctx_review_record(lines, latest_review_record(conn, task_id))
     _ctx_comments(lines, list_comments(conn, task_id), now)
     return "\n".join(lines).rstrip() + "\n"
 
@@ -4354,6 +4487,27 @@ def _ctx_role_history(lines: list[str], conn: sqlite3.Connection, task: Task, no
         lines.append(
             f"- {row['id']} — {row['title']} ({_ctx_stamp(int(row['ended_at']), now)}): {first}"
         )
+    lines.append("")
+
+
+def _ctx_review_record(lines: list[str], record: Optional[dict]) -> None:
+    """Prior structured review (#11), rendered whole so a re-review checks
+    only the SHA-to-SHA delta plus the prior FAIL items/findings."""
+    if not record:
+        return
+    head = record.get("head_sha")
+    lines.append("## Prior review record")
+    lines.append(f"Verdict: {record.get('verdict')} at head `{head}`"
+                 + (f" (base `{record['base_sha']}`)" if record.get("base_sha") else ""))
+    lines.append(f"Re-review hint: inspect `git diff {head}..HEAD` and re-check the "
+                 "FAIL items and findings below; reuse finding ids, and give any new "
+                 f"finding a class ({', '.join(REVIEW_FINDING_CLASSES)}).")
+    for it in record.get("items") or []:
+        lines.append(f"- {it.get('id')}: {it.get('verdict')} — {it.get('evidence')}")
+    for f in record.get("findings") or []:
+        cls = f" [{f['class']}]" if f.get("class") else ""
+        lines.append(f"- finding {f.get('id')}{cls}: {f.get('summary')}"
+                     + (f" — {f['evidence']}" if f.get("evidence") else ""))
     lines.append("")
 
 

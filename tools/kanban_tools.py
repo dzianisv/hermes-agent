@@ -841,6 +841,14 @@ def _handle_request_review(args: dict, **kw) -> str:
         return _ok_landed(kb, conn, tid, "review")
 
 
+def _require_review_record(args: dict) -> dict:
+    rec = args.get("review_record")
+    _check(isinstance(rec, dict), "review_record is required: {head_sha, base_sha, "
+           "items:[{id, verdict PASS|FAIL, evidence}], findings:[{id, summary, evidence, class?}]} "
+           "covering every acceptance item in one full pass")
+    return rec
+
+
 @_kanban_handler("kanban_request_changes")
 def _handle_request_changes(args: dict, **kw) -> str:
     """Return a reviewer-owned running task to its implementer."""
@@ -849,7 +857,8 @@ def _handle_request_changes(args: dict, **kw) -> str:
         _require_text(args, "reason", "reason is required — describe the changes needed"))
     with _board(args.get("board")) as (kb, conn):
         ok, detail = kb.request_changes(
-            conn, tid, reason=reason, expected_run_id=_worker_run_id(tid))
+            conn, tid, reason=reason, expected_run_id=_worker_run_id(tid),
+            review_record=_require_review_record(args))
         _check(ok, f"could not request changes for {tid}: {detail or 'invalid review state'}")
         return _ok_landed(kb, conn, tid, "ready", implementer=detail)
 
@@ -868,7 +877,8 @@ def _handle_approve(args: dict, **kw) -> str:
                f"Installed profiles: {', '.join(list_profile_names())}")
     with _board(args.get("board")) as (kb, conn):
         ok, detail = kb.approve_for_merge(
-            conn, tid, summary=summary, merger=merger, expected_run_id=_worker_run_id(tid))
+            conn, tid, summary=summary, merger=merger, expected_run_id=_worker_run_id(tid),
+            review_record=_require_review_record(args))
         _check(ok, f"could not approve {tid}: {detail or 'invalid review state'}")
         return _ok_landed(kb, conn, tid, "ready", merger=detail, stage="merge")
 
