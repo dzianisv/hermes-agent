@@ -121,21 +121,18 @@ swap_used_gi() { # prints numeric Gi (one decimal) or nothing
 
 swap_files_term() { # "swapfiles=NxQ.QGi swapfiles_sum=S.SGi newest=<iso>" or "swapfiles=unreadable"
   # Q is the AVERAGE (sum/N), not the max: N x max overstated mixed-size swap.
-  # The glob is expanded by the shell (no I/O per file); every size/mtime
-  # comes from ONE stat call under ONE wall-clock bound.
-  local dir="${DISK_GUARD_SWAP_DIR:-/System/Volumes/VM}" f out
-  local files=()
-  for f in "$dir"/swapfile*; do
-    case "${f##*/}" in swapfile|swapfile\*|*.*) continue ;; esac
-    files+=("$f")
-  done
-  if [ "${#files[@]}" -eq 0 ]; then printf 'swapfiles=unreadable'; return 0; fi
-  # rc 1 = some file vanished mid-probe (rest still valid); >=124 = timed out,
-  # killed or skipped (no bound available) -> nothing from it is trusted.
-  out=$(dg_timeout 5 stat -f '%z %m' "${files[@]}" 2>/dev/null)
-  [ $? -ge 124 ] && { printf 'swapfiles=unreadable'; return 0; }
+  # Glob expansion AND stat both run inside ONE bounded child: a glob expanded
+  # here would readdir a wedged volume with no bound. `exec` makes stat the
+  # bounded pid, so a perl-alarm kill leaves no orphan holding the pipe open.
+  # ANY non-zero exit (partial output, unmatched glob, timeout, no bound) means
+  # the set is unknown: a partial count would understate swap as if measured.
+  local dir="${DISK_GUARD_SWAP_DIR:-/System/Volumes/VM}" out
+  out=$(dg_timeout 5 /bin/sh -c 'exec stat -f "%z %m %N" "$1"/swapfile*' _ "$dir" 2>/dev/null) \
+    || { printf 'swapfiles=unreadable'; return 0; }
   out=$(printf '%s\n' "$out" | awk '
-    NF == 2 && $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ {
+    $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ {
+      p = $0; sub(/^[0-9]+ [0-9]+ /, "", p); b = p; sub(/.*\//, "", b)
+      if (b !~ /^swapfile/ || b ~ /\./ || b == "swapfile*") next
       n++; sum += $1; if ($2 > newest) newest = $2
     }
     END { if (n) printf "%d %.1f %.1f %d", n, sum/n/1073741824, sum/1073741824, newest }')

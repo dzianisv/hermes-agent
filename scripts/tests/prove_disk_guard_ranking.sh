@@ -28,6 +28,7 @@
 #      figures only; nothing is deleted.
 #   R7 every swap probe degrades silently: failing sysctl/top, a hanging top
 #      (bounded by the 5s timeout) and an unreadable swap dir still exit 0;
+#      a stat that prints some rows then fails is unreadable, never a count;
 #      and with sysctl, top AND stat all hanging 30s (stat over real-looking
 #      swapfiles) one tick still finishes in <20s, rc 0, reporting unknown.
 #
@@ -119,16 +120,31 @@ nprot=$(printf '%s\n' "$prot" | grep -c '^/')
 check "R5a guard exposes a non-empty protected set" "yes" \
       "$([ "${nprot:-0}" -ge 1 ] && echo yes || echo no)"
 
+# Matcher: exit 0 iff some ranked row (size, then path) is at or under $2.
+# An `exit` in a main rule still runs END, so the hit is carried in a flag;
+# `exit 0 ... END { exit 1 }` would report "no hit" for every input.
+lists_protected() {
+  # Here-string, not a pipe: under pipefail an early awk exit can SIGPIPE
+  # printf and turn a hit into a non-zero pipeline status.
+  awk -v pp="$2" '{ $1=""; sub(/^[ \t]+/,""); \
+        if ($0 == pp || index($0, pp "/") == 1) { hit = 1; exit } } END { exit !hit }' <<<"$1"
+}
 prot_hit=0
 while read -r p; do
   [ -n "$p" ] || continue
-  printf '%s\n' "$out" | awk -v pp="$p" '{ $1=""; sub(/^[ \t]+/,""); \
-        if ($0 == pp || index($0, pp "/") == 1) exit 0 } END { exit 1 }' \
+  lists_protected "$out" "$p" \
     && { echo "  protected path offered for deletion: $p"; prot_hit=1; }
 done <<EOF
 $prot
 EOF
 check "R5b no protected path is listed as reclaimable" "0" "$prot_hit"
+# R5c anti-vacuity: the same matcher MUST fire on a row naming a protected
+# path (and a child of it), or R5b proves nothing.
+p1=$(printf '%s\n' "$prot" | grep -m1 '^/')
+r5c=no
+lists_protected "1.2G  $p1" "$p1" && lists_protected "300M  $p1/sub" "$p1" \
+  && ! lists_protected "300M  ${p1}x" "$p1" && r5c=yes
+check "R5c matcher detects a synthetic protected row" "yes" "$r5c"
 fi
 
 # --- R6: swap is reported as a measured term (fixture figures, no deletion).
@@ -199,5 +215,31 @@ check "R7f hung stat -> swapfiles=unreadable" "yes" \
       "$(printf '%s\n' "$r7f_out" | grep -q 'swapfiles=unreadable' && echo yes || echo no)"
 check "R7f hung top -> compressor_top omitted" "0" \
       "$(printf '%s\n' "$r7f_out" | grep -c 'compressor_top=')"
+
+# R7g: PARTIAL failure is unknown. Two swapfiles; a PATH `stat` (reached via
+# the bounded /bin/sh child, which inherits PATH) prints ONE valid row and then
+# exits 1. Reporting that as 1x1.0Gi would understate swap as if measured.
+PART="$SANDBOX/partial"; VMG="$SANDBOX/vmg"; mkdir -p "$PART" "$VMG"
+: > "$VMG/swapfile0"; : > "$VMG/swapfile1"
+# The row honours the requested -f format, so a guard that trusts partial
+# output (whatever its format string) would parse it and print 1x1.0Gi.
+cat > "$PART/stat" <<STUB
+#!/bin/sh
+case "\$2" in
+  *%N*) echo "1073741824 $(date +%s) $VMG/swapfile0" ;;
+  *)    echo "1073741824 $(date +%s)" ;;
+esac
+exit 1
+STUB
+chmod +x "$PART/stat"
+r7g_out=$(env -u DISK_GUARD_FAKE_SWAP_GI PATH="$PART:$PATH" DISK_GUARD_SKIP_TOP=1 \
+          DISK_GUARD_SWAP_DIR="$VMG" DISK_GUARD_FAKE_FREE_GI=10 \
+          bash "$GUARD" 2>&1); r7g_rc=$?
+echo "--- R7g partial-stat output ---"; printf '%s\n' "$r7g_out"; echo "----------------------"
+check "R7g partial-stat tick exits 0" "0" "$r7g_rc"
+check "R7g partial stat -> swapfiles=unreadable" "yes" \
+      "$(printf '%s\n' "$r7g_out" | grep -q 'swapfiles=unreadable' && echo yes || echo no)"
+check "R7g partial stat never reports a count" "0" \
+      "$(printf '%s\n' "$r7g_out" | grep -c 'swapfiles=1x')"
 
 exit "$fail"
