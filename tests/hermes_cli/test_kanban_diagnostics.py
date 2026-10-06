@@ -302,3 +302,57 @@ def test_repeated_failures_historical_error_is_redacted():
         assert secret not in diag.title
         assert secret not in diag.detail
         assert secret not in payload
+
+
+def _historical_diag(error: str):
+    """Book one crashed run with ``error``, clear the task field (handoff), and
+    return the board's repeated_failures diagnostic plus its serialized form."""
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="historical", assignee="worker")
+        assert kb.claim_task(conn, tid) is not None
+        with kb.write_txn(conn):
+            kb._end_run(conn, tid, outcome="crashed", status="crashed", error=error)
+            conn.execute(
+                "UPDATE tasks SET status = 'ready', claim_lock = NULL, consecutive_failures = 5, "
+                "last_failure_error = NULL WHERE id = ?", (tid,),
+            )
+        row = conn.execute("SELECT * FROM tasks WHERE id = ?", (tid,)).fetchone()
+        runs = list(conn.execute("SELECT * FROM task_runs WHERE task_id = ? ORDER BY id", (tid,)))
+    finally:
+        conn.close()
+    diags = [d for d in kd.compute_task_diagnostics(row, [], runs) if d.kind == "repeated_failures"]
+    assert len(diags) == 1
+    diag = diags[0]
+    assert f"(historical, run {runs[-1]['id']})" in diag.title
+    return diag, (diag.title, diag.detail, json.dumps(diag.to_dict()))
+
+
+def _slices(secret: str, width: int) -> set[str]:
+    return {secret[i:i + width] for i in range(len(secret) - width + 1)}
+
+
+def test_historical_error_redacts_url_query_credential(kanban_home):
+    secret = "opaqueDemoCredential0123456789"
+    _diag, surfaces = _historical_diag(
+        f"request failed: GET https://api.example.com/v1/x?api_key={secret}&foo=1"
+    )
+    for text in surfaces:
+        assert secret not in text
+        assert "opaqueDemo" not in text and "Credential0123" not in text
+        assert not any(s in text for s in _slices(secret, 8))
+
+
+def test_historical_error_redacts_token_straddling_the_snippet_cut(kanban_home):
+    """A token cut at the 500-char snippet boundary is still recognised whole."""
+    body = "Zq7Wm2Xr9Lk4Pv8Ns3Jd6Hb1Tf5Yc0Ga2Ue7Ri4O"
+    assert len(body) == 40
+    before_cut = 12
+    filler = "x" * (500 - len(" sk-proj-") - before_cut)
+    _diag, surfaces = _historical_diag(f"{filler} sk-proj-{body} tail")
+    # Truncate-then-redact masked the cut token with this interior slice as its "tail".
+    leaked_by_truncation = body[before_cut - 4:before_cut]
+    for text in surfaces:
+        assert body not in text
+        assert not any(s in text for s in _slices(body, 8))
+        assert leaked_by_truncation not in text

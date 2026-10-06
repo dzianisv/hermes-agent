@@ -434,10 +434,11 @@ def _rule_repeated_failures(task, events, runs, now, cfg) -> list[Diagnostic]:
     elif historical_run is not None:
         from agent.redact import redact_sensitive_text
 
-        # Historical run text is raw worker output serialized board-wide: redact it.
-        hist_snippet = redact_sensitive_text(
-            _error_snippet(_task_field(historical_run, "error")), force=True,
-        )
+        # Historical run text is raw worker output serialized board-wide. Redact
+        # the FULL text before truncating: a cut inside a token defeats its pattern.
+        hist_snippet = _error_snippet(redact_sensitive_text(
+            _task_field(historical_run, "error"), force=True, redact_url_credentials=True,
+        ))
         hist_id = _task_field(historical_run, "id")
         title = (
             f"Agent {outcome_label} x{failures} (historical, run {hist_id}): "

@@ -379,6 +379,20 @@ def _drive_spawn_failed(conn, monkeypatch):
     return tid
 
 
+def _drive_spawn_failed_workspace(conn, monkeypatch):
+    """Workspace-resolution writer: a relative ``dir`` path makes the real
+    resolver raise, so the claim is booked ``spawn_failed`` before any spawn."""
+    _spawnable(monkeypatch)
+    tid = kb.create_task(
+        conn, title="workspace", assignee="worker", max_retries=5,
+        workspace_kind="dir", workspace_path="rel/path",
+    )
+    spawned: list[str] = []
+    kbd.dispatch_once(conn, spawn_fn=lambda task, _ws: spawned.append(task.id))
+    assert spawned == []
+    return tid
+
+
 def _drive_gave_up(conn, monkeypatch):
     _spawnable(monkeypatch)
     tid = kb.create_task(conn, title="breaker", assignee="worker", max_retries=1)
@@ -573,33 +587,70 @@ def _drive_scheduled(conn, monkeypatch):
     return tid
 
 
-# site -> (driver, outcome the site must produce)
+# ``tasks.last_failure_error`` expectations: each pins the site's own row.
+def _err_is_none(err):
+    return err is None
+
+
+def _err_startswith(prefix: str):
+    return lambda err: err is not None and err.startswith(prefix)
+
+
+def _err_equals(text: str):
+    return lambda err: err == text
+
+
+def _err_spawn_callback(err):
+    return err is not None and "spawn exploded" in err and not err.startswith("workspace:")
+
+
+# site -> (driver, outcome its run must end with, last_failure_error expectation)
 _WRITER_SITES = {
-    "detect_crashed_workers:crashed": (_drive_crashed, "crashed"),
-    "detect_crashed_workers:rate_limited": (_drive_rate_limited, "rate_limited"),
-    "enforce_max_runtime": (_drive_timed_out_runtime, "timed_out"),
-    "turn_finalizer:budget_exhausted": (_drive_timed_out_budget, "timed_out"),
-    "detect_stale_running": (_drive_stale, "stale"),
-    "dispatch_once:spawn_failed": (_drive_spawn_failed, "spawn_failed"),
-    "dispatch_once:breaker_gave_up": (_drive_gave_up, "gave_up"),
-    "release_stale_claims": (_drive_reclaimed_stale_claim, "reclaimed"),
-    "reclaim_task": (_drive_reclaimed_operator, "reclaimed"),
-    "reconcile_orphaned_running": (_drive_reclaimed_orphan, "reclaimed"),
-    "invalidate_descendants_for_parent_reopen": (_drive_reclaimed_parent_reopen, "reclaimed"),
-    "archive_task": (_drive_reclaimed_archive, "reclaimed"),
-    "_reclaim_dangling_run": (_drive_reclaimed_dangling, "reclaimed"),
-    "kanban_db_connect:_backfill_legacy_inflight_runs": (_drive_reclaimed_backfill_cas, "reclaimed"),
-    "dashboard:_set_status_direct": (_drive_reclaimed_dashboard, "reclaimed"),
-    "complete_task:end_run": (_drive_completed_run, "completed"),
-    "complete_task:synthesize": (_drive_completed_synth, "completed"),
-    "edit_task:synthesize": (_drive_completed_edit, "completed"),
-    "kanban_swarm:_activate_root_inline": (_drive_completed_swarm, "completed"),
-    "block_task": (_drive_blocked, "blocked"),
-    "request_review": (_drive_review_requested, "review_requested"),
-    "request_changes": (_drive_changes_requested, "changes_requested"),
-    "approve_for_merge": (_drive_approved, "approved"),
-    "schedule_task": (_drive_scheduled, "scheduled"),
+    "detect_crashed_workers:crashed": (
+        _drive_crashed, "crashed", _err_equals("pid 71001 exited with code 1")),
+    "detect_crashed_workers:rate_limited": (
+        _drive_rate_limited, "rate_limited", _err_startswith(f"pid {71000 + kb.KANBAN_RATE_LIMIT_EXIT_CODE} exited rate-limited")),
+    "enforce_max_runtime": (_drive_timed_out_runtime, "timed_out", _err_startswith("elapsed ")),
+    "turn_finalizer:budget_exhausted": (
+        _drive_timed_out_budget, "timed_out", _err_startswith("Iteration budget exhausted (90/90)")),
+    "detect_stale_running": (_drive_stale, "stale", _err_is_none),
+    "dispatch_once:spawn_callback": (_drive_spawn_failed, "spawn_failed", _err_spawn_callback),
+    "dispatch_once:workspace_resolution": (
+        _drive_spawn_failed_workspace, "spawn_failed", _err_startswith("workspace: ")),
+    "dispatch_once:breaker_gave_up": (_drive_gave_up, "gave_up", _err_equals("spawn exploded")),
+    "release_stale_claims": (_drive_reclaimed_stale_claim, "reclaimed", _err_startswith("stale_lock=")),
+    "reclaim_task": (_drive_reclaimed_operator, "reclaimed", _err_is_none),
+    "reconcile_orphaned_running": (_drive_reclaimed_orphan, "reclaimed", _err_is_none),
+    "invalidate_descendants_for_parent_reopen": (_drive_reclaimed_parent_reopen, "reclaimed", _err_is_none),
+    "archive_task": (_drive_reclaimed_archive, "reclaimed", _err_is_none),
+    "_reclaim_dangling_run": (_drive_reclaimed_dangling, "reclaimed", _err_is_none),
+    "kanban_db_connect:_backfill_legacy_inflight_runs": (
+        _drive_reclaimed_backfill_cas, "reclaimed", _err_is_none),
+    "dashboard:_set_status_direct": (_drive_reclaimed_dashboard, "reclaimed", _err_is_none),
+    "complete_task:end_run": (_drive_completed_run, "completed", _err_is_none),
+    "complete_task:synthesize": (_drive_completed_synth, "completed", _err_is_none),
+    "edit_task:synthesize": (_drive_completed_edit, "completed", _err_is_none),
+    "kanban_swarm:_activate_root_inline": (_drive_completed_swarm, "completed", _err_is_none),
+    "block_task": (_drive_blocked, "blocked", _err_is_none),
+    "request_review": (_drive_review_requested, "review_requested", _err_is_none),
+    "request_changes": (_drive_changes_requested, "changes_requested", _err_is_none),
+    "approve_for_merge": (_drive_approved, "approved", _err_is_none),
+    "schedule_task": (_drive_scheduled, "scheduled", _err_is_none),
 }
+
+
+def _latest_ended_outcome(conn, tid: str):
+    row = conn.execute(
+        "SELECT outcome FROM task_runs WHERE task_id = ? AND ended_at IS NOT NULL "
+        "ORDER BY ended_at DESC, id DESC LIMIT 1", (tid,),
+    ).fetchone()
+    return row[0] if row else None
+
+
+def _recorded_sequence(conn, tid: str) -> list[str]:
+    return [r[0] for r in conn.execute(
+        "SELECT outcome FROM _outcomes_seen WHERE task_id = ? ORDER BY rowid", (tid,),
+    ).fetchall()]
 
 
 def test_classification_sets_are_disjoint():
@@ -608,19 +659,24 @@ def test_classification_sets_are_disjoint():
 
 @pytest.mark.parametrize("site", sorted(_WRITER_SITES))
 def test_every_writer_outcome_is_classified(kanban_home, monkeypatch, site):
-    driver, expected = _WRITER_SITES[site]
+    driver, expected, err_ok = _WRITER_SITES[site]
     with kbc.connect() as conn:
         _install_recorder(conn)
         tid = driver(conn, monkeypatch)
-        produced = _seen(conn, tid)
-        # The named writer actually wrote: a removed/rerouted site is noticed.
-        assert expected in produced, f"{site} produced {sorted(produced)}"
+        # The named writer wrote THIS task's row: a removed/rerouted site is noticed.
+        assert _latest_ended_outcome(conn, tid) == expected
+        sequence = _recorded_sequence(conn, tid)
+        assert sequence and sequence[-1] == expected, f"{site} recorded {sequence}"
+        err = conn.execute(
+            "SELECT last_failure_error FROM tasks WHERE id = ?", (tid,),
+        ).fetchone()[0]
+        assert err_ok(err), f"{site} left last_failure_error={err!r}"
         assert unclassified(_seen(conn)) == set()
 
 
 def test_inventory_covers_every_classified_outcome():
     """Every classified outcome has a driven writer (stale entries are noticed)."""
-    driven = {outcome for _driver, outcome in _WRITER_SITES.values()}
+    driven = {outcome for _driver, outcome, _err_ok in _WRITER_SITES.values()}
     assert driven == kbd._BLOCKER_DIAGNOSTIC_OUTCOMES | set(_EXCLUDED_OUTCOMES)
 
 
