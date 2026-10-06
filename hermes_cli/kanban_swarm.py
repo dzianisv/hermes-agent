@@ -119,6 +119,7 @@ def create_swarm(
     workspace_path: Optional[str] = None,
     priority: int = 0,
     idempotency_key: Optional[str] = None,
+    outcome_key: Optional[str] = None,
 ) -> SwarmCreated:
     """Atomically create a durable, immediately dispatchable Kanban swarm."""
     activation_summary = "Swarm topology planned; root remains the shared blackboard."
@@ -129,7 +130,7 @@ def create_swarm(
             synthesizer_assignee=synthesizer_assignee, root_title=root_title,
             verifier_title=verifier_title, synthesizer_title=synthesizer_title, tenant=tenant,
             created_by=created_by, workspace_kind=workspace_kind, workspace_path=workspace_path,
-            priority=priority, idempotency_key=idempotency_key,
+            priority=priority, idempotency_key=idempotency_key, outcome_key=outcome_key,
         )
         root = kb.get_task(conn, created.root_id)
         if root is not None and root.status == "blocked":
@@ -167,6 +168,7 @@ def _create_swarm_uncommitted(
     verifier_assignee: str, synthesizer_assignee: str, root_title: Optional[str],
     verifier_title: str, synthesizer_title: str, tenant: Optional[str], created_by: str,
     workspace_kind: Optional[str], workspace_path: Optional[str], priority: int, idempotency_key: Optional[str],
+    outcome_key: Optional[str] = None,
 ) -> SwarmCreated:
     """Create the swarm graph inside the caller's transaction: planning root
     (``blocked`` until the caller activates it), parallel workers, a verifier
@@ -194,6 +196,7 @@ def _create_swarm_uncommitted(
         assignee=created_by,
         priority=priority,
         idempotency_key=idempotency_key,
+        outcome_key=outcome_key,
         initial_status="blocked",
         **common,
     )
@@ -207,6 +210,10 @@ def _create_swarm_uncommitted(
         synthesizer_id = existing.get("synthesizer_id")
         if worker_ids and verifier_id and synthesizer_id:
             return SwarmCreated(root, worker_ids, str(verifier_id), str(synthesizer_id))
+    if getattr(root, "deduped", False):
+        # Folded into a pre-existing open task for this outcome: never graft a
+        # fresh swarm graph onto an unrelated card.
+        raise ValueError(f"outcome_key already owned by open task {root}; swarm not created")
 
     context_suffix = _swarm_context(root, goal)
     worker_ids = [

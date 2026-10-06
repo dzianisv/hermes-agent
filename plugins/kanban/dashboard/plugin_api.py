@@ -408,6 +408,7 @@ class CreateTaskBody(BaseModel):
     provider_override: Optional[str] = None
     reasoning_effort: Optional[str] = None  # none|minimal|…|ultra; None inherits the profile's level
     project_id: Optional[str] = None  # None inherits the board's scoped project (if any)
+    outcome_key: Optional[str] = None  # one OPEN task per (project, key) when kanban.outcome_keys is on
 
 
 @router.post("/tasks")
@@ -735,6 +736,8 @@ def _set_status_direct(conn: sqlite3.Connection, task_id: str, new_status: str) 
             return False
         was_running = prev["status"] == "running"
         reopening_satisfied_parent = prev["status"] in {"done", "archived"} and effective_status not in {"done", "archived"}
+        if reopening_satisfied_parent and kanban_db.outcome_key_reopen_conflict(conn, task_id):
+            return False  # another open task now owns this outcome_key
         cur = conn.execute(
             "UPDATE tasks SET status = ?, "
             "  claim_lock = CASE WHEN ? = 'running' THEN claim_lock ELSE NULL END, "

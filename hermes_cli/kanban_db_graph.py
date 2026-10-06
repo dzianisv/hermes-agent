@@ -101,7 +101,7 @@ def decompose_triage_task(
     """
     from hermes_cli.kanban_db import (
         _canonical_assignee, _link, _append_event, _insert_comment,
-        write_txn, recompute_ready,
+        write_txn, recompute_ready, _would_cycle,
     )
 
     if not children:
@@ -132,15 +132,23 @@ def decompose_triage_task(
             for child in children
         ]
         # Sibling edges within the decomposed graph.
+        # A child folded into an existing task (outcome_key) can alias a sibling,
+        # the root, or an ancestor of the root: skip self-edges and any edge that
+        # would close a cycle rather than deadlock the graph.
+        def _safe_link(parent_id: str, child_id: str) -> bool:
+            if parent_id == child_id or _would_cycle(conn, parent_id, child_id):
+                return False
+            _link(conn, parent_id, child_id)
+            return True
+
         for idx, child in enumerate(children):
             for p_idx in child.get("parents") or []:
                 parent_id, child_id = child_ids[p_idx], child_ids[idx]
-                _link(conn, parent_id, child_id)
-                _append_event(conn, child_id, "linked", {"parent": parent_id, "child": child_id})
-        # Root waits for the whole graph: link it under EVERY child (simpler
-        # than computing leaves; cycle-free since the root is only ever a child).
-        for cid in child_ids:
-            _link(conn, cid, task_id)
+                if _safe_link(parent_id, child_id):
+                    _append_event(conn, child_id, "linked", {"parent": parent_id, "child": child_id})
+        # Root waits for the whole graph: link it under EVERY child.
+        for cid in dict.fromkeys(child_ids):
+            _safe_link(cid, task_id)
         # Flip the root triage -> todo, assignee -> orchestrator.
         sets = ["status = 'todo'"]
         params: list[Any] = []
@@ -182,13 +190,17 @@ def _insert_decomposed_child(
     """
     from hermes_cli.kanban_db import (
         _new_task_id, _canonical_assignee, _append_event,
-        check_outcome_key, _open_task_for_outcome_key, _fold_into_outcome_key,
+        check_outcome_key, _open_task_for_outcome_key, _fold_into_outcome_key, board_for_conn,
     )
 
     # Same outcome_key rule as create_task (policy + one OPEN task per
     # (project, key)); the partial UNIQUE index backstops any race. A keyed
     # child is scoped to the root's project so it cannot dodge a board-level key.
-    outcome_key = check_outcome_key(child.get("outcome_key"))
+    # Policy of the board this connection targets (not the process's current
+    # board); children are sub-work of the root, so ``require`` does not apply.
+    outcome_key = check_outcome_key(
+        child.get("outcome_key"), board_for_conn(conn), top_level=False,
+    )
     child_project = root_row["project_id"] if outcome_key else None
     if outcome_key:
         existing = _open_task_for_outcome_key(conn, child_project, outcome_key)

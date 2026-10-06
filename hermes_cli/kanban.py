@@ -438,6 +438,7 @@ def _cmd_swarm(args: argparse.Namespace) -> int:
             synthesizer_assignee=args.synthesizer, tenant=args.tenant,
             created_by=args.created_by or _profile_author(), priority=args.priority,
             idempotency_key=getattr(args, "idempotency_key", None),
+            outcome_key=getattr(args, "outcome_key", None),
         )
     if getattr(args, "json", False):
         _print_json(created.as_dict())

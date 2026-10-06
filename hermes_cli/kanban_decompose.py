@@ -265,6 +265,7 @@ def _clean_children(task_id: str, raw_tasks: list, routing: _Routing) -> tuple[l
             "title": title.strip()[:200],
             "body": body.strip() if isinstance(body, str) else "",
             "assignee": chosen,
+            "outcome_key": entry.get("outcome_key") if isinstance(entry.get("outcome_key"), str) else None,
             # Drop non-int, out-of-range and self parent indices.
             "parents": [p for p in parents if isinstance(p, int) and 0 <= p < len(raw_tasks) and p != idx],
         })

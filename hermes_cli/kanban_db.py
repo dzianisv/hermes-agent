@@ -122,45 +122,88 @@ class OutcomeKeyError(ValueError):
     """Board requires an outcome_key (or the key fails the configured pattern)."""
 
 
-def _outcome_key_policy(board: Optional[str]) -> tuple[bool, Optional[str]]:
-    """(require, pattern): board.json ``require_outcome_key``/``outcome_key_pattern``
-    win, else config.yaml ``kanban.*``. Defaults: not required, no pattern."""
-    require, pattern = None, None
+def board_for_conn(conn: sqlite3.Connection) -> Optional[str]:
+    """Slug of the board whose DB ``conn`` is open on (None = unknown/in-memory,
+    callers fall back to the current board). Policy lookups must use THIS, not
+    the process's current board — a connection may target any board."""
+    from hermes_cli.kanban_db_connect import _main_db_file
+    f = _main_db_file(conn)
+    if not f:
+        return None
+    try:
+        p = Path(f).resolve()
+        if p == kanban_db_path(DEFAULT_BOARD).resolve():
+            return DEFAULT_BOARD
+        if p.name == "kanban.db" and p.parent.parent == boards_root().resolve():
+            return _normalize_board_slug(p.parent.name)
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def _outcome_key_policy(board: Optional[str]) -> tuple[bool, bool, Optional[str]]:
+    """(enabled, require, pattern): board.json ``outcome_keys``/``require_outcome_key``/
+    ``outcome_key_pattern`` win, else config.yaml ``kanban.*``. Default: OFF
+    (keys ignored, nothing required) so behaviour is unchanged unless opted in."""
+    names = ("outcome_keys", "require_outcome_key", "outcome_key_pattern")
+    vals: dict = {n: None for n in names}
     try:
         meta = _board_meta_for(board)
-        require = meta.get("require_outcome_key")
-        pattern = meta.get("outcome_key_pattern")
+        for n in names:
+            vals[n] = meta.get(n)
     except Exception:
         pass
-    if require is None or pattern is None:
+    if any(v is None for v in vals.values()):
         try:
             from hermes_cli.config import load_config_readonly
             cfg = (load_config_readonly() or {}).get("kanban", {}) or {}
         except Exception:
             cfg = {}
-        if require is None:
-            require = cfg.get("require_outcome_key")
-        if pattern is None:
-            pattern = cfg.get("outcome_key_pattern")
-    return bool(require), (str(pattern) if pattern else None)
+        for n in names:
+            if vals[n] is None:
+                vals[n] = cfg.get(n)
+    pattern = vals["outcome_key_pattern"]
+    return bool(vals["outcome_keys"]), bool(vals["require_outcome_key"]), (str(pattern) if pattern else None)
 
 
-def check_outcome_key(outcome_key: Optional[str], board: Optional[str] = None) -> Optional[str]:
-    """Normalise ``outcome_key`` and enforce the board policy; raises OutcomeKeyError."""
+def check_outcome_key(
+    outcome_key: Optional[str], board: Optional[str] = None, *, top_level: bool = True,
+) -> Optional[str]:
+    """Normalise ``outcome_key`` and enforce the board policy; raises OutcomeKeyError.
+
+    Feature off (default): returns None — keys are ignored entirely. ``require``
+    only applies to ``top_level`` tasks; sub-work created under a parent
+    (decompose children, swarm workers, ``--parent``) belongs to the parent's outcome.
+    """
+    enabled, require, pattern = _outcome_key_policy(board)
+    if not enabled:
+        return None
     key = str(outcome_key).strip() if outcome_key is not None else ""
     key = key or None
-    require, pattern = _outcome_key_policy(board)
-    if require:
-        if key is None:
-            raise OutcomeKeyError(
-                "outcome_key is required on this board (kanban.require_outcome_key=true); "
-                "pass --outcome-key <KEY> (e.g. G3) naming the outcome this task delivers"
-            )
-        if pattern and not re.search(pattern, key):
-            raise OutcomeKeyError(
-                f"outcome_key {key!r} does not match kanban.outcome_key_pattern {pattern!r}"
-            )
+    if require and top_level and key is None:
+        raise OutcomeKeyError(
+            "outcome_key is required on this board (kanban.require_outcome_key=true); "
+            "pass --outcome-key <KEY> (e.g. G3) naming the outcome this task delivers"
+        )
+    if key is not None and pattern and not re.search(pattern, key):
+        raise OutcomeKeyError(
+            f"outcome_key {key!r} does not match kanban.outcome_key_pattern {pattern!r}"
+        )
     return key
+
+
+def outcome_key_reopen_conflict(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """Reason string when moving closed ``task_id`` back to an open status would
+    collide with another OPEN task holding its outcome_key; None when safe."""
+    row = conn.execute(
+        "SELECT outcome_key, project_id FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    if row is None or not row["outcome_key"]:
+        return None
+    holder = _open_task_for_outcome_key(conn, row["project_id"], row["outcome_key"])
+    if holder and holder != task_id:
+        return (f"outcome_key {row['outcome_key']!r} is now held by open task {holder}; "
+                f"reopen or comment on {holder} instead")
+    return None
 
 
 def _open_task_for_outcome_key(
@@ -1414,7 +1457,9 @@ def create_task(
     )
     parents = tuple(p for p in parents if p)
     skills_list = _normalize_task_skills(skills)
-    outcome_key = check_outcome_key(outcome_key, board)
+    outcome_key = check_outcome_key(
+        outcome_key, board or board_for_conn(conn), top_level=not parents,
+    )
 
     # Idempotency check BEFORE the write txn (no lock held); a concurrent-create
     # race may insert twice, the next lookup stabilises on the newest.
@@ -3961,6 +4006,9 @@ def reopen_done_task(
             return False, (
                 f"task {task_id} is {prior!r}; reopen-done only applies to 'done' or 'archived'"
             )
+        conflict = outcome_key_reopen_conflict(conn, task_id)
+        if conflict:
+            return False, conflict
         _reclaim_dangling_run(
             conn, task_id, statuses=("done", "archived"), now=now,
             note="invariant recovery on done reopen",
