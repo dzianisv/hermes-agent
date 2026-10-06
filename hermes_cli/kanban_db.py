@@ -2419,6 +2419,57 @@ def _extend_run_claim(conn: sqlite3.Connection, task_id: str, expires: int) -> O
     return run_id
 
 
+# Host sleep accounting (#5). While the host sleeps, wall-clock time keeps
+# moving but a frozen worker cannot heartbeat, so on wake every live worker
+# looks silent for the whole sleep. The OS keeps a sleep counter we can read:
+# (clock including sleep) - (clock excluding sleep). On macOS that is
+# CLOCK_MONOTONIC_RAW - CLOCK_UPTIME_RAW (both unslewed); on Linux
+# CLOCK_BOOTTIME - CLOCK_MONOTONIC. Unlike comparing wall time with monotonic
+# time, an NTP wall-clock step does not register as sleep.
+_SLEEP_MIN_SECONDS = 30.0
+_sleep_prev: Optional[tuple] = None  # (wall, host_sleep_total) at the last sample
+_sleep_intervals: list = []  # [(wake_wall, slept_seconds)], newest last, bounded
+
+
+def _host_sleep_total() -> Optional[float]:
+    """Seconds this host has slept since boot, or None when unsupported."""
+    try:
+        if sys.platform == "darwin":
+            return max(0.0, time.clock_gettime(time.CLOCK_MONOTONIC_RAW)
+                       - time.clock_gettime(time.CLOCK_UPTIME_RAW))
+        if hasattr(time, "CLOCK_BOOTTIME"):
+            return max(0.0, time.clock_gettime(time.CLOCK_BOOTTIME)
+                       - time.clock_gettime(time.CLOCK_MONOTONIC))
+    except (AttributeError, OSError):
+        pass
+    return None
+
+
+def _note_sleep_sample(wall: float, total: Optional[float]) -> None:
+    """Record a sample; log a sleep interval when the OS sleep counter grew."""
+    global _sleep_prev
+    if total is None:
+        return
+    prev = _sleep_prev
+    _sleep_prev = (wall, total)
+    if prev is None:
+        return
+    slept = total - prev[1]
+    if slept >= _SLEEP_MIN_SECONDS:
+        _sleep_intervals.append((wall, slept))
+        del _sleep_intervals[:-64]
+
+
+def _slept_seconds_since(ts: float) -> float:
+    """Seconds the host slept after wall-clock ``ts`` (as observed by this process)."""
+    return sum(s for wake, s in _sleep_intervals if wake > ts)
+
+
+def _awake_age(now: int, ts) -> int:
+    """``now - ts`` minus time the host slept in between (never negative)."""
+    return max(0, int(now - int(ts) - _slept_seconds_since(int(ts))))
+
+
 def release_stale_claims(
     conn: sqlite3.Connection, *, signal_fn=None, failure_limit: Optional[int] = None,
 ) -> int:
@@ -2449,6 +2500,7 @@ def release_stale_claims(
     dead workers.
     """
     now = int(time.time())
+    _note_sleep_sample(now, _host_sleep_total())
     reclaimed = 0
     host_prefix = _host_prefix()
     stale = conn.execute(
@@ -2463,7 +2515,10 @@ def release_stale_claims(
         hb = row["last_heartbeat_at"]
         # Backstop: a heartbeat older than the max-stale threshold means no
         # observable progress — reclaim even if the PID is alive (logic loop).
-        heartbeat_stale = hb is not None and (now - int(hb)) > DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS
+        # Time the host slept is not worker silence (#5): a live worker that
+        # only looks stale because the Mac slept gets its lease renewed and
+        # keeps its session instead of being killed and respawned.
+        heartbeat_stale = hb is not None and _awake_age(now, hb) > DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS
         started_at = _row_get(row, "worker_started_at")
         if (host_local and row["worker_pid"] and _worker_alive(row["worker_pid"], started_at)
                 and not heartbeat_stale):

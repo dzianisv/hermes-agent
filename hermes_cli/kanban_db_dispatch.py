@@ -1389,6 +1389,7 @@ def detect_stale_running(
         return []
 
     now = int(time.time())
+    _kb._note_sleep_sample(now, _kb._host_sleep_total())  # #5: credit host sleep
     reclaimed: list[str] = []
 
     rows = conn.execute(
@@ -1407,7 +1408,7 @@ def detect_stale_running(
             continue
 
         last_hb = row["last_heartbeat_at"]
-        hb_age = (now - int(last_hb)) if last_hb is not None else None
+        hb_age = _kb._awake_age(now, last_hb) if last_hb is not None else None
         if hb_age is not None and hb_age < _STALE_HEARTBEAT_GAP_SECONDS:
             continue
 
