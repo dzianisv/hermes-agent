@@ -856,19 +856,6 @@ def _handle_request_changes(args: dict, **kw) -> str:
 
 @_kanban_handler("kanban_approve")
 def _handle_approve(args: dict, **kw) -> str:
-    """Reviewer approval with merge still pending: hand the card to the merger."""
-    tid = _worker_guard("kanban_approve", args)
-    summary = _redact(_require_text(
-        args, "summary", "summary is required — name the approved head SHA and evidence"))
-    with _board(args.get("board")) as (kb, conn):
-        ok, detail = kb.approve_for_merge(
-            conn, tid, summary=summary, expected_run_id=_worker_run_id(tid))
-        _check(ok, f"could not approve {tid}: {detail or 'invalid review state'}")
-        return _ok_landed(kb, conn, tid, "ready", implementer=detail, stage="merge")
-
-
-@_kanban_handler("kanban_approve")
-def _handle_approve(args: dict, **kw) -> str:
     """Reviewer approval: hand the card to the merger at stage ``merge``."""
     tid = _worker_guard("kanban_approve", args)
     summary = _redact(_require_text(
@@ -1181,7 +1168,6 @@ _TOOLS = (
     ("kanban_block", KANBAN_BLOCK_SCHEMA, _handle_block, "⏸"),
     ("kanban_request_review", KANBAN_REQUEST_REVIEW_SCHEMA, _handle_request_review, "👀"),
     ("kanban_request_changes", KANBAN_REQUEST_CHANGES_SCHEMA, _handle_request_changes, "↩"),
-    ("kanban_approve", KANBAN_APPROVE_SCHEMA, _handle_approve, "✅"),
     ("kanban_approve", KANBAN_APPROVE_SCHEMA, _handle_approve, "✅"),
     ("kanban_heartbeat", KANBAN_HEARTBEAT_SCHEMA, _handle_heartbeat, "💓"),
     ("kanban_comment", KANBAN_COMMENT_SCHEMA, _handle_comment, "💬"),

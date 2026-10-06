@@ -3753,62 +3753,6 @@ def request_changes(
 
 
 def approve_for_merge(
-    conn: sqlite3.Connection, task_id: str, *, summary: str, expected_run_id: Optional[int] = None,
-) -> tuple[bool, Optional[str]]:
-    """Reviewer verdict "approved, merge pending": close the review run as
-    ``approved`` and hand the card to the implementer at stage ``merge``.
-
-    Without this a reviewer had only ``complete`` (card done before the PR is
-    merged) or ``request_changes`` (approval recorded as rework, engineer
-    respawned as if code was wrong) — issue #26. Returns ``(ok, implementer | reason)``."""
-    summary = str(redact_review_value(summary or "")).strip()
-    if not summary:
-        return False, "summary is required"
-    with write_txn(conn):
-        task_row = conn.execute(
-            "SELECT status, assignee, current_run_id FROM tasks WHERE id = ?", (task_id,),
-        ).fetchone()
-        if task_row is None:
-            return False, "task not found"
-        current_run_id = task_row["current_run_id"]
-        if task_row["status"] != "running" or current_run_id is None:
-            return False, "task is not in an active review run"
-        if expected_run_id is not None and int(current_run_id) != int(expected_run_id):
-            return False, "run_id mismatch"
-        claimed_payload = _json_dict(_row_get(_latest_event(conn, task_id, "claimed", current_run_id), "payload"))
-        if claimed_payload.get("source_status") != "review":
-            return False, "active run was not claimed from review"
-        requested_event = _latest_event(conn, task_id, "review_requested")
-        if requested_event is None:
-            return False, "no prior review_requested event"
-        implementer = _nonblank_str(_json_dict(requested_event["payload"]).get("implementer"))
-        if implementer is None:
-            return False, "review handoff has no valid implementer provenance"
-        reviewer = _canonical_assignee(_nonblank_str(task_row["assignee"]))
-        new_status = _landing_status_after_parents(conn, task_id)
-        cur = conn.execute(
-            """
-            UPDATE tasks
-               SET status = ?, assignee = ?, current_step_key = 'merge',
-                   claim_lock = NULL, claim_expires = NULL,
-                   worker_pid = NULL, worker_started_at = NULL
-             WHERE id = ? AND status = 'running' AND current_run_id = ?
-            """,
-            (new_status, implementer, task_id, int(current_run_id)),
-        )
-        if cur.rowcount != 1:
-            return False, "task changed during review handoff"
-        run_id = _end_run(conn, task_id, outcome="approved", status=new_status, summary=summary)
-        _append_event(
-            conn, task_id, "review_approved",
-            {"summary": _first_line(summary, 400), "implementer": implementer,
-             "reviewer": reviewer, "status": new_status, "stage": "merge"},
-            run_id=run_id,
-        )
-    return True, implementer
-
-
-def approve_for_merge(
     conn: sqlite3.Connection, task_id: str, *, summary: str,
     expected_run_id: Optional[int] = None, merger: Optional[str] = None,
 ) -> tuple[bool, Optional[str]]:

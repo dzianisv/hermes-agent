@@ -274,22 +274,6 @@ KANBAN_REQUEST_CHANGES_SCHEMA = _schema(
 KANBAN_APPROVE_SCHEMA = _schema(
     "kanban_approve",
     (
-        "Reviewer verdict: the code is APPROVED but the work is not finished "
-        "(merge, CI, release or live proof still pending). Closes the review run "
-        "as approved and hands the card back to the implementer at stage 'merge'. "
-        "Use this instead of kanban_request_changes when no code change is needed; "
-        "use kanban_complete only when nothing at all remains."
-    ),
-    {
-        "task_id": _prop("string", _DESC_TASK_ID_DEFAULT),
-        "summary": _prop("string", "Approved head SHA, review evidence, and what remains (merge steps)."),
-    },
-    ["summary"],
-)
-
-KANBAN_APPROVE_SCHEMA = _schema(
-    "kanban_approve",
-    (
         "Reviewer verdict: the work is APPROVED and must now be merged. Closes "
         "the review run as approved, moves the card to the 'merge' stage and "
         "hands it back to the implementer (or `merger`) to merge the same PR. "
