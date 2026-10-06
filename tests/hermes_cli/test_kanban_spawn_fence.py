@@ -314,3 +314,33 @@ def test_real_process_blocks_dispatch_until_exit(
         if proc.poll() is None:
             proc.kill()
             proc.wait(timeout=10)
+
+
+@pytest.mark.platforms("posix")
+def test_two_ticks_beside_live_worker_spawn_nothing_and_log_why(
+    board, all_assignees_spawnable, monkeypatch,
+):
+    """Regression for the 2026-10-03 duplicate spawn: the task lost its claim but its worker is
+    alive (literal ``work kanban task <id>`` argv). Two dispatch ticks must leave exactly that
+    one worker: no spawn, no claim, and each refusal recorded with its reason."""
+    conn = board
+    tid = kb.create_task(conn, title="lost-claim", assignee="alice")
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)", "-q", f"work kanban task {tid}"],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    calls, spawn_fn = _spawn_recorder()
+    try:
+        for _ in range(2):
+            kbd.dispatch_once(conn, spawn_fn=spawn_fn)
+        assert calls == []
+        assert kb.get_task(conn, tid).status == "ready"
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_runs WHERE task_id = ?", (tid,),
+        ).fetchone()[0] == 0
+        reasons = [e.payload.get("reason") for e in _guard_events(conn, tid)]
+        assert reasons == ["live_worker_process", "live_worker_process"]
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=10)
