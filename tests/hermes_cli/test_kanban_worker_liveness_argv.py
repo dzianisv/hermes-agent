@@ -489,3 +489,48 @@ def test_pid_alive_keeps_existence_answer_when_ps_fails(monkeypatch):
     monkeypatch.setattr(subprocess, "run",
                         lambda argv, **kw: subprocess.CompletedProcess(argv, 0, stdout="Z+\n", stderr=""))
     assert kbd._pid_alive(os.getpid()) is False
+
+
+@pytest.mark.platforms("posix")
+def test_eperm_live_worker_is_not_crashed_or_respawned(board, monkeypatch):
+    """Regression for the 2026-10-03 incident: a live worker of this task whose existence probe
+    answers EPERM (no psutil, ``os.kill(pid, 0)`` -> PermissionError) and whose start fingerprint
+    drifted far is held by the sweep, never signalled, and never respawned by the next tick."""
+    conn = board
+    tid = kb.create_task(conn, title="job", assignee="worker")
+    # Literal worker argv (``hermes chat -q "work kanban task <id>"``), not a fix-era helper.
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "import time;time.sleep(60)", "-q", f"work kanban task {tid}"],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    try:
+        kb.claim_task(conn, tid)
+        kbd._set_worker_pid(conn, tid, proc.pid)
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET worker_started_at = ? WHERE id = ?",
+                         (_shifted(_real_fingerprint(proc.pid), 1000), tid))
+
+        real_kill = os.kill
+        signals: list = []
+
+        def eperm_kill(pid, sig):
+            if pid == proc.pid:
+                signals.append(sig)
+                raise PermissionError(1, "Operation not permitted")
+            return real_kill(pid, sig)
+
+        monkeypatch.setitem(sys.modules, "psutil", None)
+        monkeypatch.setattr(os, "kill", eperm_kill)
+        spawned: list = []
+
+        sweep = kbd._reclaim_dead_workers(conn)
+        result = kbd.dispatch_once(conn, spawn_fn=lambda task, ws, board=None: spawned.append(task.id) or 1)
+
+        assert tid not in sweep.crashed
+        assert not _events(conn, tid, "crashed")
+        assert kb.get_task(conn, tid).status == "running"
+        assert spawned == [] and not any(row[0] == tid for row in result.spawned)
+        assert signals and all(sig == 0 for sig in signals)  # probed, never signalled
+    finally:
+        monkeypatch.undo()
+        _stop(proc)
