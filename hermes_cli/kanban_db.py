@@ -2763,6 +2763,11 @@ def complete_task(
     from hermes_cli.kanban_pr_acceptance_store import prepare_acceptance, record_acceptance
     verified_cards = _gate_created_cards(conn, task_id, created_cards, summary or result)
     _gate_empty_completion(conn, task_id, result=result, summary=summary)
+    # Product-outcome cards need an independently verified live-validation
+    # receipt (kanban.live_receipt; off unless configured). Pre-write: a
+    # refusal leaves status and owner untouched.
+    from hermes_cli.kanban_live_receipt import gate as _live_receipt_gate
+    _live_receipt_gate(conn, task_id, metadata=metadata, summary=summary, result=result)
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )

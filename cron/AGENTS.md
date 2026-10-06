@@ -116,6 +116,11 @@ substring (root). Worker liveness is `(worker_pid, worker_started_at)` — the s
 (`gateway.status.get_process_start_time`) recorded at claim time — never bare PID existence, or a
 recycled PID gets killed on reclaim.
 
+- **Done means works live, not PR approved.** `hermes_cli/kanban_live_receipt.py` gates
+  `complete_task` when `kanban.live_receipt.workflows` is set (off otherwise): cards on configured
+  `boards`/`projects` or with a body `PROOF:` line need `metadata.live_receipt` = a GitHub Actions run
+  URL, re-fetched via `gh` (injectable `GH_RUNNER`) and checked for success, merged-commit target
+  and post-merge timing; refusal is pre-write so status and owner stay.
 - **Notifications leave through the task's owning profile.** `hermes_cli/kanban_db_notify.py`
   subscriptions carry the profile; `gateway/kanban_watchers_notifier.py` delivers via THAT
   profile's adapter under its scope (`_notify_profile_filter`), never the multiplexer's launch

@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Optional
 
 from hermes_cli import kanban_db as kb
+from hermes_cli.kanban_live_receipt import LiveReceiptError
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_db_workspace as kbw
@@ -940,6 +941,10 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 fail_msg[tid] = (f"cannot complete {tid}: a live worker is running it. Wait for the "
                                  f"worker, `hermes kanban reclaim {tid}` to release it, or re-run with "
                                  f"--force to close its run and complete anyway.")
+                return False
+            except LiveReceiptError as receipt_err:
+                fail_msg[tid] = (f"cannot complete {tid}: {receipt_err}. Pass --metadata with "
+                                 f"live_receipt=<run URL> and published_pr=<merged PR URL>.")
                 return False
             except kb.EmptyCompletionError as empty_err:
                 fail_msg[tid] = (f"cannot complete {tid}: {empty_err}. Pass --result/--summary "

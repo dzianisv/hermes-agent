@@ -16,6 +16,7 @@ from contextlib import contextmanager
 from typing import Any, Callable, Optional
 
 from agent.redact import redact_sensitive_text
+from hermes_cli.kanban_live_receipt import LiveReceiptError
 from hermes_cli.goals import judge_goal
 from tools.registry import no_cache_check_fn, registry, tool_error
 from hermes_cli.config import cfg_get, load_config
@@ -723,6 +724,11 @@ def _handle_complete(args: dict, **kw) -> str:
                 f"in-flight (no state change). Retry kanban_complete with the same "
                 f"summary/metadata and either drop these ids from created_cards, or pass "
                 f"created_cards=[] to skip the card-claim check entirely.")
+        except LiveReceiptError as receipt_err:
+            return tool_error(
+                f"kanban_complete blocked: {receipt_err}. Your task is still in-flight with the same "
+                f"owner (no state change). Run the validation workflow after merge, then retry with "
+                f"metadata.live_receipt=<GitHub Actions run URL> and metadata.published_pr=<merged PR URL>.")
         except kb.EmptyCompletionError as empty_err:
             # Same shape as the card gate: nothing was mutated, the audit event
             # already landed; the worker retries with evidence instead of stalling.
