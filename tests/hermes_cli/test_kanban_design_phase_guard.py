@@ -81,9 +81,15 @@ def test_missing_key_is_parked(conn):
 
 
 def test_key_mentioned_mid_sentence_does_not_count(conn):
-    body = f"{DESIGN_LINE}\nSCOPE: x\nsee acceptance criteria later\nPROOF: z"
+    # The literal header token appears, but not at line start: a substring
+    # check would accept it; the per-line anchor must not.
+    body = (f"{DESIGN_LINE}\nSCOPE: x\n"
+            "We will define see ACCEPTANCE: criteria in a follow-up card.\nPROOF: z")
     tid = _raw_card(conn, body)
     assert disp._design_phase_guard(conn, tid, "software-engineer") == "brief_incomplete"
+    assert kb.get_task(conn, tid).status == "scheduled"
+    reasons = [(e.payload or {}).get("reason") or "" for e in kb.list_events(conn, tid) if e.kind == "scheduled"]
+    assert reasons and "ACCEPTANCE:" in reasons[-1].split("missing", 1)[1]
 
 
 def test_qualified_design_header_with_design_page_passes(conn):
