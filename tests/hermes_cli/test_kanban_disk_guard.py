@@ -451,7 +451,7 @@ def _quiet_swap_used(monkeypatch):
     monkeypatch.setattr("gateway.lifecycle_ledger.sample_memory", lambda: {})
 
 
-def _assert_stall_degrades_then_recovers(monkeypatch, release):
+def _assert_stall_degrades_then_recovers(monkeypatch, release, recovered_key="free_bytes"):
     monkeypatch.setattr(kbd, "DISK_GUARD_PROBE_TIMEOUT_SECONDS", 0.2)
     start = time.monotonic()
     sample = kbd._disk_sample()
@@ -468,7 +468,7 @@ def _assert_stall_degrades_then_recovers(monkeypatch, release):
     for t in _alive_probe_threads():
         t.join(5)
     assert not _alive_probe_threads()
-    assert "free_bytes" in kbd._disk_sample()
+    assert recovered_key in kbd._disk_sample()
 
 
 @pytest.mark.real_disk_guard
@@ -523,6 +523,77 @@ def test_dispatch_with_stalled_probe_does_not_hang(
         return _Usage(FLOOR // 2)
 
     monkeypatch.setattr(kbd.shutil, "disk_usage", blocking_usage)
+    spawns = []
+
+    def fake_spawn(task, workspace, board=None):
+        spawns.append(task.id)
+        return 42
+
+    try:
+        with kbc.connect() as conn:
+            for t in ("a", "b", "c"):
+                kb.create_task(conn, title=t, assignee="alice")
+            start = time.monotonic()
+            res = kbd.dispatch_once(conn, spawn_fn=fake_spawn)
+            elapsed = time.monotonic() - start
+        assert elapsed < 2.0
+        assert len(spawns) == 3
+        assert res.disk_pressure is None
+    finally:
+        release.set()
+        for t in _alive_probe_threads():
+            t.join(5)
+
+
+def _blocking_meminfo_fallback(monkeypatch, release):
+    """No sysctl; the Linux /proc fallback stalls until ``release``."""
+    monkeypatch.setattr(kbd, "_sysctl_swap_used_bytes", lambda: None)
+
+    def blocking_sample_memory():
+        release.wait(10)
+        return {"swap_used_kib": 2048}
+
+    monkeypatch.setattr("gateway.lifecycle_ledger.sample_memory", blocking_sample_memory)
+
+
+@pytest.mark.real_disk_guard
+def test_stalled_linux_swap_fallback_degrades_to_unknown(kanban_home, tmp_path, monkeypatch):
+    monkeypatch.setattr(kbd, "_SWAP_DIR", tmp_path / "absent")
+    monkeypatch.setattr(kbd.shutil, "disk_usage", lambda p: _Usage(100 * GIB))
+    release = threading.Event()
+    _blocking_meminfo_fallback(monkeypatch, release)
+    try:
+        _assert_stall_degrades_then_recovers(monkeypatch, release, "swap_used_bytes")
+    finally:
+        release.set()
+
+
+@pytest.mark.real_disk_guard
+def test_stalled_sysctl_degrades_to_unknown(kanban_home, tmp_path, monkeypatch):
+    monkeypatch.setattr(kbd, "_SWAP_DIR", tmp_path / "absent")
+    monkeypatch.setattr(kbd.shutil, "disk_usage", lambda p: _Usage(100 * GIB))
+    release = threading.Event()
+
+    def blocking_sysctl():
+        release.wait(10)
+        return 3 * GIB
+
+    monkeypatch.setattr(kbd, "_sysctl_swap_used_bytes", blocking_sysctl)
+    try:
+        _assert_stall_degrades_then_recovers(monkeypatch, release, "swap_used_bytes")
+    finally:
+        release.set()
+
+
+@pytest.mark.real_disk_guard
+def test_dispatch_with_stalled_swap_fallback_does_not_hang(
+    kanban_home, all_assignees_spawnable, tmp_path, monkeypatch,
+):
+    monkeypatch.setattr(kbd, "DISK_GUARD_PROBE_TIMEOUT_SECONDS", 0.2)
+    monkeypatch.setattr(kbd, "_SWAP_DIR", tmp_path / "absent")
+    monkeypatch.setattr(kbd.shutil, "disk_usage", lambda p: _Usage(FLOOR // 2))
+    release = threading.Event()
+    _blocking_meminfo_fallback(monkeypatch, release)
     spawns = []
 
     def fake_spawn(task, workspace, board=None):

@@ -2823,6 +2823,10 @@ def _disk_sample(board: Optional[str] = None) -> dict:
         holder["free"] = _disk_free_bytes(board)
         if holder["free"] is not None:
             holder["files"] = _swapfiles()
+            swap_used = _sysctl_swap_used_bytes()
+            if swap_used is None:
+                swap_used = _meminfo_swap_used_bytes()
+            holder["swap_used"] = swap_used
         holder["done"] = True
 
     with _disk_probe_lock:
@@ -2855,9 +2859,7 @@ def _disk_sample(board: Optional[str] = None) -> dict:
         sample["quantum_bytes"] = max((st.st_size for st in files), default=0)
         sample["swap_files"] = len(files)
         sample["swap_fresh_files"] = sum(1 for st in files if st.st_mtime >= cutoff)
-    swap_used = _sysctl_swap_used_bytes()
-    if swap_used is None:
-        swap_used = _meminfo_swap_used_bytes()
+    swap_used = holder["swap_used"]
     if swap_used is not None:
         sample["swap_used_bytes"] = swap_used
     return sample
