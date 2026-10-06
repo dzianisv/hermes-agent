@@ -2295,6 +2295,12 @@ def claim_task(
             )
             _append_event(conn, task_id, "claim_rejected", {"reason": "parents_not_done"})
             return None
+        # Issue #12: implementation claims need a full spec in the card BODY.
+        # Single point for the dispatcher spawn and `hermes kanban claim`; an
+        # incomplete card goes back to its owner in triage with a comment.
+        from hermes_cli.kanban_spec_gate import enforce_spec_gate
+        if enforce_spec_gate(conn, task_id):
+            return None
         # Close a leaked prior run so the CAS below doesn't strand it.
         _reclaim_dangling_run(
             conn, task_id, statuses=("ready",), now=now, note="invariant recovery on re-claim",
