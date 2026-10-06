@@ -114,9 +114,13 @@ the first attempt, sticky, because no retry can heal it (#114587).
 Process-identity note: `kanban --preserve-cache` contains "serve" — never classify processes by argv
 substring (root). Worker liveness is `(worker_pid, worker_started_at)` — the spawn fingerprint
 (`<instantiation epoch>|<get_process_start_time>`). Epoch must match; the start part agrees within
-`gateway.status.START_TIME_DRIFT_TOLERANCE` (macOS readings drift ~1s, #117505), never exact string
+`kanban_db_dispatch.WORKER_START_TIME_TOLERANCE_CS` (500 cs; macOS readings drift ~1s, #117505) —
+the gateway's `START_TIME_DRIFT_TOLERANCE` (200) is unchanged and is not the worker tolerance.
+Beyond it the argv witness (`work kanban task <id>` as whole tokens) still proves the worker; an
+unreadable argv is a **held** verdict: never signalled, claim never released. Never exact string
 equality and never bare PID existence, or a recycled PID gets killed on reclaim / a live worker is
-respawned beside itself.
+respawned beside itself. The argv token names the task, not the run, so the terminal-run reaper
+uses fingerprint-only identity.
 
 - **Notifications leave through the task's owning profile.** `hermes_cli/kanban_db_notify.py`
   subscriptions carry the profile; `gateway/kanban_watchers_notifier.py` delivers via THAT

@@ -528,10 +528,10 @@ def _pid_alive(pid: Optional[int]) -> bool:
                 timeout=1,
                 check=False,
             )
-            if proc.returncode != 0:
+            if proc.returncode == 0 and "Z" in (proc.stdout or "").strip():
                 return False
-            if "Z" in (proc.stdout or "").strip():
-                return False
+            # A nonzero ``ps`` exit (sandbox, transient failure) is no verdict: keep the existence
+            # answer. Only a readable 'Z' stat means dead.
         except (OSError, subprocess.SubprocessError, TimeoutError):
             # If the secondary probe fails, keep the kill(0) answer.
             pass
@@ -559,8 +559,9 @@ def _process_fingerprint(pid: int) -> Optional[str]:
 
 
 # Worker start-time drift tolerance (×100 scale). Measured macOS drift between spawn and a later read
-# is 100-200 cs, right at the gateway-wide ``START_TIME_DRIFT_TOLERANCE`` (200, left untouched); a
-# recycled PID is still never within 5 s of the original's start.
+# reaches ~100-200 cs (#117505), at the edge of the gateway-wide ``START_TIME_DRIFT_TOLERANCE`` (200,
+# left untouched — it is not the worker tolerance); workers get 5 s headroom, plus the argv identity
+# witness beyond it. A recycled PID is still never within 5 s of the original's start.
 WORKER_START_TIME_TOLERANCE_CS = 500
 
 
@@ -1194,11 +1195,25 @@ def _terminate_reclaimed_worker(
         info["terminated"] = True
         return info
     if _worker_alive(pid, started_at, task_id):
-        if not _sigkill(kill, pid, killpg=killpg, snapshot=tree):
+        if not _escalate_sigkill(kill, pid, started_at, task_id, killpg=killpg, snapshot=tree):
+            info["signal_refused"] = True
+            info["terminated"] = False
             return info
         info["sigkill"] = True
     info["terminated"] = not _worker_alive(pid, started_at, task_id)
     return info
+
+
+def _escalate_sigkill(kill, pid: int, started_at, task_id: Optional[str], *, killpg=None,
+                      snapshot=None) -> bool:
+    """SIGKILL a worker that outlived SIGTERM — only while its identity is still POSITIVELY
+    confirmed. Identity can become unreadable between SIGTERM and escalation (argv gone, start time
+    unreadable); a live pid that merely may be ours is never killed. False = refused or undelivered."""
+    if not _may_signal_worker(pid, started_at, task_id):
+        _kb._log.warning("kanban: task %s worker pid %s survived SIGTERM but its identity is no longer "
+                         "confirmed; SIGKILL refused", task_id, pid)
+        return False
+    return _sigkill(kill, pid, killpg=killpg, snapshot=snapshot)
 
 
 def reap_terminal_workers(conn: sqlite3.Connection, *, signal_fn=None) -> list[str]:
@@ -1237,11 +1252,16 @@ def _reap_terminal_worker_row(conn, row, host_prefix: str, signal_fn, reaped: li
         return
     if fingerprint == UNVERIFIED_WORKER_FINGERPRINT and _kb._pid_alive(pid):
         return  # unproven identity: never signalled; its evidence is cleared once the pid is gone
-    alive = _worker_alive(pid, fingerprint, row["task_id"])
+    current = conn.execute("SELECT worker_pid FROM tasks WHERE id = ?", (row["task_id"],)).fetchone()
+    if current is not None and current["worker_pid"] is not None and int(current["worker_pid"]) == pid:
+        return  # a successor run of this task owns the pid: neither signalled nor its evidence cleared
+    # Fingerprint-only identity (task_id=None): the argv token names the TASK, not the RUN, so it
+    # cannot prove a closed run's worker — it would match a successor run's live worker.
+    alive = _worker_alive(pid, fingerprint, None)
     termination = None
     if alive:
         termination = _terminate_reclaimed_worker(
-            pid, row["claim_lock"], signal_fn=signal_fn, started_at=fingerprint, task_id=row["task_id"])
+            pid, row["claim_lock"], signal_fn=signal_fn, started_at=fingerprint, task_id=None)
         if not termination["terminated"]:
             return  # still alive: try again next tick
     with _kb.write_txn(conn):
@@ -1447,7 +1467,13 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
             # Short polling wait — no time.sleep on the write txn.
             _poll_worker_exit(pid, started_at, tid)
             if _worker_alive(pid, started_at, tid):
-                killed = _sigkill(kill, pid, killpg=killpg, snapshot=tree)
+                killed = _escalate_sigkill(kill, pid, started_at, tid, killpg=killpg, snapshot=tree)
+        if _worker_alive(pid, started_at, tid):
+            # Alive (or held: identity unreadable) — releasing the claim would spawn a duplicate
+            # beside it. Retried next tick.
+            _kb._log.warning("kanban: task %s worker pid %s exceeded max runtime and is still alive; "
+                             "claim kept", tid, pid)
+            continue
 
         error = f"elapsed {int(elapsed)}s > limit {limit}s"
         with _kb.write_txn(conn):

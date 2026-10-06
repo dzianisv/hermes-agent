@@ -245,3 +245,247 @@ def test_done_reopened_after_recent_success_releases_the_guard(board, reopened, 
                 "INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, 'done_reopened', ?, ?)",
                 (tid, json.dumps({"status": "ready"}), ended + 1))
     assert kbd.check_respawn_guard(conn, tid) == expected
+
+
+# --- Unknown identity = no signal AND no release (review follow-ups) ---------------------------------
+
+def _spawn_sleeper(token_task_id: str) -> subprocess.Popen:
+    return subprocess.Popen(
+        [sys.executable, "-c", "import time;time.sleep(60)", "-q", kbd.worker_task_argv_token(token_task_id)],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+
+
+def _real_fingerprint(pid: int) -> str:
+    fp = None
+    for _ in range(100):
+        fp = kbd._process_fingerprint(pid)
+        if fp:
+            break
+        time.sleep(0.05)
+    assert fp and "|" in fp
+    return fp
+
+
+def _shifted(fp: str, delta: int) -> str:
+    epoch, start = fp.rsplit("|", 1)
+    return f"{epoch}|{int(start) + delta}"
+
+
+def _stop(proc: subprocess.Popen) -> None:
+    if proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=10)
+
+
+@pytest.mark.platforms("posix")
+def test_real_child_far_drift_identity_comes_from_its_argv(board):
+    conn = board
+    tid = kb.create_task(conn, title="job", assignee="worker")
+    ours = _spawn_sleeper(tid)
+    other_tid = kb.create_task(conn, title="other", assignee="worker")
+    foreign = _spawn_sleeper("t_someone_else")
+    try:
+        for task_id, proc in ((tid, ours), (other_tid, foreign)):
+            kb.claim_task(conn, task_id)
+            kbd._set_worker_pid(conn, task_id, proc.pid)
+            with kb.write_txn(conn):
+                conn.execute("UPDATE tasks SET worker_started_at = ? WHERE id = ?",
+                             (_shifted(_real_fingerprint(proc.pid), 1000), task_id))
+
+        sweep = kbd._reclaim_dead_workers(conn)
+
+        assert tid not in sweep.crashed
+        assert kb.get_task(conn, tid).status == "running"
+        assert not _events(conn, tid, "crashed")
+        assert other_tid in sweep.crashed
+        assert kb.get_task(conn, other_tid).status != "running"
+    finally:
+        _stop(ours)
+        _stop(foreign)
+
+
+def _signal_recorder(on_sigterm=None):
+    import signal as _signal
+
+    rec: list = []
+
+    def fn(pid, sig):
+        rec.append((pid, sig))
+        if sig == _signal.SIGTERM and on_sigterm is not None:
+            on_sigterm()
+
+    return rec, fn
+
+
+def _identity_goes_unreadable(monkeypatch):
+    from gateway import status
+
+    def flip():
+        monkeypatch.setattr(status, "get_process_start_time", lambda pid: None)
+        monkeypatch.setattr(status, "_read_process_cmdline", lambda pid: None)
+
+    return flip
+
+
+def _sigkill_sent(rec) -> bool:
+    import signal as _signal
+
+    return any(sig == getattr(_signal, "SIGKILL", None) for _pid, sig in rec)
+
+
+def test_sigkill_escalation_refused_once_identity_is_unreadable(board, monkeypatch):
+    import signal as _signal
+
+    conn = board
+    pid, fp, tid = _live_fp_running(conn)
+    lock = conn.execute("SELECT claim_lock FROM tasks WHERE id = ?", (tid,)).fetchone()[0]
+    monkeypatch.setattr(kbd, "_poll_worker_exit", lambda *a, **k: False)  # SIGTERM ignored
+    rec, fn = _signal_recorder(on_sigterm=_identity_goes_unreadable(monkeypatch))
+
+    info = kbd._terminate_reclaimed_worker(pid, lock, signal_fn=fn, started_at=fp, task_id=tid)
+
+    assert any(sig == _signal.SIGTERM for _p, sig in rec)
+    assert not _sigkill_sent(rec)
+    assert info["terminated"] is False and info["signal_refused"] is True
+    assert kbd._worker_survived_termination(info) is True
+
+
+@pytest.mark.parametrize("identity_unreadable_after_sigterm", [False, True])
+def test_max_runtime_never_releases_a_claim_beside_a_surviving_worker(
+        board, monkeypatch, identity_unreadable_after_sigterm):
+    conn = board
+    pid, _fp, tid = _live_fp_running(conn)
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET max_runtime_seconds = 1 WHERE id = ?", (tid,))
+    lock = conn.execute("SELECT claim_lock FROM tasks WHERE id = ?", (tid,)).fetchone()[0]
+    monkeypatch.setattr(kbd, "_poll_worker_exit", lambda *a, **k: False)
+    rec, fn = _signal_recorder(
+        on_sigterm=_identity_goes_unreadable(monkeypatch) if identity_unreadable_after_sigterm else None)
+
+    assert kbd.enforce_max_runtime(conn, signal_fn=fn) == []
+
+    assert rec, "the over-runtime worker is signalled while its identity is confirmed"
+    assert _sigkill_sent(rec) is (not identity_unreadable_after_sigterm)
+    task = kb.get_task(conn, tid)
+    assert task.status == "running" and task.worker_pid == pid
+    assert conn.execute("SELECT claim_lock FROM tasks WHERE id = ?", (tid,)).fetchone()[0] == lock
+    assert not _events(conn, tid, "timed_out")
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("successor_owns_pid", [True, False])
+def test_terminal_reaper_identity_is_run_scoped_not_task_scoped(board, successor_owns_pid):
+    conn = board
+    tid = kb.create_task(conn, title="job", assignee="worker")
+    proc = _spawn_sleeper(tid)  # argv carries the TASK token — it cannot name the closed run
+    try:
+        kb.claim_task(conn, tid, claimer=kb._claimer_id())
+        run_b = kb._current_run_id(conn, tid)
+        lock_b = conn.execute("SELECT claim_lock FROM tasks WHERE id = ?", (tid,)).fetchone()[0]
+        kbd._set_worker_pid(conn, tid, proc.pid if successor_owns_pid else os.getpid())
+        stale_fp = _shifted(_real_fingerprint(proc.pid), 1000)
+        ended = int(time.time()) - 3600
+        with kb.write_txn(conn):
+            run_a = conn.execute(
+                "INSERT INTO task_runs (task_id, profile, status, outcome, claim_lock, worker_pid, "
+                "worker_started_at, started_at, ended_at) VALUES (?, 'worker', 'reclaimed', 'reclaimed', "
+                "?, ?, ?, ?, ?)",
+                (tid, lock_b, proc.pid, stale_fp, ended - 60, ended)).lastrowid
+        rec, fn = _signal_recorder()
+
+        assert kbd.reap_terminal_workers(conn, signal_fn=fn) == []
+
+        assert rec == []
+        assert proc.poll() is None
+        task = kb.get_task(conn, tid)
+        assert task.status == "running" and task.current_run_id == run_b
+        assert conn.execute("SELECT claim_lock FROM tasks WHERE id = ?", (tid,)).fetchone()[0] == lock_b
+        evidence = conn.execute("SELECT worker_pid FROM task_runs WHERE id = ?", (run_a,)).fetchone()[0]
+        # A successor's pid keeps its evidence; otherwise the fingerprint mismatch makes it foreign.
+        assert evidence == (proc.pid if successor_owns_pid else None)
+    finally:
+        _stop(proc)
+
+
+def test_manual_reclaim_keeps_claim_when_identity_unreadable(board, monkeypatch):
+    conn = board
+    pid, _fp, tid = _live_fp_running(conn)
+    lock = conn.execute("SELECT claim_lock FROM tasks WHERE id = ?", (tid,)).fetchone()[0]
+    _drift_start_time(monkeypatch, 1000)
+    _cmdline(monkeypatch, None)
+    rec, fn = _signal_recorder()
+
+    assert kb.reclaim_task(conn, tid, reason="op", signal_fn=fn) is False
+
+    assert rec == []
+    task = kb.get_task(conn, tid)
+    assert task.status == "running" and task.worker_pid == pid
+    assert conn.execute("SELECT claim_lock FROM tasks WHERE id = ?", (tid,)).fetchone()[0] == lock
+
+
+def test_manual_reclaim_signals_drifted_worker_proven_by_argv(board, monkeypatch):
+    import signal as _signal
+
+    conn = board
+    pid, _fp, tid = _live_fp_running(conn)
+    _drift_start_time(monkeypatch, 1000)
+    _cmdline(monkeypatch, _worker_cmdline(tid))
+    monkeypatch.setattr(kbd, "_poll_worker_exit", lambda *a, **k: True)  # exits on SIGTERM
+    rec, fn = _signal_recorder()
+
+    assert kb.reclaim_task(conn, tid, reason="op", signal_fn=fn) is True
+
+    assert any(sig == _signal.SIGTERM for _p, sig in rec)
+    assert kb.get_task(conn, tid).status != "running"
+
+
+def test_dashboard_status_change_terminates_with_task_id(tmp_path, monkeypatch):
+    fastapi = pytest.importorskip("fastapi")
+    import importlib.util
+    from pathlib import Path
+
+    from fastapi.testclient import TestClient
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    kb.init_db()
+    plugin_file = Path(__file__).resolve().parents[2] / "plugins" / "kanban" / "dashboard" / "plugin_api.py"
+    spec = importlib.util.spec_from_file_location("hermes_dashboard_plugin_kanban_liveness_test", plugin_file)
+    mod = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, spec.name, mod)
+    spec.loader.exec_module(mod)
+    app = fastapi.FastAPI()
+    app.include_router(mod.router, prefix="/api/plugins/kanban")
+
+    with kbc.connect() as c:
+        tid = kb.create_task(c, title="job", assignee="worker")
+        kb.claim_task(c, tid)
+        kbd._set_worker_pid(c, tid, 424242)
+    calls: list = []
+    monkeypatch.setattr(kb, "_terminate_reclaimed_worker",
+                        lambda pid, lock, **kw: calls.append((pid, kw)) or {"terminated": True})
+
+    r = TestClient(app).patch(f"/api/plugins/kanban/tasks/{tid}", json={"status": "ready"})
+
+    assert r.status_code == 200, r.text
+    assert calls and calls[0][0] == 424242 and calls[0][1]["task_id"] == tid
+
+
+@pytest.mark.platforms("macos")
+def test_pid_alive_keeps_existence_answer_when_ps_fails(monkeypatch):
+    def ps(argv, **kw):
+        return subprocess.CompletedProcess(argv, 1, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", ps)
+    assert kbd._pid_alive(os.getpid()) is True
+
+    monkeypatch.setattr(subprocess, "run",
+                        lambda argv, **kw: subprocess.CompletedProcess(argv, 0, stdout="Z+\n", stderr=""))
+    assert kbd._pid_alive(os.getpid()) is False

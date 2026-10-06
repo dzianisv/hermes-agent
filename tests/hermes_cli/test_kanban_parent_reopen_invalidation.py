@@ -105,7 +105,7 @@ def test_running_descendant_event_precedes_termination_via_reclaim_helper(
 
     kills: list[tuple] = []
 
-    def fake_terminate(pid, claim_lock, started_at=None, **kwargs):
+    def fake_terminate(pid, claim_lock, started_at=None, task_id=None, **kwargs):
         # The audit trail must already be durable when the kill fires:
         # standalone calls commit before terminating.
         side = kbc.connect(tmp_path / "kanban.db")
@@ -114,7 +114,7 @@ def test_running_descendant_event_precedes_termination_via_reclaim_helper(
         finally:
             side.close()
         assert "descendant_invalidated" in kinds
-        kills.append((pid, claim_lock, started_at))
+        kills.append((pid, claim_lock, started_at, task_id))
         return {"terminated": True}
 
     monkeypatch.setattr(kb, "_terminate_reclaimed_worker", fake_terminate)
@@ -125,6 +125,8 @@ def test_running_descendant_event_precedes_termination_via_reclaim_helper(
     )
 
     assert kills and kills[0][0] == 424242
+    # The task id rides along so a drifted worker can be proven by its argv token.
+    assert kills[0][3] == child_id
     assert result["terminations"] == kills
     child = kb.get_task(conn, child_id)
     assert child is not None
