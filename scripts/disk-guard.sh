@@ -79,13 +79,15 @@ lt() { awk -v a="$1" -v b="$2" 'BEGIN{exit !(a+0 < b+0)}'; }
 # Bounded probe: dg_timeout <seconds> cmd... . A diagnostic probe that hangs
 # would hang the guard itself, so every swap probe goes through this. launchd's
 # PATH may not carry Homebrew's (g)timeout; perl's alarm survives exec and is
-# always present on macOS, so the bound holds either way.
+# always present on macOS, so the bound holds either way. With neither, the
+# probe is SKIPPED (non-zero), never run unbounded: a missing measurement
+# degrades to "unknown"/"unreadable", a hung one would wedge every tick.
 dg_timeout() {
   local s=$1 t; shift
   t=$(command -v gtimeout || command -v timeout)
   if [ -n "$t" ]; then "$t" "$s" "$@"
   elif command -v perl >/dev/null 2>&1; then perl -e 'alarm shift; exec @ARGV' "$s" "$@"
-  else "$@"
+  else return 125
   fi
 }
 
@@ -98,6 +100,11 @@ dg_timeout() {
 swap_used_gi() { # prints numeric Gi (one decimal) or nothing
   if [ -n "${DISK_GUARD_FAKE_SWAP_GI:-}" ]; then
     printf '%s' "$DISK_GUARD_FAKE_SWAP_GI"; return 0
+  fi
+  # One measurement per tick: the main body memoizes it so the shortfall
+  # clause does not pay a second (possibly hung) sysctl bound.
+  if [ "${DG_SWAP_USED_MEMO+set}" = set ]; then
+    printf '%s' "$DG_SWAP_USED_MEMO"; return 0
   fi
   local raw
   raw=$(dg_timeout 5 sysctl -n vm.swapusage 2>/dev/null) || return 0
@@ -112,29 +119,37 @@ swap_used_gi() { # prints numeric Gi (one decimal) or nothing
   return 0
 }
 
-swap_files_term() { # "swapfiles=NxQ.QGi newest=<iso>" or "swapfiles=unreadable"
-  local dir="${DISK_GUARD_SWAP_DIR:-/System/Volumes/VM}" f out sz mt
-  local n=0 maxb=0 newest=0
+swap_files_term() { # "swapfiles=NxQ.QGi swapfiles_sum=S.SGi newest=<iso>" or "swapfiles=unreadable"
+  # Q is the AVERAGE (sum/N), not the max: N x max overstated mixed-size swap.
+  # The glob is expanded by the shell (no I/O per file); every size/mtime
+  # comes from ONE stat call under ONE wall-clock bound.
+  local dir="${DISK_GUARD_SWAP_DIR:-/System/Volumes/VM}" f out
+  local files=()
   for f in "$dir"/swapfile*; do
-    [ -f "$f" ] || continue
-    case "$(basename "$f")" in *.*) continue ;; esac
-    out=$(dg_timeout 5 stat -f '%z %m' "$f" 2>/dev/null) || continue
-    sz=${out%% *}; mt=${out##* }
-    case "$sz$mt" in ''|*[!0-9]*) continue ;; esac
-    n=$((n + 1))
-    [ "$sz" -gt "$maxb" ] && maxb=$sz
-    [ "$mt" -gt "$newest" ] && newest=$mt
+    case "${f##*/}" in swapfile|swapfile\*|*.*) continue ;; esac
+    files+=("$f")
   done
-  if [ "$n" -eq 0 ]; then printf 'swapfiles=unreadable'; return 0; fi
-  printf 'swapfiles=%sx%sGi' "$n" "$(awk -v b="$maxb" 'BEGIN{printf "%.1f", b/1073741824}')"
-  out=$(date -r "$newest" '+%Y-%m-%dT%H:%M:%S%z' 2>/dev/null) && printf ' newest=%s' "$out"
+  if [ "${#files[@]}" -eq 0 ]; then printf 'swapfiles=unreadable'; return 0; fi
+  # rc 1 = some file vanished mid-probe (rest still valid); >=124 = timed out,
+  # killed or skipped (no bound available) -> nothing from it is trusted.
+  out=$(dg_timeout 5 stat -f '%z %m' "${files[@]}" 2>/dev/null)
+  [ $? -ge 124 ] && { printf 'swapfiles=unreadable'; return 0; }
+  out=$(printf '%s\n' "$out" | awk '
+    NF == 2 && $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ {
+      n++; sum += $1; if ($2 > newest) newest = $2
+    }
+    END { if (n) printf "%d %.1f %.1f %d", n, sum/n/1073741824, sum/1073741824, newest }')
+  if [ -z "$out" ]; then printf 'swapfiles=unreadable'; return 0; fi
+  set -- $out
+  printf 'swapfiles=%sx%sGi swapfiles_sum=%sGi' "$1" "$2" "$3"
+  out=$(date -r "$4" '+%Y-%m-%dT%H:%M:%S%z' 2>/dev/null) && printf ' newest=%s' "$out"
   return 0
 }
 
 compressor_top_term() { # "compressor_top=a:X.XG,b:Y.YG" or nothing
   [ "${DISK_GUARD_SKIP_TOP:-0}" = 1 ] && return 0
   local out
-  out=$(dg_timeout 10 top -l1 -stats cmprs,command -o cmprs -n 2 2>/dev/null) || return 0
+  out=$(dg_timeout 5 top -l1 -stats cmprs,command -o cmprs -n 2 2>/dev/null) || return 0
   printf '%s\n' "$out" | awk '
     /^CMPRS[[:space:]]+COMMAND/ { h = 1; next }
     h && NF >= 2 && c < 2 {
@@ -163,17 +178,20 @@ swap_term() { # one line of space-separated fields; always exit 0
 }
 
 # Shortfall clause shared by every target-shortfall line. $1 = free Gi now.
-# Swap is capped at the shortfall: it explains the gap, never more than it.
+# Swap is reported twice, never clipped: the MEASURED figure (Z) as-is, and the
+# part of the shortfall it accounts for (Y = min(Z, X)). Clipping Z to X hid
+# how big swap actually was whenever it exceeded the gap.
 swap_shortfall_clause() {
-  local s y
-  s=$(awk -v t="$RECLAIM_TARGET_GI" -v n="$1" 'BEGIN{d=t-n; if(d<0)d=0; printf "%.2f", d}')
-  y=$(swap_used_gi)
-  if printf '%s' "$y" | grep -Eq '^[0-9]+(\.[0-9]+)?$'; then
-    y=$(awk -v y="$y" -v s="$s" 'BEGIN{if(y+0>s+0)y=s; printf "%.1f", y}')Gi
+  local x z y
+  x=$(awk -v t="$RECLAIM_TARGET_GI" -v n="$1" 'BEGIN{d=t-n; if(d<0)d=0; printf "%.1f", d}')
+  z=$(swap_used_gi)
+  if printf '%s' "$z" | grep -Eq '^[0-9]+(\.[0-9]+)?$'; then
+    y=$(awk -v z="$z" -v x="$x" 'BEGIN{y=z+0; if(y>x+0)y=x+0; printf "%.1f", y}')Gi
+    z=$(awk -v z="$z" 'BEGIN{printf "%.1f", z}')Gi
   else
-    y=unknown
+    y=unknown; z=unknown
   fi
-  printf 'shortfall to target %sGi, of which swap holds %s (not reclaimable by this guard — needs memory pressure relief or reboot)' "$s" "$y"
+  printf 'shortfall to target %sGi, of which swap accounts for %s (swap_used=%s measured; not reclaimable by this guard — needs memory pressure relief or reboot)' "$x" "$y" "$z"
 }
 
 # Check-only runs never escalate, so they never logged WHY free sat under the
@@ -865,6 +883,7 @@ before=$(free_gi)
 # entirely for a full day.
 [ "${DISK_GUARD_LIB:-0}" = 1 ] && return 0 2>/dev/null
 
+DG_SWAP_USED_MEMO=$(swap_used_gi)
 swap_before=$(swap_term)
 log "free=${before}Gi floor=${FLOOR_GI}Gi target=${RECLAIM_TARGET_GI}Gi ${swap_before}"
 
@@ -882,7 +901,11 @@ after=$(free_gi)
 # Re-measure only when a reclaim ran in between; a check-only run is one
 # instant, and a second top probe would just double a hung probe's bound.
 swap_after=$swap_before
-[ "$RECLAIM" = 1 ] && swap_after=$(swap_term)
+if [ "$RECLAIM" = 1 ]; then
+  unset DG_SWAP_USED_MEMO
+  DG_SWAP_USED_MEMO=$(swap_used_gi)
+  swap_after=$(swap_term)
+fi
 log "free=${after}Gi (reclaimed $(awk -v a="$after" -v b="$before" 'BEGIN{printf "%.2f", a-b}')Gi) ${swap_after}"
 report_check_only_shortfall "$after"
 

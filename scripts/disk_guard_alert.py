@@ -113,26 +113,32 @@ def _swap_used_gi():
 
 
 def _swap_files(now):
+    """(count, average GiB, files written in the last 24h) or (None,)*3.
+
+    Enumeration lives INSIDE the _run seam with a single 5s bound: an
+    os.listdir on a wedged volume blocks with no timeout, and a per-file stat
+    loop multiplies the bound by the file count. The shell expands the glob;
+    an unmatched glob is passed through literally and fails stat (rc!=0).
+    """
     d = os.environ.get("DISK_GUARD_SWAP_DIR") or SWAP_DIR
-    try:
-        names = sorted(n for n in os.listdir(d)
-                       if n.startswith("swapfile") and "." not in n)
-    except OSError:
+    out = _run(["/bin/sh", "-c", 'stat -f "%z %m %N" "$1"/swapfile*', "_", d],
+               timeout=5)
+    if not out:
         return None, None, None
-    if not names:
-        return None, None, None
-    out = _run(["stat", "-f", "%z %m"] + [os.path.join(d, n) for n in names],
-               timeout=5) or ""
     rows = []
     for line in out.splitlines():
-        parts = line.split()
-        if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
-            rows.append((int(parts[0]), int(parts[1])))
+        parts = line.split(" ", 2)
+        if len(parts) != 3 or not (parts[0].isdigit() and parts[1].isdigit()):
+            continue
+        name = os.path.basename(parts[2])
+        if not name.startswith("swapfile") or "." in name:
+            continue
+        rows.append((int(parts[0]), int(parts[1])))
     if not rows:
         return None, None, None
-    quantum = max(sz for sz, _ in rows) / 1073741824
+    avg = sum(sz for sz, _ in rows) / len(rows) / 1073741824
     grew = sum(1 for _, mt in rows if now - mt <= 86400)
-    return len(rows), quantum, grew
+    return len(rows), avg, grew
 
 
 def _compressor_top():
@@ -546,14 +552,18 @@ def incident_key(free, floor, detail, prev=None):
 def suppressed(free, now=None, key=None):
     """True when this exact incident already paged inside the TTL.
 
-    Two independent reasons to re-page: the incident CHANGED (different key),
-    or the TTL expired. Anything else is a repeat and stays silent.
+    Three independent reasons to re-page: the incident CHANGED (different key),
+    the TTL expired, or the previous page never LANDED. An undelivered page
+    (every channel failed, or a fixture was refused) informed nobody, so it
+    must never dedupe the next attempt. Anything else is a repeat.
     """
     now = now or int(time.time())
     st = load_state()
     last_at = int(st.get("last_at") or 0)
     if not st:
         return False
+    if st.get("landed") is False:
+        return False          # nobody heard it: try again
     if (now - last_at) >= REPEAT_WINDOW_SECONDS:
         return False          # TTL expired: re-page even if unchanged
     if key is not None:
@@ -631,17 +641,24 @@ def main(argv=None):
         # not extend the TTL (that would make a genuine 6h re-page never fire),
         # but a tick that regained a ranking must record it, or the next tick
         # compares against an empty set and mints a new key.
-        if paths and paths != (prev.get("last_paths") or {}):
+        if (paths and paths != (prev.get("last_paths") or {})
+                and not fixture_active()):
             prev.update({"last_paths": paths, "last_gen": gen,
                          "last_floor": floor})
             save_state(prev)
         return 1
 
     landed = alert(text, key=key)
-    save_state({"last_free": free, "last_at": int(time.time()),
-                "last_key": key, "last_paths": paths, "last_gen": gen,
-                "last_floor": floor,
-                "landed": bool(landed)})
+    if fixture_active():
+        # A fixture never mutates dedupe state: a refused synthetic page that
+        # wrote last_at/last_key would silence the identical REAL incident.
+        print("disk-guard: fixture run; dedupe state left untouched",
+              file=sys.stderr)
+    else:
+        save_state({"last_free": free, "last_at": int(time.time()),
+                    "last_key": key, "last_paths": paths, "last_gen": gen,
+                    "last_floor": floor,
+                    "landed": bool(landed)})
     print(text)
     if not landed:
         print("disk-guard: NO alert channel accepted the page", file=sys.stderr)

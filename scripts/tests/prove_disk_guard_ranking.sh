@@ -27,13 +27,17 @@
 #      shortfall line, and reclaim_to_target's exhausted line must too. Fixture
 #      figures only; nothing is deleted.
 #   R7 every swap probe degrades silently: failing sysctl/top, a hanging top
-#      (bounded by the 10s timeout) and an unreadable swap dir still exit 0.
+#      (bounded by the 5s timeout) and an unreadable swap dir still exit 0;
+#      and with sysctl, top AND stat all hanging 30s (stat over real-looking
+#      swapfiles) one tick still finishes in <20s, rc 0, reporting unknown.
 #
-# Run: bash ~/.hermes/scripts/tests/prove_disk_guard_ranking.sh
+# Run: bash scripts/tests/prove_disk_guard_ranking.sh   (guards THIS checkout;
+#      DISK_GUARD_SCRIPT=<path> proves another copy, e.g. a mutation)
 #      PROVE_SWAP_ONLY=1 (or --only-swap) runs just R6/R7, skipping the slow du scan.
 set -uo pipefail
 
-GUARD="${DISK_GUARD_SCRIPT:-$HOME/.hermes/scripts/disk-guard.sh}"
+GUARD="${DISK_GUARD_SCRIPT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/disk-guard.sh}"
+echo "guard under test: $GUARD"
 [ "${1:-}" = "--only-swap" ] && PROVE_SWAP_ONLY=1
 SWAP_ONLY="${PROVE_SWAP_ONLY:-0}"
 fail=0
@@ -131,10 +135,13 @@ fi
 r6_out=$(DISK_GUARD_FAKE_FREE_GI=10 DISK_GUARD_FAKE_SWAP_GI=28.8 DISK_GUARD_SKIP_TOP=1 \
          bash "$GUARD" 2>&1); r6_rc=$?
 echo "--- R6 guard output ---"; printf '%s\n' "$r6_out"; echo "----------------------"
-check "R6a check-only output reports swap_used=28.8Gi" "yes" \
-      "$(printf '%s\n' "$r6_out" | grep -q 'swap_used=28\.8Gi' && echo yes || echo no)"
+check "R6a free= line reports swap_used=28.8Gi" "yes" \
+      "$(printf '%s\n' "$r6_out" | grep -Eq ' free=10\.00Gi floor=[0-9.]+Gi target=[0-9.]+Gi swap_used=28\.8Gi ' && echo yes || echo no)"
+r6_bt=$(printf '%s\n' "$r6_out" | grep 'below_target:')
 check "R6b below_target line names swap" "yes" \
-      "$(printf '%s\n' "$r6_out" | grep -q 'below_target:.*swap holds' && echo yes || echo no)"
+      "$(printf '%s\n' "$r6_bt" | grep -q 'of which swap accounts for' && echo yes || echo no)"
+check "R6b' below_target line carries swap_used=28.8Gi unclipped" "yes" \
+      "$(printf '%s\n' "$r6_bt" | grep -q 'swap_used=28\.8Gi measured' && echo yes || echo no)"
 check "R6c swap term never changes the exit code" "0" "$r6_rc"
 
 # R6d: the reclaim_to_target exhausted line, driven through the library seam
@@ -147,13 +154,13 @@ r6d_out=$(
   reclaim_to_target 2>&1
 )
 echo "--- R6d reclaim_to_target output ---"; printf '%s\n' "$r6d_out"; echo "----------------------"
-check "R6d reclaim_to_target names swap capped at the shortfall" "yes" \
-      "$(printf '%s\n' "$r6d_out" | grep -q 'of which swap holds 15\.0Gi' && echo yes || echo no)"
+check "R6d reclaim_to_target attributes min(swap, shortfall) and reports swap unclipped" "yes" \
+      "$(printf '%s\n' "$r6d_out" | grep -q 'shortfall to target 15\.0Gi, of which swap accounts for 15\.0Gi (swap_used=28\.8Gi measured' && echo yes || echo no)"
 
 # --- R7: failure paths degrade silently and stay bounded.
 STUBS="$SANDBOX/stubs"; mkdir -p "$STUBS"
 printf '#!/bin/sh\nexit 1\n' > "$STUBS/sysctl"
-printf '#!/bin/sh\nsleep 30\nexit 1\n' > "$STUBS/top"
+printf '#!/bin/sh\nexec sleep 30\n' > "$STUBS/top"
 chmod +x "$STUBS/sysctl" "$STUBS/top"
 r7_start=$(date +%s)
 r7_out=$(env -u DISK_GUARD_FAKE_SWAP_GI -u DISK_GUARD_SKIP_TOP PATH="$STUBS:$PATH" \
@@ -168,8 +175,29 @@ check "R7c unreadable swap dir reports swapfiles=unreadable" "yes" \
       "$(printf '%s\n' "$r7_out" | grep -q 'swapfiles=unreadable' && echo yes || echo no)"
 check "R7d failed/hung top omits compressor_top" "0" \
       "$(printf '%s\n' "$r7_out" | grep -c 'compressor_top=')"
-# One top probe per check-only run, bounded at 10s, plus slack.
+# One top probe per check-only run, bounded at 5s, plus slack.
 check "R7e hung top is bounded by the timeout" "yes" \
       "$([ "$r7_secs" -le 15 ] && echo yes || echo no)"
+
+# R7f: EVERY probe hangs. sysctl, top and stat sleep 30s; the swap dir holds
+# real-looking swapfiles so the single stat probe actually runs (a missing dir
+# never reaches stat). The tick must stay bounded, exit 0 and say unknown.
+HANG="$SANDBOX/hang"; VMDIR="$SANDBOX/vm"; mkdir -p "$HANG" "$VMDIR"
+for c in sysctl top stat; do printf '#!/bin/sh\nexec sleep 30\n' > "$HANG/$c"; chmod +x "$HANG/$c"; done
+: > "$VMDIR/swapfile0"; : > "$VMDIR/swapfile1"
+r7f_start=$(date +%s)
+r7f_out=$(env -u DISK_GUARD_FAKE_SWAP_GI -u DISK_GUARD_SKIP_TOP PATH="$HANG:$PATH" \
+          DISK_GUARD_SWAP_DIR="$VMDIR" DISK_GUARD_FAKE_FREE_GI=10 \
+          bash "$GUARD" 2>&1); r7f_rc=$?
+r7f_secs=$(( $(date +%s) - r7f_start ))
+echo "--- R7f all-probes-hang output (${r7f_secs}s) ---"; printf '%s\n' "$r7f_out"; echo "----------------------"
+check "R7f all-hung tick exits 0" "0" "$r7f_rc"
+check "R7f all-hung tick finishes in <20s" "yes" "$([ "$r7f_secs" -lt 20 ] && echo yes || echo no)"
+check "R7f hung sysctl -> swap_used=unknown" "yes" \
+      "$(printf '%s\n' "$r7f_out" | grep -q 'swap_used=unknown' && echo yes || echo no)"
+check "R7f hung stat -> swapfiles=unreadable" "yes" \
+      "$(printf '%s\n' "$r7f_out" | grep -q 'swapfiles=unreadable' && echo yes || echo no)"
+check "R7f hung top -> compressor_top omitted" "0" \
+      "$(printf '%s\n' "$r7f_out" | grep -c 'compressor_top=')"
 
 exit "$fail"

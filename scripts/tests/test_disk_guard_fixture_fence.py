@@ -38,7 +38,9 @@ from pathlib import Path
 
 import pytest
 
-SCRIPT = Path(os.path.expanduser("~/.hermes/scripts/disk_guard_alert.py"))
+# Bind to THIS checkout; DISK_GUARD_ALERT_SCRIPT may point at another copy.
+SCRIPT = Path(os.environ.get("DISK_GUARD_ALERT_SCRIPT")
+              or Path(__file__).resolve().parents[1] / "disk_guard_alert.py")
 spec = importlib.util.spec_from_file_location("disk_guard_alert_fence", SCRIPT)
 dga = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(dga)

@@ -32,7 +32,9 @@ from pathlib import Path
 
 import pytest
 
-SCRIPT = Path(os.path.expanduser("~/.hermes/scripts/disk_guard_alert.py"))
+# Bind to THIS checkout; DISK_GUARD_ALERT_SCRIPT may point at another copy.
+SCRIPT = Path(os.environ.get("DISK_GUARD_ALERT_SCRIPT")
+              or Path(__file__).resolve().parents[1] / "disk_guard_alert.py")
 spec = importlib.util.spec_from_file_location("disk_guard_alert_key", SCRIPT)
 dga = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(dga)
@@ -58,6 +60,17 @@ RENDER_B_OTHER_UUID = RENDER_B_443.replace(
 )
 
 FREE, FLOOR = 8, 10
+
+
+def _measured(monkeypatch, free):
+    """Drive main() with a MEASURED figure. The DISK_GUARD_FAKE_FREE_GI fixture
+    never writes dedupe state, so it cannot exercise a repeat."""
+    monkeypatch.delenv("DISK_GUARD_FAKE_FREE_GI", raising=False)
+    monkeypatch.delenv("DISK_GUARD_FAKE_SWAP_GI", raising=False)
+    monkeypatch.setattr(dga, "free_gi", lambda: float(free))
+    monkeypatch.setattr(dga, "swap_info", lambda: {
+        "used_gi": None, "files": None, "quantum_gi": None,
+        "grew_24h": None, "top": None})
 
 
 def _chain(renderings, free=FREE, floor=FLOOR):
@@ -178,7 +191,7 @@ def test_parse_paths_is_derived_from_the_text_not_a_known_list():
 def test_two_ticks_on_unchanged_state_page_exactly_once(monkeypatch, tmp_path):
     """The acceptance criterion, driven through main() and the real state file."""
     monkeypatch.setenv("DISK_GUARD_STATE", str(tmp_path / "s.json"))
-    monkeypatch.setenv("DISK_GUARD_FAKE_FREE_GI", "8")
+    _measured(monkeypatch, 8)
     delivered = []
     # deliver_wake is the RETIRED EM route (card t_b8d0aaeb). Patching it here
     # made these tests assert against a channel alert() no longer calls, so a
@@ -199,7 +212,7 @@ def test_incident_beginning_on_an_empty_ranking_pages_exactly_once(
     regains the ranking. Previously tick 2 recomputed a fresh hash and paged a
     second time for the same state."""
     monkeypatch.setenv("DISK_GUARD_STATE", str(tmp_path / "s.json"))
-    monkeypatch.setenv("DISK_GUARD_FAKE_FREE_GI", "8")
+    _measured(monkeypatch, 8)
     delivered = []
     # deliver_wake is the RETIRED EM route (card t_b8d0aaeb). Patching it here
     # made these tests assert against a channel alert() no longer calls, so a
@@ -233,7 +246,7 @@ def test_ttl_still_repages_the_same_incident(monkeypatch, tmp_path):
     """Dedupe must not become silence: after 6h an unchanged RED pages again."""
     state = tmp_path / "s.json"
     monkeypatch.setenv("DISK_GUARD_STATE", str(state))
-    monkeypatch.setenv("DISK_GUARD_FAKE_FREE_GI", "8")
+    _measured(monkeypatch, 8)
     delivered = []
     # deliver_wake is the RETIRED EM route (card t_b8d0aaeb). Patching it here
     # made these tests assert against a channel alert() no longer calls, so a
@@ -255,7 +268,7 @@ def test_suppressed_tick_does_not_extend_the_ttl(monkeypatch, tmp_path):
     forever — the dedupe would become permanent silence."""
     state = tmp_path / "s.json"
     monkeypatch.setenv("DISK_GUARD_STATE", str(state))
-    monkeypatch.setenv("DISK_GUARD_FAKE_FREE_GI", "8")
+    _measured(monkeypatch, 8)
     # deliver_kanban_cto must be patched like every other channel. Leaving it
     # unpatched here is what created real CTO cards t_849189ed / t_0fbf5b8d on
     # 2026-09-25 at 19:04 from this test's literals (8Gi / floor 10Gi) while

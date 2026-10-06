@@ -16,9 +16,9 @@ from pathlib import Path
 
 import pytest
 
-SCRIPT = Path(os.environ.get(
-    "DISK_GUARD_ALERT_SCRIPT",
-    os.path.expanduser("~/.hermes/scripts/disk_guard_alert.py")))
+# Bind to THIS checkout; DISK_GUARD_ALERT_SCRIPT may point at another copy.
+SCRIPT = Path(os.environ.get("DISK_GUARD_ALERT_SCRIPT")
+              or Path(__file__).resolve().parents[1] / "disk_guard_alert.py")
 spec = importlib.util.spec_from_file_location("disk_guard_alert", SCRIPT)
 dga = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(dga)
@@ -335,10 +335,21 @@ def test_healthy_disk_is_silent(monkeypatch):
 
 
 # ----------------------------------------------------------------- dedupe --
+# Dedupe is exercised with a MEASURED figure (free_gi patched), not the
+# DISK_GUARD_FAKE_FREE_GI fixture: a fixture run never writes dedupe state, so
+# it cannot be the first tick of a repeat.
+
+def _measured(monkeypatch, free):
+    monkeypatch.delenv("DISK_GUARD_FAKE_FREE_GI", raising=False)
+    monkeypatch.delenv("DISK_GUARD_FAKE_SWAP_GI", raising=False)
+    monkeypatch.setattr(dga, "free_gi", lambda: float(free))
+    monkeypatch.setattr(dga, "swap_info", lambda: {
+        "used_gi": None, "files": None, "quantum_gi": None,
+        "grew_24h": None, "top": None})
 
 def test_repeat_alert_within_window_is_suppressed(monkeypatch, tmp_path):
     monkeypatch.setenv("DISK_GUARD_STATE", str(tmp_path / "state.json"))
-    monkeypatch.setenv("DISK_GUARD_FAKE_FREE_GI", "1")
+    _measured(monkeypatch, "1")
     delivered = []
     monkeypatch.setattr(dga, "deliver_kanban_cto", lambda t, key=None: delivered.append(t) or True)
     monkeypatch.setattr(dga, "deliver_telegram", lambda t: delivered.append(t) or True)
@@ -353,10 +364,10 @@ def test_worsening_alert_is_not_suppressed(monkeypatch, tmp_path):
     delivered = []
     monkeypatch.setattr(dga, "deliver_kanban_cto", lambda t, key=None: delivered.append(t) or True)
     monkeypatch.setattr(dga, "deliver_telegram", lambda t: delivered.append(t) or True)
-    monkeypatch.setenv("DISK_GUARD_FAKE_FREE_GI", "5")
+    _measured(monkeypatch, "5")
     dga.main(["--floor", "10"])
     n = len(delivered)
-    monkeypatch.setenv("DISK_GUARD_FAKE_FREE_GI", "1")
+    _measured(monkeypatch, "1")
     dga.main(["--floor", "10"])
     assert len(delivered) > n, "a worse figure is new information and must page"
 
@@ -371,11 +382,11 @@ def test_small_wobble_inside_window_does_not_repage(monkeypatch, tmp_path):
     monkeypatch.setattr(dga, "deliver_kanban_cto", lambda t, key=None: delivered.append(t) or True)
     monkeypatch.setattr(dga, "deliver_telegram", lambda t: delivered.append(t) or True)
     body = "Top reclaimable:\n  2337MB  /a"
-    monkeypatch.setenv("DISK_GUARD_FAKE_FREE_GI", "7")
+    _measured(monkeypatch, "7")
     dga.main(["--floor", "10", "--detail", body])
     n = len(delivered)
     assert n > 0
-    monkeypatch.setenv("DISK_GUARD_FAKE_FREE_GI", "7")  # same state, next tick
+    _measured(monkeypatch, "7")  # same state, next tick
     dga.main(["--floor", "10", "--detail", body])
     assert len(delivered) == n
 
@@ -385,10 +396,10 @@ def test_material_drop_repages(monkeypatch, tmp_path):
     delivered = []
     monkeypatch.setattr(dga, "deliver_kanban_cto", lambda t, key=None: delivered.append(t) or True)
     monkeypatch.setattr(dga, "deliver_telegram", lambda t: delivered.append(t) or True)
-    monkeypatch.setenv("DISK_GUARD_FAKE_FREE_GI", "7")
+    _measured(monkeypatch, "7")
     dga.main(["--floor", "10"])
     n = len(delivered)
-    monkeypatch.setenv("DISK_GUARD_FAKE_FREE_GI", "2")
+    _measured(monkeypatch, "2")
     dga.main(["--floor", "10"])
     assert len(delivered) > n
 
@@ -401,7 +412,7 @@ def test_material_drop_repages(monkeypatch, tmp_path):
 # operator would actually read: (free, floor, top paths).
 
 def _fire(monkeypatch, delivered, free, detail, floor="25"):
-    monkeypatch.setenv("DISK_GUARD_FAKE_FREE_GI", free)
+    _measured(monkeypatch, free)
     return dga.main(["--floor", floor, "--detail", detail])
 
 
@@ -474,7 +485,7 @@ def _fake_run(swap_dir_rows):
     def run(argv, timeout=30):
         if argv[0] == "top":
             return TOP_OUT
-        if argv[0] == "stat":
+        if argv[0] == "/bin/sh" and "stat" in argv[2]:
             return swap_dir_rows
         return ""
     return run
@@ -486,12 +497,13 @@ def _swap_page(monkeypatch, capsys, tmp_path, swap_gi, free="0.3"):
     monkeypatch.setenv("DISK_GUARD_FAKE_FREE_GI", free)
     monkeypatch.setenv("DISK_GUARD_FAKE_SWAP_GI", swap_gi)
     d = tmp_path / "vm"
-    d.mkdir()
-    for i in range(3):
-        (d / f"swapfile{i}").write_text("")
     monkeypatch.setenv("DISK_GUARD_SWAP_DIR", str(d))
     now = int(time.time())
-    rows = f"1073741824 {now - 100}\n1073741824 {now - 200}\n1073741824 {now - 200000}\n"
+    rows = (f"1073741824 {now - 100} {d}/swapfile0\n"
+            f"1073741824 {now - 200} {d}/swapfile1\n"
+            f"1073741824 {now - 200000} {d}/swapfile2\n"
+            # a sibling the guard must ignore (not a swapfile proper)
+            f"9999999999 {now} {d}/swapfile.lock\n")
     monkeypatch.setattr(dga, "_run", _fake_run(rows))
     assert dga.main(["--dry-run"]) == 1
     return capsys.readouterr().out
@@ -545,3 +557,121 @@ def test_swap_used_parses_sysctl_swapusage(monkeypatch):
     monkeypatch.setattr(dga, "_run",
                         lambda argv, timeout=30: real if argv[0] == "sysctl" else "")
     assert dga.swap_info()["used_gi"] == pytest.approx(2741.5 / 1024, abs=0.01)
+
+
+def test_swap_files_reports_the_average_of_actual_sizes(monkeypatch):
+    rows = ("1073741824 100 /vm/swapfile0\n"
+            "3221225472 200 /vm/swapfile1\n")
+    monkeypatch.setattr(dga, "_run", lambda argv, timeout=30: rows)
+    assert dga._swap_files(300) == (2, pytest.approx(2.0), 2)
+
+
+def test_swap_files_timeout_degrades_and_page_is_still_composed(
+        monkeypatch, capsys, tmp_path):
+    """_run returns None on a timed-out probe: the swap line degrades, nothing
+    raises, and the RED page is still rendered."""
+    monkeypatch.setenv("DISK_GUARD_FAKE_FREE_GI", "0.3")
+    monkeypatch.setenv("DISK_GUARD_FAKE_SWAP_GI", "20")
+    seen = []
+
+    def run(argv, timeout=30):
+        seen.append((argv, timeout))
+        return None
+    monkeypatch.setattr(dga, "_run", run)
+    assert dga._swap_files(time.time()) == (None, None, None)
+    assert dga.main(["--dry-run"]) == 1
+    out = capsys.readouterr().out
+    assert out.startswith("DISK GUARD RED")
+    assert "Swap: used 20.0 Gi in unknown swapfiles (grew by unknown in 24h)" in out
+    assert any(a[0] == "/bin/sh" and t == 5 for a, t in seen), seen
+
+
+def test_swap_files_missing_dir_degrades(monkeypatch, tmp_path):
+    """Real probe, nonexistent dir: the unmatched glob fails stat -> None."""
+    monkeypatch.setenv("DISK_GUARD_SWAP_DIR", str(tmp_path / "nope"))
+    assert dga._swap_files(time.time()) == (None, None, None)
+
+
+def test_swap_files_never_enumerates_outside_the_bounded_seam(
+        monkeypatch, tmp_path):
+    """os.listdir has no timeout; enumeration must go through _run only."""
+    def boom(*a, **k):
+        raise AssertionError("os.listdir called outside the _run seam")
+    monkeypatch.setattr(dga.os, "listdir", boom)
+    d = tmp_path / "vm"
+    d.mkdir()
+    (d / "swapfile0").write_bytes(b"x" * 2048)
+    (d / "swapfile0.lock").write_text("")
+    monkeypatch.setenv("DISK_GUARD_SWAP_DIR", str(d))
+    n, avg, grew = dga._swap_files(time.time())
+    assert (n, grew) == (1, 1)
+    assert avg == pytest.approx(2048 / 1073741824)
+    monkeypatch.delenv("DISK_GUARD_FAKE_SWAP_GI", raising=False)
+    info = dga.swap_info()
+    assert info["files"] == 1
+
+
+# ------------------------------------------- undelivered pages never dedupe -
+
+def _channels(monkeypatch, delivered, ok=True):
+    monkeypatch.setattr(dga, "deliver_kanban_cto",
+                        lambda t, key=None: delivered.append(t) or ok)
+    monkeypatch.setattr(dga, "deliver_telegram",
+                        lambda t: delivered.append(t) or ok)
+
+
+def test_refused_fixture_red_does_not_suppress_the_identical_real_red(
+        monkeypatch, tmp_path):
+    state = tmp_path / "s.json"
+    monkeypatch.setenv("DISK_GUARD_STATE", str(state))
+    monkeypatch.setattr(dga, "swap_info", lambda: {
+        "used_gi": None, "files": None, "quantum_gi": None,
+        "grew_24h": None, "top": None})
+    body = "Top reclaimable:\n  2337MB  /a"
+    # Tick 1: fixture figure, REAL channels -> both refuse (FIXTURE fence).
+    monkeypatch.setenv("DISK_GUARD_FAKE_FREE_GI", "0.3")
+    monkeypatch.setattr(dga.subprocess, "run", lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError("fixture reached the board")))
+    monkeypatch.setattr(dga.urllib.request, "urlopen", lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError("fixture reached the network")))
+    assert dga.main(["--detail", body]) == 1
+    st = json.loads(state.read_text()) if state.exists() else {}
+    assert "last_at" not in st and "last_key" not in st, st
+    # Tick 2: identical incident, now MEASURED -> a real delivery is attempted.
+    delivered = []
+    monkeypatch.delenv("DISK_GUARD_FAKE_FREE_GI")
+    monkeypatch.setattr(dga, "free_gi", lambda: 0.3)
+    _channels(monkeypatch, delivered)
+    assert dga.main(["--detail", body]) == 1
+    assert len(delivered) == 2, "the real RED was suppressed by a refused fixture"
+
+
+def test_undelivered_real_page_is_reattempted(monkeypatch, tmp_path):
+    state = tmp_path / "s.json"
+    monkeypatch.setenv("DISK_GUARD_STATE", str(state))
+    _measured(monkeypatch, 0.3)
+    body = "Top reclaimable:\n  2337MB  /a"
+    attempts = []
+    _channels(monkeypatch, attempts, ok=False)
+    dga.main(["--detail", body])
+    assert json.loads(state.read_text())["landed"] is False
+    n = len(attempts)
+    assert n == 2
+    dga.main(["--detail", body])
+    assert len(attempts) == 2 * n, "a page that never landed must not dedupe"
+
+
+def test_landed_page_still_suppresses_the_identical_page(monkeypatch, tmp_path):
+    state = tmp_path / "s.json"
+    monkeypatch.setenv("DISK_GUARD_STATE", str(state))
+    _measured(monkeypatch, 0.3)
+    body = "Top reclaimable:\n  2337MB  /a"
+    delivered = []
+    _channels(monkeypatch, delivered)
+    dga.main(["--detail", body])
+    first_at = json.loads(state.read_text())["last_at"]
+    n = len(delivered)
+    assert n == 2
+    dga.main(["--detail", body])
+    assert len(delivered) == n
+    assert json.loads(state.read_text())["last_at"] == first_at
