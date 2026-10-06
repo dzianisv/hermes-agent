@@ -391,11 +391,21 @@ def _rule_repeated_failures(task, events, runs, now, cfg) -> list[Diagnostic]:
     assignee = _task_field(task, "assignee")
 
     # Most recent failure outcome makes the title/action specific.
+    newest_runs = _runs_newest_first(runs)
+    failure_outcomes = {"spawn_failed", "timed_out", "crashed"}
     most_recent_outcome = next(
-        (oc for oc in (_task_field(r, "outcome") for r in _runs_newest_first(runs))
-         if oc in {"spawn_failed", "timed_out", "crashed"}),
+        (oc for oc in (_task_field(r, "outcome") for r in newest_runs) if oc in failure_outcomes),
         None,
     )
+    # A review handoff clears the task field while the streak survives; fall
+    # back (read-only) to the run history so the card never claims no error.
+    historical_run = None
+    if not _error_snippet(last_err):
+        historical_run = next(
+            (r for r in newest_runs
+             if _task_field(r, "outcome") in failure_outcomes and _error_snippet(_task_field(r, "error"))),
+            None,
+        )
 
     actions: list[DiagnosticAction] = []
     if most_recent_outcome == "spawn_failed" and assignee and assignee != "default":
@@ -421,6 +431,26 @@ def _rule_repeated_failures(task, events, runs, now, cfg) -> list[Diagnostic]:
             f"{failure_limit}-attempt retry budget on it. Full last error:\n\n{err_snippet}\n\n"
             f"Fix the assignee profile's provider credentials/model, then unblock the task."
         )
+    elif historical_run is not None:
+        from agent.redact import redact_sensitive_text
+
+        # Historical run text is raw worker output serialized board-wide. Redact
+        # the FULL text before truncating: a cut inside a token defeats its pattern.
+        hist_snippet = _error_snippet(redact_sensitive_text(
+            _task_field(historical_run, "error"), force=True, redact_url_credentials=True,
+        ))
+        hist_id = _task_field(historical_run, "id")
+        title = (
+            f"Agent {outcome_label} x{failures} (historical, run {hist_id}): "
+            f"{hist_snippet.splitlines()[0][:160]}"
+        )
+        detail = (
+            f"This task has failed {failures} times in a row (most recent: {outcome_label}). The "
+            f"task's current error field is empty (cleared by a handoff). Last recorded error from "
+            f"run history (run {hist_id}):\n\n{hist_snippet}\n\nThe dispatcher circuit breaker is "
+            f"configured for {failure_limit} consecutive non-success attempts. Fix the root cause "
+            f"and reclaim or unblock the task to retry."
+        )
     elif err_snippet:
         title = f"Agent {outcome_label} x{failures}: {err_snippet.splitlines()[0][:160]}"
         detail = (
@@ -443,6 +473,9 @@ def _rule_repeated_failures(task, events, runs, now, cfg) -> list[Diagnostic]:
             "consecutive_failures": failures,
             "most_recent_outcome": most_recent_outcome,
             "last_error": last_err,
+            "historical_run_id": (
+                _task_field(historical_run, "id") if historical_run is not None else None
+            ),
             "failure_threshold": threshold,
             "failure_limit": failure_limit,
         },
