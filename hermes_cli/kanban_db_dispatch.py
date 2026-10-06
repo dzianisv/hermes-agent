@@ -3045,7 +3045,7 @@ def _design_phase_cfg() -> Optional[dict]:
         import yaml
         from pathlib import Path
         root = Path(os.environ.get("HERMES_ROOT_HOME") or Path.home() / ".hermes") / "config.yaml"
-        cfg = ((yaml.safe_load(root.read_text()) or {}).get("kanban") or {}).get("design_phase") or {}
+        cfg = ((yaml.safe_load(root.read_text(encoding="utf-8-sig")) or {}).get("kanban") or {}).get("design_phase") or {}
     except Exception:
         return None
     if not cfg or not cfg.get("enabled", True):

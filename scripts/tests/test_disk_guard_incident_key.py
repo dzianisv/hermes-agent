@@ -256,9 +256,9 @@ def test_ttl_still_repages_the_same_incident(monkeypatch, tmp_path):
     monkeypatch.setattr(dga, "deliver_telegram", lambda t: delivered.append(t) or True)
     dga.main(["--floor", "10", "--detail", RENDER_B_443])
     n = len(delivered)
-    st = json.loads(state.read_text())
+    st = json.loads(state.read_text(encoding="utf-8-sig"))
     st["last_at"] = int(time.time()) - (dga.REPEAT_WINDOW_SECONDS + 60)
-    state.write_text(json.dumps(st))
+    state.write_text(json.dumps(st), encoding="utf-8")
     dga.main(["--floor", "10", "--detail", RENDER_A])
     assert len(delivered) > n
 
@@ -278,7 +278,7 @@ def test_suppressed_tick_does_not_extend_the_ttl(monkeypatch, tmp_path):
     monkeypatch.setattr(dga, "deliver_wake", lambda t: True)
     monkeypatch.setattr(dga, "deliver_telegram", lambda t: True)
     dga.main(["--floor", "10", "--detail", RENDER_A])
-    first_at = json.loads(state.read_text())["last_at"]
+    first_at = json.loads(state.read_text(encoding="utf-8-sig"))["last_at"]
     time.sleep(1.1)
     dga.main(["--floor", "10", "--detail", RENDER_B_443])   # suppressed
-    assert json.loads(state.read_text())["last_at"] == first_at
+    assert json.loads(state.read_text(encoding="utf-8-sig"))["last_at"] == first_at

@@ -71,7 +71,7 @@ def _run_rc(argv, timeout=30):
     any rc != 0 as unknown rather than parse what was printed before failing.
     """
     try:
-        p = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+        p = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8", timeout=timeout)
         return p.returncode, p.stdout
     except Exception:
         return None, ""
@@ -300,7 +300,7 @@ def deliver_wake(text):
     """
     cfg = wake_config()
     _refuse_if_fixture("deliver_wake")
-    with open(os.path.expanduser(cfg["secret_file"])) as fh:
+    with open(os.path.expanduser(cfg["secret_file"]), encoding="utf-8-sig") as fh:
         secret = fh.read().strip()
     body = json.dumps({
         "text": text,
@@ -357,7 +357,7 @@ def deliver_kanban_cto(text, key=None):
         "--idempotency-key", f"disk-guard-{key or 'unkeyed'}",
         "--json",
     ]
-    proc = subprocess.run(argv, capture_output=True, text=True, timeout=60)
+    proc = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8", timeout=60)
     if proc.returncode != 0:
         raise RuntimeError(
             f"kanban create rc={proc.returncode}: {proc.stderr.strip()[:200]}")
@@ -374,7 +374,7 @@ def _bot_token():
     if tok:
         return tok
     env = os.path.expanduser("~/.hermes/.env")
-    with open(env) as fh:
+    with open(env, encoding="utf-8-sig") as fh:
         for line in fh:
             line = line.strip()
             if line.startswith("TELEGRAM_BOT_TOKEN=") and len(line) > 19:
@@ -429,7 +429,7 @@ def state_path():
 
 def load_state():
     try:
-        with open(state_path()) as fh:
+        with open(state_path(), encoding="utf-8-sig") as fh:
             st = json.load(fh)
         return st if isinstance(st, dict) else {}
     except Exception:
@@ -440,7 +440,7 @@ def save_state(st):
     p = state_path()
     os.makedirs(os.path.dirname(p) or ".", exist_ok=True)
     tmp = f"{p}.tmp"
-    with open(tmp, "w") as fh:
+    with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(st, fh, indent=1, sort_keys=True)
     os.replace(tmp, p)
 
