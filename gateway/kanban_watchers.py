@@ -24,7 +24,7 @@ from gateway.kanban_watchers_common import (
     _to_thread_process_service,
     logger,
 )
-from gateway.kanban_watchers_notifier import _KanbanNotification, _notifier_collect
+from gateway.kanban_watchers_notifier import _KanbanNotification, _notifier_collect, flush_wake_digest
 from gateway.kanban_watchers_dispatcher import (
     _KanbanDispatcher,
     _log_spawn_results,
@@ -87,6 +87,8 @@ class GatewayKanbanWatchersMixin:
             logger.warning("kanban notifier: kanban_db not importable; notifier disabled")
             return
 
+        from gateway.kanban_wake_gate import WakeGateConfig
+        self._kanban_wake_gate = WakeGateConfig.from_kanban_cfg(kanban_cfg)
         sub_fail_counts: dict[tuple, int] = getattr(self, "_kanban_sub_fail_counts", {})
         self._kanban_sub_fail_counts = sub_fail_counts
         notifier_profile = getattr(self, "_kanban_notifier_profile", None) or self._active_profile_name()
@@ -116,6 +118,7 @@ class GatewayKanbanWatchersMixin:
                     await _KanbanNotification(
                         self, d, platform_cls=_Platform, sub_fail_counts=sub_fail_counts,
                     ).deliver()
+                await flush_wake_digest(self, platform_cls=_Platform)
             except Exception as exc:
                 logger.warning("kanban notifier tick failed: %s", exc)
             await self._sleep_between_ticks(interval)

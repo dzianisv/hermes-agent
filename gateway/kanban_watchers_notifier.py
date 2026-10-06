@@ -304,9 +304,15 @@ class _Collector:
         if not events:
             return None
         task = self.kb.get_task(conn, sub["task_id"])
+        lineage = None
+        gate = getattr(self.runner, "_kanban_wake_gate", None)
+        if gate is not None and gate.enabled and gate.active_task_ids:
+            from gateway.kanban_wake_gate import task_lineage
+            lineage = task_lineage(conn, sub["task_id"])
         logger.debug("kanban notifier: claimed %d event(s) for %s on board %s cursor %s→%s",
                      len(events), sub["task_id"], slug, old_cursor, cursor)
-        return {"sub": sub, "old_cursor": old_cursor, "cursor": cursor, "events": events, "task": task, "board": slug}
+        return {"sub": sub, "old_cursor": old_cursor, "cursor": cursor, "events": events, "task": task, "board": slug,
+                "lineage": lineage}
 
     def collect_board(self, slug: str) -> None:
         """Claim events on one board, appending delivery dicts to ``deliveries``."""
@@ -731,6 +737,26 @@ class _KanbanNotification:
                 return False
         return True
 
+    def _coalesce(self, events: list, wake_payloads: list) -> bool:
+        """Wake gate (#17): park a non-urgent wake in the durable digest. True = parked."""
+        gate = getattr(self.runner, "_kanban_wake_gate", None)
+        if gate is None or not gate.enabled:
+            return False
+        from gateway.kanban_wake_gate import default_store, is_immediate, route_key
+        if is_immediate(gate, self.d, events):
+            return False
+        kinds = sorted({k for _s, _d, ks in wake_payloads for k in ks})
+        store = getattr(self.runner, "_kanban_wake_digest", None) or default_store()
+        handoff = f" — {self.wake_handoff}" if self.wake_handoff else ""
+        store.add(
+            route_key=route_key(self.sub, self.session_key),
+            route={"sub": self.sub, "session_key": self.session_key, "board": self.board_slug},
+            dedup_key=f"{self.board_slug or ''}:{self.task_id}:{','.join(kinds)}",
+            line=f"{self.head} {'/'.join(kinds)} — {self.title}{handoff}",
+        )
+        logger.info("kanban wake gate: coalesced %s %s into digest", self.task_id, kinds)
+        return True
+
     async def deliver(self) -> None:
         try:
             self.plat = self.platform_cls(self.platform_str)
@@ -776,6 +802,8 @@ class _KanbanNotification:
                 if self.wake_kinds:
                     wake_payloads.append((self.synth, self.wake_diagnostic, self.wake_kinds))
             self.d = {**self.d, "events": original_events}
+            if wake_payloads and self._coalesce(original_events, wake_payloads):
+                wake_payloads = []
         wake_kinds, is_push = self.wake_kinds, self.is_push_adapter
         from gateway.wake import WakeNotAccepted
 
@@ -805,3 +833,37 @@ class _KanbanNotification:
         # Unsubscribe only on archive; ``done`` is reversible.
         if self.task and self.task.status == "archived":
             await self.unsub()
+
+
+async def flush_wake_digest(runner: Any, *, platform_cls: Any, now: Optional[float] = None) -> int:
+    """Deliver each session's coalesced wakes as ONE digest wake once the checkpoint is due (#17).
+
+    Rows stay queued when the route is gone or admission fails, so the next
+    tick retries; returns the number of digests delivered.
+    """
+    gate = getattr(runner, "_kanban_wake_gate", None)
+    if gate is None or not gate.enabled:
+        return 0
+    from gateway.kanban_wake_gate import default_store, digest_text
+    from gateway.wake import adapter_supports_push
+    store = getattr(runner, "_kanban_wake_digest", None) or default_store()
+    delivered = 0
+    for key, route, rows in await asyncio.to_thread(store.due, gate.digest_interval_seconds, now):
+        sub = route["sub"]
+        n = _KanbanNotification(runner, {"sub": sub, "task": None, "events": [], "board": route.get("board"),
+                                         "cursor": 0}, platform_cls=platform_cls, sub_fail_counts={})
+        try:
+            n.plat = platform_cls(n.platform_str)
+            adapter = await asyncio.to_thread(_adapter_for_subscription, runner, n.plat, sub, n.sub_profile or None)
+            if adapter is None:
+                continue
+            n.adapter, n.is_push_adapter = adapter, adapter_supports_push(adapter)
+            n.session_key = route.get("session_key") or ""
+            n.synth, n.wake_diagnostic, n.wake_kinds = digest_text(rows), False, {"digest"}
+            await n.wake()
+        except Exception as exc:
+            logger.warning("kanban wake gate: digest delivery for %s failed (will retry): %s", key, exc)
+            continue
+        await asyncio.to_thread(store.settle, key, rows)
+        delivered += 1
+    return delivered
