@@ -3045,7 +3045,7 @@ def _design_phase_cfg() -> Optional[dict]:
         import yaml
         from pathlib import Path
         root = Path(os.environ.get("HERMES_ROOT_HOME") or Path.home() / ".hermes") / "config.yaml"
-        cfg = ((yaml.safe_load(root.read_text()) or {}).get("kanban") or {}).get("design_phase") or {}
+        cfg = ((yaml.safe_load(root.read_text(encoding="utf-8-sig")) or {}).get("kanban") or {}).get("design_phase") or {}
     except Exception:
         return None
     if not cfg or not cfg.get("enabled", True):
@@ -3058,6 +3058,17 @@ def _design_phase_cfg() -> Optional[dict]:
         # Notion page ids that hold designs; empty = any Notion link (legacy).
         "design_pages": {str(p).replace("-", "").lower() for p in (cfg.get("design_pages") or [])},
     }
+
+
+def _brief_marker_re(marker: str) -> "re.Pattern[str]":
+    # A header line "KEY:" or "KEY (qualifier):" counts; prose mentions do not.
+    # Group 1 is the rest of the header line.
+    key = marker.rstrip(":")
+    return re.compile(rf"^\s*{re.escape(key)}\b[^:\n]{{0,80}}:[ \t]*(.*)", re.MULTILINE | re.IGNORECASE)
+
+
+def _brief_has_marker(text: str, marker: str) -> bool:
+    return _brief_marker_re(marker).search(text) is not None
 
 
 def _design_phase_guard(conn: sqlite3.Connection, task_id: str, assignee: str) -> Optional[str]:
@@ -3090,11 +3101,12 @@ def _design_phase_guard(conn: sqlite3.Connection, task_id: str, assignee: str) -
                 ok = True
                 break
     if not ok:
-        # Any DESIGN: line may carry the link (body, or an EM/architect comment);
-        # the guard's own park note also contains "DESIGN:" and must not mask it.
+        # Any DESIGN header line ("DESIGN:" or "DESIGN (qualifier):") may carry the
+        # link (body, or an EM/architect comment). The guard's own park note says
+        # "DESIGN:" mid-sentence, so it is not a header and cannot mask the check.
         # A link to any Notion page (e.g. the readiness-gaps page) is not a design:
-        # with design_pages configured, the DESIGN: line must name one of them.
-        for v in re.findall(r"DESIGN:[ \t]*(.+)", text):
+        # with design_pages configured, the DESIGN line must name one of them.
+        for v in _brief_marker_re("DESIGN").findall(text):
             ids = set(re.findall(r"[0-9a-f]{32}", v.replace("-", "").lower()))
             if cfg["design_pages"]:
                 ok = bool(ids & cfg["design_pages"])
@@ -3102,8 +3114,7 @@ def _design_phase_guard(conn: sqlite3.Connection, task_id: str, assignee: str) -
                 ok = bool(ids) or bool(re.search(r"notion\.(so|com)/", v))
             if ok:
                 break
-    low = text.lower()
-    missing = [r for r in cfg["required"] if r.lower() not in low]
+    missing = [r for r in cfg["required"] if not _brief_has_marker(text, r)]
     if ok and not missing:
         return None
     if not ok:
