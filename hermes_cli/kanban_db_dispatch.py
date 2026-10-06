@@ -2769,6 +2769,8 @@ def _design_phase_cfg() -> Optional[dict]:
         "architects": set(cfg.get("architects") or []),
         "architect": cfg.get("architect") or next(iter(cfg.get("architects") or []), None),
         "required": list(cfg.get("required") or []),
+        # Notion page ids that hold designs; empty = any Notion link (legacy).
+        "design_pages": {str(p).replace("-", "").lower() for p in (cfg.get("design_pages") or [])},
     }
 
 
@@ -2804,8 +2806,16 @@ def _design_phase_guard(conn: sqlite3.Connection, task_id: str, assignee: str) -
     if not ok:
         # Any DESIGN: line may carry the link (body, or an EM/architect comment);
         # the guard's own park note also contains "DESIGN:" and must not mask it.
-        ok = any(re.search(r"[0-9a-f]{32}|notion\.(so|com)/", v)
-                 for v in re.findall(r"DESIGN:[ \t]*(.+)", text))
+        # A link to any Notion page (e.g. the readiness-gaps page) is not a design:
+        # with design_pages configured, the DESIGN: line must name one of them.
+        for v in re.findall(r"DESIGN:[ \t]*(.+)", text):
+            ids = set(re.findall(r"[0-9a-f]{32}", v.replace("-", "").lower()))
+            if cfg["design_pages"]:
+                ok = bool(ids & cfg["design_pages"])
+            else:
+                ok = bool(ids) or bool(re.search(r"notion\.(so|com)/", v))
+            if ok:
+                break
     low = text.lower()
     missing = [r for r in cfg["required"] if r.lower() not in low]
     if ok and not missing:
