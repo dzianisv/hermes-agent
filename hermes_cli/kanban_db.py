@@ -2467,13 +2467,14 @@ def release_stale_claims(
         # observable progress — reclaim even if the PID is alive (logic loop).
         heartbeat_stale = hb is not None and (now - int(hb)) > DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS
         started_at = _row_get(row, "worker_started_at")
-        if (host_local and row["worker_pid"] and _worker_alive(row["worker_pid"], started_at)
+        if (host_local and row["worker_pid"] and _worker_alive(row["worker_pid"], started_at, row["id"])
                 and not heartbeat_stale):
             _extend_live_stale_claim(conn, row, now)
             continue
 
         termination = _terminate_reclaimed_worker(
             row["worker_pid"], row["claim_lock"], signal_fn=signal_fn, started_at=started_at,
+            task_id=row["id"],
         )
         # A live worker of ours must keep its claim (else a duplicate spawns beside it).
         if _worker_survived_termination(termination):
@@ -2731,7 +2732,7 @@ def _claim_is_live(trow) -> bool:
         trow["status"] == "running"
         and trow["claim_lock"] is not None
         and trow["worker_pid"]
-        and _worker_alive(trow["worker_pid"], trow["worker_started_at"])
+        and _worker_alive(trow["worker_pid"], trow["worker_started_at"], trow["id"])
     )
 
 
@@ -2780,7 +2781,7 @@ def complete_task(
         if acceptance is not None and not record_acceptance(conn, task_id, acceptance):
             return False
         trow = conn.execute(
-            "SELECT status, claim_lock, worker_pid, worker_started_at FROM tasks WHERE id = ?",
+            "SELECT id, status, claim_lock, worker_pid, worker_started_at FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         prior_status = trow["status"] if trow else None
@@ -3400,7 +3401,7 @@ def request_review(
             if not _parents_satisfied(conn, task_id):
                 return _ret(False, "parent dependencies are not satisfied")
             trow = conn.execute(
-                "SELECT assignee, status, claim_lock, current_run_id, worker_pid, "
+                "SELECT id, assignee, status, claim_lock, current_run_id, worker_pid, "
                 "worker_started_at FROM tasks WHERE id = ?", (task_id,),
             ).fetchone()
             if trow is None:

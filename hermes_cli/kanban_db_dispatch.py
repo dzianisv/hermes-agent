@@ -558,19 +558,76 @@ def _process_fingerprint(pid: int) -> Optional[str]:
     return f"{current_instantiation_epoch()}|{start}"
 
 
-def _worker_alive(pid: Optional[int], started_at) -> bool:
+# Worker start-time drift tolerance (×100 scale). Measured macOS drift between spawn and a later read
+# is 100-200 cs, right at the gateway-wide ``START_TIME_DRIFT_TOLERANCE`` (200, left untouched); a
+# recycled PID is still never within 5 s of the original's start.
+WORKER_START_TIME_TOLERANCE_CS = 500
+
+
+def worker_task_argv_token(task_id: str) -> str:
+    """Exact ``-q`` argv element a worker process carries for ``task_id``.
+
+    Matched as a whole argv element, never as a substring, so a shorter id
+    cannot fence a longer one (``t_00`` vs ``t_007efb64``).
+    """
+    return f"work kanban task {task_id}"
+
+
+def _pid_carries_task(pid: Optional[int], task_id: Optional[str]) -> Optional[bool]:
+    """Does live ``pid``'s command line carry ``task_id``'s worker token? ``None`` = unreadable.
+
+    The cmdline reader joins argv with spaces, so the token is matched as consecutive whole tokens:
+    ``t_00`` never matches a ``t_007efb64`` worker.
+    """
+    if not pid or not task_id:
+        return None
+    from gateway.status import _read_process_cmdline
+    try:
+        cmdline = _read_process_cmdline(int(pid))
+    except Exception:
+        return None
+    if not cmdline or not isinstance(cmdline, str):
+        return None
+    tokens = cmdline.split()
+    needle = worker_task_argv_token(task_id).split()
+    n = len(needle)
+    return any(tokens[i:i + n] == needle for i in range(len(tokens) - n + 1))
+
+
+def _worker_alive(pid: Optional[int], started_at, task_id: Optional[str] = None) -> bool:
     """True when ``pid`` is live AND is still the worker we spawned. ``started_at`` is the fingerprint
     recorded by ``_set_worker_pid``; after a reboot (or any PID recycle) an unrelated process can own
     the number, so bare existence is never enough to extend a claim or to signal. A legacy row without
     a fingerprint keeps the existence answer: killing it is the pre-fingerprint behaviour and the row is
     rewritten with a fingerprint on its next spawn. An UNVERIFIED spawn also keeps the existence answer
     (a claim is never released beside a possibly-live worker) but ``_terminate_reclaimed_worker``
-    refuses to signal it."""
+    refuses to signal it.
+
+    With ``task_id`` a fingerprint mismatch is not yet a verdict: start-time drift beyond tolerance
+    must not declare a live worker dead (the respawn-a-duplicate loop). The worker's argv token is
+    the second identity; an unreadable cmdline holds the claim rather than guessing."""
     if not _kb._pid_alive(pid):
         return False
     if started_at == UNVERIFIED_WORKER_FINGERPRINT:
         return True
-    return not _pid_recycled(pid, started_at)
+    if not _pid_recycled(pid, started_at):
+        return True
+    if task_id is None:
+        return False
+    carries = _pid_carries_task(pid, task_id)
+    if carries is True:
+        _kb._log.debug("kanban: task %s pid %s fingerprint drift beyond tolerance, identity by argv",
+                       task_id, pid)
+        return True
+    if carries is None:
+        _kb._log.debug("kanban: task %s pid %s identity unreadable, holding", task_id, pid)
+        return True
+    return False
+
+
+def _may_signal_worker(pid: Optional[int], started_at, task_id: Optional[str]) -> bool:
+    """A live pid is signalled only when it is provably ours: fingerprint match, or argv identity."""
+    return not _pid_recycled(pid, started_at) or bool(task_id and _pid_carries_task(pid, task_id) is True)
 
 
 def _split_composed_fingerprint(fingerprint: str) -> Optional[tuple[str, str]]:
@@ -605,7 +662,7 @@ def _start_parts_match(recorded: Any, current: Any) -> bool:
     if _positive_start_part(recorded) is None or _positive_start_part(current) is None:
         return False
     try:
-        return start_time_fingerprints_match(recorded, current)
+        return start_time_fingerprints_match(recorded, current, tolerance=WORKER_START_TIME_TOLERANCE_CS)
     except (TypeError, ValueError):
         return False
 
@@ -659,10 +716,10 @@ def _kill_fn(signal_fn) -> Optional[Callable[[int, int], None]]:
     return os.kill if hasattr(os, "kill") else None
 
 
-def _poll_worker_exit(pid: int, started_at: Optional[int] = None) -> bool:
+def _poll_worker_exit(pid: int, started_at: Optional[int] = None, task_id: Optional[str] = None) -> bool:
     """Poll ~5 s (10 x 0.5 s) for ``pid`` to die; True once it is gone."""
     for _ in range(10):
-        if not _worker_alive(pid, started_at):
+        if not _worker_alive(pid, started_at, task_id):
             return True
         time.sleep(0.5)
     return False
@@ -1072,13 +1129,18 @@ def _terminate_reclaimed_worker(
     *,
     signal_fn=None,
     started_at=None,
+    task_id: Optional[str] = None,
 ) -> dict[str, Any]:
     """Best-effort host-local worker termination for reclaim paths. ``started_at`` is the spawn-time
     fingerprint: when the live process no longer matches it, the PID was recycled and nothing is
     signalled — the worker is gone, which is what the reclaim wanted (``terminated`` = True). An
     UNVERIFIED spawn (fingerprint capture failed) that is still live is never signalled either, but
     it is reported as surviving (``signal_refused``) so the reclaim holds the claim instead of
-    spawning a duplicate beside it."""
+    spawning a duplicate beside it.
+
+    With ``task_id``, a fingerprint mismatch whose argv carries the task token is still our worker
+    (start-time drift) and is signalled; an unreadable argv is held like UNVERIFIED (never signalled,
+    never reported terminated)."""
     info: dict[str, Any] = {
         "prev_pid": int(pid) if pid else None,
         "host_local": False,
@@ -1100,7 +1162,13 @@ def _terminate_reclaimed_worker(
         info["signal_refused"] = True
         info["terminated"] = not _kb._pid_alive(pid)
         return info
-    if _kb._pid_alive(pid) and _pid_recycled(pid, started_at):
+    if _kb._pid_alive(pid) and not _may_signal_worker(pid, started_at, task_id):
+        if task_id and _pid_carries_task(pid, task_id) is None:
+            # Identity unreadable: a live pid that may be our worker is neither signalled nor
+            # released beside (that would spawn a duplicate). Held until it exits.
+            info["signal_refused"] = True
+            info["terminated"] = False
+            return info
         info["terminated"] = True
         info["pid_recycled"] = True
         return info
@@ -1122,14 +1190,14 @@ def _terminate_reclaimed_worker(
     except OSError:
         return info
 
-    if _poll_worker_exit(pid, started_at):
+    if _poll_worker_exit(pid, started_at, task_id):
         info["terminated"] = True
         return info
-    if _worker_alive(pid, started_at):
+    if _worker_alive(pid, started_at, task_id):
         if not _sigkill(kill, pid, killpg=killpg, snapshot=tree):
             return info
         info["sigkill"] = True
-    info["terminated"] = not _worker_alive(pid, started_at)
+    info["terminated"] = not _worker_alive(pid, started_at, task_id)
     return info
 
 
@@ -1169,11 +1237,11 @@ def _reap_terminal_worker_row(conn, row, host_prefix: str, signal_fn, reaped: li
         return
     if fingerprint == UNVERIFIED_WORKER_FINGERPRINT and _kb._pid_alive(pid):
         return  # unproven identity: never signalled; its evidence is cleared once the pid is gone
-    alive = _worker_alive(pid, fingerprint)
+    alive = _worker_alive(pid, fingerprint, row["task_id"])
     termination = None
     if alive:
         termination = _terminate_reclaimed_worker(
-            pid, row["claim_lock"], signal_fn=signal_fn, started_at=fingerprint)
+            pid, row["claim_lock"], signal_fn=signal_fn, started_at=fingerprint, task_id=row["task_id"])
         if not termination["terminated"]:
             return  # still alive: try again next tick
     with _kb.write_txn(conn):
@@ -1358,20 +1426,27 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
             _kb._log.warning("kanban: task %s worker pid %s exceeded max runtime but has no verified "
                              "identity; not signalled", tid, pid)
             continue
+        if (_kb._pid_alive(pid) and _pid_recycled(pid, started_at)
+                and _pid_carries_task(pid, tid) is None):
+            # Fingerprint drifted and argv is unreadable: may be our live worker, so it is neither
+            # signalled nor released beside (duplicate). Same refusal as UNVERIFIED.
+            _kb._log.warning("kanban: task %s worker pid %s exceeded max runtime but its identity is "
+                             "unreadable; not signalled", tid, pid)
+            continue
         # SIGTERM then SIGKILL after 5 s grace; workers wanting a cleaner
         # shutdown install their own SIGTERM handler. A recycled PID (fingerprint
         # mismatch) is never signalled: the worker is already gone.
         killed = False
         kill = _kill_fn(signal_fn)
-        if kill is not None and not (_kb._pid_alive(pid) and _pid_recycled(pid, started_at)):
+        if kill is not None and not (_kb._pid_alive(pid) and not _may_signal_worker(pid, started_at, tid)):
             killpg = signal_fn if signal_fn is not None else None
             # Pre-death snapshot; reused by the SIGKILL escalation.
             tree = _capture_worker_tree(pid)
             with contextlib.suppress(ProcessLookupError, OSError):
                 _signal_worker_tree(pid, signal.SIGTERM, kill=kill, killpg=killpg, snapshot=tree)
             # Short polling wait — no time.sleep on the write txn.
-            _poll_worker_exit(pid, started_at)
-            if _worker_alive(pid, started_at):
+            _poll_worker_exit(pid, started_at, tid)
+            if _worker_alive(pid, started_at, tid):
                 killed = _sigkill(kill, pid, killpg=killpg, snapshot=tree)
 
         error = f"elapsed {int(elapsed)}s > limit {limit}s"
@@ -1466,7 +1541,7 @@ def detect_stale_running(
         lock = row["claim_lock"] or ""
 
         termination = _kb._terminate_reclaimed_worker(
-            pid, lock, signal_fn=signal_fn, started_at=_kb._row_get(row, "worker_started_at"))
+            pid, lock, signal_fn=signal_fn, started_at=_kb._row_get(row, "worker_started_at"), task_id=tid)
 
         # Never release a claim while our own worker is still alive: that would
         # spawn a duplicate beside it. Hold the claim and retry next tick.
@@ -1536,7 +1611,7 @@ def reconcile_orphaned_running(conn: sqlite3.Connection) -> list[str]:
     for row in rows:
         tid = row["id"]
         pid = row["worker_pid"]
-        if pid and _worker_alive(pid, _kb._row_get(row, "worker_started_at")):
+        if pid and _worker_alive(pid, _kb._row_get(row, "worker_started_at"), tid):
             # Never requeue beside a live process. Retry next tick.
             _kb._log.debug(
                 "kanban reconcile: task %s has broken claim bookkeeping but "
@@ -1815,6 +1890,85 @@ class _CrashSweep:
     exited_hook_payloads: list[dict] = field(default_factory=list)
 
 
+def _ppid_chain(pid: int, limit: int = 5) -> list[int]:
+    """Best-effort parent pids of ``pid`` (nearest first); ``[]`` on any error."""
+    try:
+        import psutil  # type: ignore
+        return [int(p.pid) for p in psutil.Process(int(pid)).parents()[:limit]]
+    except Exception:
+        return []
+
+
+def _current_start_fingerprint(pid: int, started_at) -> Optional[str]:
+    """The live reading in the same shape as the recorded one; ``None`` when unreadable."""
+    try:
+        if isinstance(started_at, str) and "|" in started_at:
+            return _process_fingerprint(int(pid))
+        from gateway.status import get_process_start_time
+        current = get_process_start_time(int(pid))
+        return None if current is None else str(current)
+    except Exception:
+        return None
+
+
+def _liveness_verdict(pid: Optional[int], started_at, task_id: Optional[str]) -> dict[str, Any]:
+    """Why ``_worker_alive(pid, started_at, task_id)`` answers what it does — JSON-safe evidence for
+    the reclaim/hold log line and event payload. Computed only off the healthy path."""
+    exists = bool(_kb._pid_alive(pid))
+    recorded = None if started_at is None else str(started_at)
+    current = _current_start_fingerprint(pid, started_at) if exists else None
+    if not exists or started_at is None or started_at == UNVERIFIED_WORKER_FINGERPRINT or current is None:
+        fp_match = None
+    else:
+        fp_match = not _pid_recycled(pid, started_at)
+    argv_match = _pid_carries_task(pid, task_id) if exists else None
+    if not exists:
+        reason = "gone"
+    elif started_at == UNVERIFIED_WORKER_FINGERPRINT:
+        reason = "unverified_held"
+    elif not _pid_recycled(pid, started_at):
+        reason = "fingerprint_match"
+    elif task_id is not None and argv_match is True:
+        reason = "argv_identity"
+    elif task_id is not None and argv_match is None:
+        reason = "identity_unreadable_held"
+    else:
+        reason = "foreign_pid"
+    return {
+        "alive": reason in ("unverified_held", "fingerprint_match", "argv_identity", "identity_unreadable_held"),
+        "exists": exists,
+        "fp_recorded": recorded,
+        "fp_current": current,
+        "fp_match": fp_match,
+        "argv_match": argv_match,
+        "ppid_chain": _ppid_chain(pid) if exists else [],
+        "reason": reason,
+    }
+
+
+def _log_liveness(action: str, task_id: str, pid: int, verdict: dict) -> None:
+    _kb._log.warning(
+        "kanban: %s %s pid %s — %s; fp %s/%s argv_match=%s ppid_chain=%s",
+        action, task_id, pid, verdict["reason"], verdict["fp_recorded"], verdict["fp_current"],
+        verdict["argv_match"], verdict["ppid_chain"],
+    )
+
+
+def _hold_live_worker(conn: sqlite3.Connection, task_id: str, pid: int, verdict: dict) -> None:
+    """Record (once per run) that a fingerprint-mismatched worker was held, not reclaimed."""
+    trow = conn.execute("SELECT current_run_id FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    run_id = trow["current_run_id"] if trow else None
+    seen = conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id = ? AND run_id IS ? AND kind = 'worker_held' LIMIT 1",
+        (task_id, run_id),
+    ).fetchone()
+    if seen:
+        return
+    _kb._append_event(conn, task_id, "worker_held",
+                      {"pid": pid, "reason": verdict["reason"], "liveness": verdict}, run_id=run_id)
+    _log_liveness("holding", task_id, pid, verdict)
+
+
 def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None) -> _CrashSweep:
     """Release every host-local ``running`` task whose worker PID is dead."""
     sweep = _CrashSweep()
@@ -1834,13 +1988,21 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
             started_at = _kb._row_get(row, "started_at")
             if started_at is not None and time.time() - started_at < _kb._resolve_crash_grace_seconds():
                 continue
-            if _worker_alive(row["worker_pid"], _kb._row_get(row, "worker_started_at")):
+            pid = int(row["worker_pid"])
+            fingerprint = _kb._row_get(row, "worker_started_at")
+            if _kb._pid_alive(pid) and (
+                fingerprint == UNVERIFIED_WORKER_FINGERPRINT or not _pid_recycled(pid, fingerprint)
+            ):
+                continue  # healthy: no verdict, no log
+            verdict = _liveness_verdict(pid, fingerprint, row["id"])
+            if verdict["alive"]:
+                _hold_live_worker(conn, row["id"], pid, verdict)
                 continue
 
-            pid = int(row["worker_pid"])
             dead = _classify_dead_worker(pid, row["claim_lock"], task_id=row["id"], board=board)
             retry_status = _kb._retry_status_for_run(conn, row["id"])
             dead.event_payload["retry_status"] = retry_status
+            dead.event_payload["liveness"] = verdict
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL "
@@ -1850,6 +2012,7 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
             )
             if cur.rowcount != 1:
                 continue
+            _log_liveness("reclaiming", row["id"], pid, verdict)
             run_id = _kb._end_run(
                 conn, row["id"],
                 outcome=dead.run_outcome, status=dead.run_outcome,
@@ -2264,7 +2427,7 @@ def check_respawn_guard(
         requeued_after = conn.execute(
             "SELECT 1 FROM task_events "
             "WHERE task_id = ? AND created_at >= ? "
-            "AND kind IN ('status', 'promoted', 'unblocked', 'reclaimed') "
+            "AND kind IN ('status', 'promoted', 'unblocked', 'reclaimed', 'done_reopened') "
             "LIMIT 1",
             (task_id, completed_at),
         ).fetchone()
@@ -3460,7 +3623,7 @@ def _worker_argv(task: Task, profile_arg: str, hermes_home: Optional[str]) -> li
     worker_toolsets = _resolve_worker_cli_toolsets(hermes_home)
     if worker_toolsets:
         cmd.extend(["--toolsets", ",".join(worker_toolsets)])
-    cmd.extend(["chat", "-q", f"work kanban task {task.id}"])
+    cmd.extend(["chat", "-q", worker_task_argv_token(task.id)])
     # goal_mode rides the same `-q` path: cli.py runs the judge loop there too, so the
     # worker log keeps its live tool feed (forcing -Q blanked it).
     return cmd
