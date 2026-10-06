@@ -1590,6 +1590,7 @@ _KANBAN_TERMINAL_STATUSES = {
     # kanban_request_review is a legitimate terminator: implementation done, awaiting a reviewer.
     "review": ("review_requested_by_worker", "worker requested review", "task {task_id} handed off for review by worker after {turns} turn(s)"),
     "changes_requested": ("changes_requested_by_reviewer", "reviewer requested changes", "reviewer returned task {task_id} for changes after {turns} turn(s)"),
+    "approved": ("approved_by_reviewer", "reviewer approved for merge", "reviewer approved task {task_id} for merge after {turns} turn(s)"),
 }
 
 
