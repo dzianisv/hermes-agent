@@ -2287,7 +2287,8 @@ def check_respawn_guard(
     # back to the implementer to push to the same PR; release even when the PR
     # comment and the verdict land in the same second (the event rule below is
     # strictly-after and would otherwise hold the rework).
-    if latest_outcome == "changes_requested":
+    # ``approved`` is the reviewer handing the SAME PR to the merger (#26).
+    if latest_outcome in ("changes_requested", "approved"):
         return None
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
     for c in conn.execute(
@@ -2305,7 +2306,7 @@ def check_respawn_guard(
             "WHERE task_id = ? AND created_at > ? "
             # ``unblocked``: an operator clearing a block after the PR comment is a
             # deliberate re-queue (card t_6a6ac2d3 deadlocked ~170 ticks without it).
-            "AND kind IN ('assigned', 'changes_requested', 'review_reopened', 'unblocked')",
+            "AND kind IN ('assigned', 'changes_requested', 'review_approved', 'review_reopened', 'unblocked')",
             (task_id, int(c["created_at"] or 0)),
         ).fetchall()
         if any(_is_handoff_event(e["kind"], e["payload"]) for e in events):

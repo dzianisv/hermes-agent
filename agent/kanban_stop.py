@@ -24,6 +24,7 @@ _TERMINAL_KANBAN_TOOLS = frozenset({
     "kanban_block",
     "kanban_request_review",
     "kanban_request_changes",
+    "kanban_approve",
 })
 
 _DEFAULT_MAX_ATTEMPTS = 2
@@ -90,7 +91,8 @@ def build_kanban_stop_nudge(
         "2. Call `kanban_complete(summary=..., artifacts=[...])` if the work is done "
         "and needs no review, `kanban_request_review(summary=...)` if it is a code "
         "change that needs same-card review, OR `kanban_block(reason=...)` if you are "
-        "blocked. Reviewers approve with `kanban_complete` or send the card back with "
+        "blocked. Reviewers approve with `kanban_approve(summary=...)` (merge pending) or "
+        "`kanban_complete` (nothing left to merge), or send the card back with "
         "`kanban_request_changes(reason=...)`.\n\n"
         "Never end a turn with only a promise of future action. Repeated "
         "protocol violations will block this task and require manual intervention.]"
