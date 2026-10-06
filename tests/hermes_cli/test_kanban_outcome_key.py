@@ -21,6 +21,9 @@ from hermes_cli.kanban_db_graph import decompose_triage_task
 def kanban_home(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
     home.mkdir()
+    for var in ("HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD", "HERMES_KANBAN_HOME",
+                "HERMES_KANBAN_WORKSPACES_ROOT"):
+        monkeypatch.delenv(var, raising=False)
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     (home / "config.yaml").write_text("kanban:\n  outcome_keys: true\n", encoding="utf-8")
@@ -251,14 +254,19 @@ def test_decompose_reads_policy_of_the_connections_board(kanban_home):
     assert kb.get_current_board() == "default"
     with kbc.connect(board="strict") as conn:
         root = kb.create_task(conn, title="root", triage=True, outcome_key="G1", board="strict")
-        with pytest.raises(kb.OutcomeKeyError):
+        # Match by name: other suites reload kanban_db, so the class identity can differ.
+        with pytest.raises(ValueError) as exc:
             decompose_triage_task(conn, root, root_assignee=None,
                                   children=[{"title": "bad", "outcome_key": "nope"}])
+        assert type(exc.value).__name__ == "OutcomeKeyError"
 
 
 def test_off_by_default_ignores_outcome_key(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
     home.mkdir()
+    for var in ("HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD", "HERMES_KANBAN_HOME",
+                "HERMES_KANBAN_WORKSPACES_ROOT"):
+        monkeypatch.delenv(var, raising=False)
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     kb.init_db()
