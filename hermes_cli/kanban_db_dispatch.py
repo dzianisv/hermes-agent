@@ -11,6 +11,7 @@ import contextlib
 import json
 import os
 import re
+import shutil
 import signal
 import sqlite3
 import subprocess
@@ -338,13 +339,17 @@ class DispatchResult:
     """Memory pressure that restricted this tick: ``"critical"`` (no new
     workers), ``"elevated"`` (at most one), ``None`` (no restriction).
     Reclaim/promotion bookkeeping still ran; deferred tasks stay queued."""
+    disk_pressure: Optional[str] = None
+    """Disk pressure that restricted this tick: ``"critical"`` (no new
+    workers), ``"elevated"`` (at most one), ``None`` (no restriction).
+    Reclaim/promotion bookkeeping still ran; deferred tasks stay queued."""
 
 
 def describe_suppression(results: Iterable[Optional["DispatchResult"]]) -> str:
     """One line naming why the tick(s) held ready work back, or ``""``.
 
     ``active_pr=1, recent_success=2, rate_limited=1, skipped_locked=1,
-    memory_pressure=critical`` — the respawn-guard reasons counted per task
+    memory_pressure=critical, disk_pressure=elevated`` — the respawn-guard reasons counted per task
     plus the tick-level holds. Feeds the "dispatcher stuck" warnings of the
     CLI daemon and the embedded gateway dispatcher, which otherwise report a
     bare zero-spawn count while ``hermes kanban tail`` is the only place the
@@ -352,6 +357,7 @@ def describe_suppression(results: Iterable[Optional["DispatchResult"]]) -> str:
     """
     counts: dict[str, int] = {}
     pressure: Optional[str] = None
+    disk_pressure: Optional[str] = None
     for res in results:
         if res is None:
             continue
@@ -363,9 +369,13 @@ def describe_suppression(results: Iterable[Optional["DispatchResult"]]) -> str:
             counts["skipped_locked"] = counts.get("skipped_locked", 0) + 1
         if res.memory_pressure:
             pressure = res.memory_pressure
+        if res.disk_pressure:
+            disk_pressure = res.disk_pressure
     parts = [f"{k}={v}" for k, v in sorted(counts.items())]
     if pressure:
         parts.append(f"memory_pressure={pressure}")
+    if disk_pressure:
+        parts.append(f"disk_pressure={disk_pressure}")
     return ", ".join(parts)
 
 
@@ -2680,6 +2690,172 @@ def _memory_pressure_level(sample: Optional[Mapping[str, Any]] = None) -> str:
         return "unknown"
 
 
+# Disk-aware dispatch guard: every worker writes workspaces/logs, and on macOS
+# the kernel grows swap by whole swapfiles ("quanta"). Free space at or below
+# the floor plus one quantum means the next swap growth can fill the disk, so
+# the tick spawns nothing; within two quanta (plus one per swapfile created in
+# the last hour — swap is actively growing) it spawns at most one. Fails open:
+# free space unknown → "unknown" → no restriction.
+
+_SWAP_DIR = Path("/System/Volumes/VM")
+DISK_GUARD_DEFAULT_FLOOR_GI = 0.5
+DISK_GUARD_FRESH_SWAP_SECONDS = 3600
+_GIB_BYTES = 1024 ** 3
+_SWAPUSAGE_USED_RE = re.compile(r"used\s*=\s*([0-9]+(?:\.[0-9]+)?)\s*([KMG])", re.IGNORECASE)
+_SWAPUSAGE_UNITS = {"K": 1024, "M": 1024 ** 2, "G": 1024 ** 3}
+
+
+def _disk_free_bytes() -> Optional[int]:
+    """Free bytes on the kanban workspaces filesystem, else the home filesystem."""
+    candidates: list[Path] = []
+    with contextlib.suppress(Exception):
+        candidates.append(_kb.workspaces_root())
+    with contextlib.suppress(Exception):
+        candidates.append(Path.home())
+    for path in candidates:
+        try:
+            if not path.exists():
+                continue
+            return int(shutil.disk_usage(path).free)
+        except Exception:
+            continue
+    return None
+
+
+def _swapfiles() -> list[os.stat_result]:
+    try:
+        return [p.stat() for p in _SWAP_DIR.glob("swapfile*") if p.is_file()]
+    except Exception:
+        return []
+
+
+def _sysctl_swap_used_bytes() -> Optional[int]:
+    """macOS ``vm.swapusage`` used bytes; None where sysctl/the key is unavailable."""
+    try:
+        proc = subprocess.run(
+            ["sysctl", "-n", "vm.swapusage"],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+    except Exception:
+        return None
+    if proc.returncode != 0:
+        return None
+    match = _SWAPUSAGE_USED_RE.search(proc.stdout or "")
+    if not match:
+        return None
+    return int(float(match.group(1)) * _SWAPUSAGE_UNITS[match.group(2).upper()])
+
+
+def _meminfo_swap_used_bytes() -> Optional[int]:
+    """Linux ``SwapTotal - SwapFree`` in bytes; None where /proc is unavailable."""
+    try:
+        from gateway.lifecycle_ledger import sample_memory
+        used_kib = (sample_memory() or {}).get("swap_used_kib")
+    except Exception:
+        return None
+    if isinstance(used_kib, bool) or not isinstance(used_kib, int):
+        return None
+    return used_kib * 1024
+
+
+def _disk_sample() -> dict:
+    """Best-effort disk/swap snapshot (bytes), ``{}`` when free space is unknown.
+
+    Module-level seam — conftest patches it to ``{}`` so dispatch results do
+    not depend on the CI runner's disk. Keys: ``free_bytes``, ``quantum_bytes``
+    (largest swapfile, 0 without a swap dir), ``swap_fresh_files`` (swapfiles
+    modified in the last hour) and, when known, ``swap_used_bytes``.
+    """
+    free = _disk_free_bytes()
+    if free is None:
+        return {}
+    files = _swapfiles()
+    sample: dict = {"free_bytes": free, "quantum_bytes": 0, "swap_fresh_files": 0}
+    with contextlib.suppress(Exception):
+        sample["quantum_bytes"] = max((st.st_size for st in files), default=0)
+    with contextlib.suppress(Exception):
+        cutoff = time.time() - DISK_GUARD_FRESH_SWAP_SECONDS
+        sample["swap_fresh_files"] = sum(1 for st in files if st.st_mtime >= cutoff)
+    swap_used = _sysctl_swap_used_bytes()
+    if swap_used is None:
+        swap_used = _meminfo_swap_used_bytes()
+    if swap_used is not None:
+        sample["swap_used_bytes"] = swap_used
+    return sample
+
+
+def _positive_float(raw: Any) -> Optional[float]:
+    if isinstance(raw, bool):
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 and value != float("inf") else None
+
+
+def _disk_floor_bytes() -> int:
+    """Disk floor: ``kanban.disk_floor_gi`` → env ``DISK_GUARD_FLOOR_GI`` → 0.5 GiB.
+
+    Invalid or non-positive values fall through to the next source.
+    """
+    gi: Optional[float] = None
+    try:
+        from hermes_cli.config import load_config_readonly
+        kanban = (load_config_readonly() or {}).get("kanban", {})
+        if isinstance(kanban, dict):
+            gi = _positive_float(kanban.get("disk_floor_gi"))
+    except Exception:
+        gi = None
+    if gi is None:
+        gi = _positive_float(os.environ.get("DISK_GUARD_FLOOR_GI"))
+    if gi is None:
+        gi = DISK_GUARD_DEFAULT_FLOOR_GI
+    return int(gi * _GIB_BYTES)
+
+
+def _disk_pressure_level(sample: Optional[Mapping[str, Any]] = None) -> str:
+    """Classify disk pressure: ok/elevated/critical/unknown.
+
+    With a swap quantum ``q``: critical at ``free <= floor + q`` (the next
+    swapfile can fill the disk), elevated at ``free <= floor + 2q + fresh*q``.
+    Without one (Linux, no swapfiles): critical at ``free <= floor``, elevated
+    at ``free <= 2*floor``. ``unknown`` imposes no restriction.
+    """
+    if sample is None:
+        sample = _disk_sample()
+    if not sample:
+        return "unknown"
+    free = sample.get("free_bytes")
+    if isinstance(free, bool) or not isinstance(free, int):
+        return "unknown"
+    q = sample.get("quantum_bytes") or 0
+    fresh = sample.get("swap_fresh_files") or 0
+    floor = _disk_floor_bytes()
+    if q > 0:
+        if free <= floor + q:
+            return "critical"
+        if free <= floor + 2 * q + fresh * q:
+            return "elevated"
+        return "ok"
+    if free <= floor:
+        return "critical"
+    if free <= 2 * floor:
+        return "elevated"
+    return "ok"
+
+
+def _disk_pressure_detail(sample: Mapping[str, Any]) -> str:
+    free_gi = (sample.get("free_bytes") or 0) / _GIB_BYTES
+    parts = [f"free {free_gi:.2f} GiB", f"floor {_disk_floor_bytes() / _GIB_BYTES:.2f} GiB"]
+    if sample.get("quantum_bytes"):
+        parts.append(f"swapfile quantum {sample['quantum_bytes'] / _GIB_BYTES:.2f} GiB")
+    if "swap_used_bytes" in sample:
+        parts.append(f"swap used {sample['swap_used_bytes'] / _GIB_BYTES:.2f} GiB")
+    parts.append(f"{sample.get('swap_fresh_files') or 0} swapfiles created in last hour")
+    return ", ".join(parts)
+
+
 def dispatch_once(
     conn: sqlite3.Connection,
     *,
@@ -3087,6 +3263,29 @@ def _tick_spawn_budget(
             _kb._log.warning(
                 "kanban dispatch: system memory pressure is elevated; "
                 "limiting to at most 1 new worker this tick"
+            )
+            spawn_budget = 1
+
+    # Disk-pressure guard: same shape as memory. A full disk kills running
+    # workers and the host's swap, so critical spawns nothing; elevated at
+    # most one. "unknown" (free space unreadable) imposes no restriction.
+    disk_sample = _disk_sample()
+    disk_level = _disk_pressure_level(disk_sample)
+    if disk_level == "critical":
+        result.disk_pressure = disk_level
+        _kb._log.warning(
+            "kanban dispatch: disk pressure critical (%s); "
+            "spawning no new workers this tick (deferred, not dropped)",
+            _disk_pressure_detail(disk_sample),
+        )
+        return False, None
+    if disk_level == "elevated":
+        result.disk_pressure = disk_level
+        if spawn_budget is None or spawn_budget > 1:
+            _kb._log.warning(
+                "kanban dispatch: disk pressure elevated (%s); "
+                "limiting to at most 1 new worker this tick",
+                _disk_pressure_detail(disk_sample),
             )
             spawn_budget = 1
     return True, spawn_budget

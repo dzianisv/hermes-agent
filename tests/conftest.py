@@ -438,6 +438,24 @@ def _neutralize_kanban_memory_guard(request, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _neutralize_kanban_disk_guard(request, monkeypatch):
+    """Pin the kanban dispatcher's disk guard to "no data" for every test.
+
+    Same rationale as the memory guard: dispatch results must not depend on
+    the runner's free disk or swapfiles. ``{}`` → pressure ``"unknown"`` →
+    no restriction. Guard tests opt out with ``@pytest.mark.real_disk_guard``
+    or patch the seam directly.
+    """
+    if request.node.get_closest_marker("real_disk_guard"):
+        return
+    try:
+        from hermes_cli import kanban_db_dispatch as _kbd_mod
+    except Exception:
+        return
+    monkeypatch.setattr(_kbd_mod, "_disk_sample", lambda: {}, raising=False)
+
+
+@pytest.fixture(autouse=True)
 def _neutralize_git_safe_directory_read(request, monkeypatch):
     """Skip the ``git config --get-all safe.directory`` pre-read in ``noninteractive_git_env()``.
 
@@ -1148,6 +1166,12 @@ def pytest_configure(config):  # noqa: D401 — pytest hook
         "real_memory_guard: bypass the autouse fixture that pins the kanban "
         "dispatcher's memory guard to 'no data' — only for tests that "
         "exercise the guard itself with their own patched samples.",
+    )
+    config.addinivalue_line(
+        "markers",
+        "real_disk_guard: bypass the autouse fixture that pins the kanban "
+        "dispatcher's disk guard to 'no data' — only for tests that "
+        "exercise the guard itself (e.g. the real _disk_sample probes).",
     )
     # NOTE: platforms("linux") / platforms("macos") / platforms("windows") are declared in
     # pyproject.toml's ``markers`` list, not here — they are part of the
