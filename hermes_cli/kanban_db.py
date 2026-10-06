@@ -2236,7 +2236,8 @@ def _claim_and_open_run(
            SET status        = 'running',
                claim_lock    = ?,
                claim_expires = ?,
-               started_at    = COALESCE(started_at, ?)
+               started_at    = COALESCE(started_at, ?),
+               current_step_key = {"COALESCE(current_step_key, 'development')" if source_status == "ready" else "current_step_key"}
          WHERE id = ?
            AND status = '{source_status}'
            AND claim_lock IS NULL
@@ -2356,6 +2357,7 @@ _RUN_OUTCOME_TERMINAL_STATUS = {
     "completed": "done",
     "review_requested": "review",
     "changes_requested": "changes_requested",
+    "approved": "approved",
     "blocked": "blocked",
     "dependency_wait": "blocked",
 }
@@ -2788,6 +2790,7 @@ def complete_task(
         sql = """
                 UPDATE tasks
                    SET status       = 'done',
+                       current_step_key = 'done',
                        result       = ?,
                        completed_at = ?,
                        claim_lock   = NULL,
@@ -3445,6 +3448,7 @@ def request_review(
                 """
                 UPDATE tasks
                    SET status        = 'review',
+                       current_step_key = 'review',
                        claim_lock    = NULL,
                        claim_expires = NULL,
                        worker_pid    = NULL
@@ -3546,6 +3550,7 @@ def request_changes(
             UPDATE tasks
                SET status = ?,
                    assignee = COALESCE(?, assignee),
+                   current_step_key = 'development',
                    claim_lock = NULL,
                    claim_expires = NULL,
                    worker_pid = NULL, worker_started_at = NULL
@@ -3571,6 +3576,63 @@ def request_changes(
             run_id=run_id,
         )
     return True, implementer
+
+
+def approve_for_merge(
+    conn: sqlite3.Connection, task_id: str, *, summary: str,
+    expected_run_id: Optional[int] = None, merger: Optional[str] = None,
+) -> tuple[bool, Optional[str]]:
+    """Reviewer verdict "approved, now merge" (#26). Closes the active review
+    run as ``approved`` (reviewer provenance stays on the run and event), moves
+    the card to stage ``merge`` and hands it to ``merger`` -- default the
+    implementer from the latest ``review_requested`` event -- in ``ready``.
+    Not a changes request (no rework loop) and not done (merge still pending).
+    Returns ``(ok, merger | reason)``."""
+    summary = str(redact_review_value(summary or "")).strip()
+    if not summary:
+        return False, "summary is required (what was approved, at which head)"
+    with write_txn(conn):
+        task_row = conn.execute(
+            "SELECT status, assignee, current_run_id FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        if task_row is None:
+            return False, "task not found"
+        current_run_id = task_row["current_run_id"]
+        if task_row["status"] != "running" or current_run_id is None:
+            return False, "task is not in an active review run"
+        if expected_run_id is not None and int(current_run_id) != int(expected_run_id):
+            return False, "run_id mismatch"
+        claimed_payload = _json_dict(_row_get(
+            _latest_event(conn, task_id, "claimed", current_run_id), "payload"))
+        if claimed_payload.get("source_status") != "review":
+            return False, "active run was not claimed from review"
+        requested_event = _latest_event(conn, task_id, "review_requested")
+        implementer = _nonblank_str(_json_dict(_row_get(requested_event, "payload")).get("implementer"))
+        target = _canonical_assignee(_nonblank_str(merger)) or implementer
+        if target is None:
+            return False, "review handoff has no implementer provenance; pass merger="
+        reviewer = _canonical_assignee(_nonblank_str(task_row["assignee"]))
+        new_status = _landing_status_after_parents(conn, task_id)
+        cur = conn.execute(
+            """
+            UPDATE tasks
+               SET status = ?, assignee = ?, current_step_key = 'merge',
+                   claim_lock = NULL, claim_expires = NULL,
+                   worker_pid = NULL, worker_started_at = NULL
+             WHERE id = ? AND status = 'running' AND current_run_id = ?
+            """,
+            (new_status, target, task_id, int(current_run_id)),
+        )
+        if cur.rowcount != 1:
+            return False, "task changed during approval handoff"
+        run_id = _end_run(conn, task_id, outcome="approved", status=new_status, summary=summary)
+        _append_event(
+            conn, task_id, "review_approved",
+            {"summary": _first_line(summary, 400), "implementer": implementer,
+             "reviewer": reviewer, "merger": target, "status": new_status, "stage": "merge"},
+            run_id=run_id,
+        )
+    return True, target
 
 
 def promote_task(

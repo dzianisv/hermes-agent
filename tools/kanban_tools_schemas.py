@@ -271,6 +271,24 @@ KANBAN_REQUEST_CHANGES_SCHEMA = _schema(
     ["reason"],
 )
 
+KANBAN_APPROVE_SCHEMA = _schema(
+    "kanban_approve",
+    (
+        "Reviewer verdict: the work is APPROVED and must now be merged. Closes "
+        "the review run as approved, moves the card to the 'merge' stage and "
+        "hands it back to the implementer (or `merger`) to merge the same PR. "
+        "Use this instead of kanban_request_changes when nothing needs to "
+        "change, and instead of kanban_complete when merge/delivery is still "
+        "pending. Only from a task claimed from the review column."
+    ),
+    {
+        "task_id": _prop("string", _DESC_TASK_ID_DEFAULT),
+        "summary": _prop("string", "What was approved and at which exact head/SHA."),
+        "merger": _prop("string", "Optional profile that merges; defaults to the implementer."),
+    },
+    ["summary"],
+)
+
 KANBAN_HEARTBEAT_SCHEMA = _schema(
     "kanban_heartbeat",
     (

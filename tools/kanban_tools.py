@@ -23,7 +23,7 @@ from tools.kanban_tools_schemas import (
     KANBAN_ATTACH_SCHEMA,
     KANBAN_ATTACH_URL_SCHEMA, KANBAN_ATTACHMENTS_SCHEMA, KANBAN_BLOCK_SCHEMA, KANBAN_COMMENT_SCHEMA,
     KANBAN_COMPLETE_SCHEMA, KANBAN_CREATE_SCHEMA, KANBAN_HEARTBEAT_SCHEMA, KANBAN_LINK_SCHEMA,
-    KANBAN_LIST_SCHEMA, KANBAN_REQUEST_CHANGES_SCHEMA, KANBAN_REQUEST_REVIEW_SCHEMA,
+    KANBAN_APPROVE_SCHEMA, KANBAN_LIST_SCHEMA, KANBAN_REQUEST_CHANGES_SCHEMA, KANBAN_APPROVE_SCHEMA, KANBAN_REQUEST_REVIEW_SCHEMA,
     KANBAN_SHOW_SCHEMA, KANBAN_UNBLOCK_SCHEMA)
 
 logger = logging.getLogger(__name__)
@@ -110,7 +110,7 @@ def _check_kanban_orchestrator_mode() -> bool:
 # (heartbeat / attach / attach_url) do not terminate a run and are not gated.
 _RUN_LIFECYCLE_TOOLS = frozenset({
     "kanban_complete", "kanban_block",
-    "kanban_request_review", "kanban_request_changes",
+    "kanban_request_review", "kanban_request_changes", "kanban_approve",
 })
 
 class _Reject(Exception):
@@ -854,6 +854,25 @@ def _handle_request_changes(args: dict, **kw) -> str:
         return _ok_landed(kb, conn, tid, "ready", implementer=detail)
 
 
+@_kanban_handler("kanban_approve")
+def _handle_approve(args: dict, **kw) -> str:
+    """Reviewer approval: hand the card to the merger at stage ``merge``."""
+    tid = _worker_guard("kanban_approve", args)
+    summary = _redact(_require_text(
+        args, "summary", "summary is required — what was approved, at which head"))
+    merger = _redact_opt(args.get("merger") or None)
+    if merger:
+        from hermes_cli.profiles import list_profile_names, profile_exists
+        _check(profile_exists(merger),
+               f"merger profile {merger!r} is not installed. "
+               f"Installed profiles: {', '.join(list_profile_names())}")
+    with _board(args.get("board")) as (kb, conn):
+        ok, detail = kb.approve_for_merge(
+            conn, tid, summary=summary, merger=merger, expected_run_id=_worker_run_id(tid))
+        _check(ok, f"could not approve {tid}: {detail or 'invalid review state'}")
+        return _ok_landed(kb, conn, tid, "ready", merger=detail, stage="merge")
+
+
 @_kanban_handler("kanban_heartbeat")
 def _handle_heartbeat(args: dict, **kw) -> str:
     """Signal liveness: extend the claim TTL AND record a heartbeat event.
@@ -1144,6 +1163,7 @@ _TOOLS = (
     ("kanban_block", KANBAN_BLOCK_SCHEMA, _handle_block, "⏸"),
     ("kanban_request_review", KANBAN_REQUEST_REVIEW_SCHEMA, _handle_request_review, "👀"),
     ("kanban_request_changes", KANBAN_REQUEST_CHANGES_SCHEMA, _handle_request_changes, "↩"),
+    ("kanban_approve", KANBAN_APPROVE_SCHEMA, _handle_approve, "✅"),
     ("kanban_heartbeat", KANBAN_HEARTBEAT_SCHEMA, _handle_heartbeat, "💓"),
     ("kanban_comment", KANBAN_COMMENT_SCHEMA, _handle_comment, "💬"),
     ("kanban_attach", KANBAN_ATTACH_SCHEMA, _handle_attach, "📎"),
