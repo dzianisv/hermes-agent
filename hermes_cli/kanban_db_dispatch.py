@@ -3297,9 +3297,6 @@ def _dispatch_lane_task(
         # worker's system prompt via KANBAN_GUIDANCE.
         claimed.skills = list(dict.fromkeys([*(claimed.skills or []), "sdlc-review"]))
     _apply_worker_resume_plan(conn, claimed)
-    from hermes_cli.kanban_review_brief import build_review_brief, is_review_spawn
-    if is_review_spawn(claimed, lane):
-        claimed.review_brief = build_review_brief(conn, claimed)
     try:
         pid = _call_spawn_fn(spawn_fn if spawn_fn is not None else _default_spawn, claimed, str(workspace), board)
         if pid:
@@ -4083,15 +4080,14 @@ def _worker_argv(task: Task, profile_arg: str, hermes_home: Optional[str]) -> li
     worker_toolsets = _resolve_worker_cli_toolsets(hermes_home)
     if worker_toolsets:
         cmd.extend(["--toolsets", ",".join(worker_toolsets)])
-    brief = f"\n\n{task.review_brief}" if task.review_brief else ""
     if task.resume_session_id:
         cmd.extend([
             "chat", "--resume", task.resume_session_id, "-q",
             f"You were interrupted (previous run {task.resume_outcome or 'interrupted'}). "
-            f"Continue kanban task {task.id} from where you stopped; re-read the card first." + brief,
+            f"Continue kanban task {task.id} from where you stopped; re-read the card first.",
         ])
         return cmd
-    cmd.extend(["chat", "-q", f"work kanban task {task.id}" + brief])
+    cmd.extend(["chat", "-q", f"work kanban task {task.id}"])
     # goal_mode rides the same `-q` path: cli.py runs the judge loop there too, so the
     # worker log keeps its live tool feed (forcing -Q blanked it).
     return cmd

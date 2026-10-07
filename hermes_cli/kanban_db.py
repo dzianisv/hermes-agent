@@ -892,8 +892,6 @@ class Task:
     # interrupted session of the previous run instead of starting fresh.
     resume_session_id: Optional[str] = None
     resume_outcome: Optional[str] = None
-    # Dispatch-time only: single-pass reviewer brief appended to a review worker's prompt.
-    review_brief: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
