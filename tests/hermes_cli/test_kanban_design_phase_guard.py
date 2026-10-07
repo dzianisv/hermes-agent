@@ -51,3 +51,13 @@ def test_link_to_design_page_passes(conn):
 def test_dashed_design_page_id_passes(conn):
     tid = _card(conn, "DESIGN: 3eeac25e-b49f-814d-a4d1-d8fce929cbf4 §16")
     assert disp._design_phase_guard(conn, tid, "software-engineer") is None
+
+
+@pytest.mark.parametrize("stage", ["review", "merge", "deploy"])
+def test_card_past_design_entry_is_not_rerouted(conn, stage):
+    """Regression t_be2a94d1: PRs merged+deployed, card handed back to the engineer for
+    tag/live proof, and the guard rerouted it to the architect because its brief lacked DESIGN:."""
+    tid = _card(conn, "DESIGN: none")
+    conn.execute("UPDATE tasks SET current_step_key=? WHERE id=?", (stage, tid)); conn.commit()
+    assert disp._design_phase_guard(conn, tid, "software-engineer") is None
+    assert kb.get_task(conn, tid).assignee == "software-engineer"

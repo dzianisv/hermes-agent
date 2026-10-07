@@ -3060,6 +3060,9 @@ def _design_phase_cfg() -> Optional[dict]:
     }
 
 
+_POST_DESIGN_STAGES = frozenset({"review", "merge", "deploy", "verify", "acceptance"})
+
+
 def _design_phase_guard(conn: sqlite3.Connection, task_id: str, assignee: str) -> Optional[str]:
     """Return a reason and park the card when an implementation card did not come
     through the design phase; ``None`` when it may be claimed.
@@ -3075,6 +3078,11 @@ def _design_phase_guard(conn: sqlite3.Connection, task_id: str, assignee: str) -
         return None
     task = _kb.get_task(conn, task_id)
     if task is None:
+        return None
+    # The gate guards ENTRY into implementation. A card already past it (stage
+    # review/merge/deploy) has code under review or merged; rerouting it to the
+    # architect stranded t_be2a94d1 after its PRs merged and deployed.
+    if (task.current_step_key or "") in _POST_DESIGN_STAGES:
         return None
     parts = [task.title or "", task.body or ""]
     try:
@@ -3111,7 +3119,9 @@ def _design_phase_guard(conn: sqlite3.Connection, task_id: str, assignee: str) -
         note = (f"BLOCKER:DEP architect — [design-phase] implementation card did not come through the "
                 f"design phase (not created by an architect, no finished architect parent, DESIGN: names no "
                 f"Notion section). Reassigned to {cfg['architect']}: write or point to the DESIGN section, "
-                "get it reviewed, then split into implementation cards with " + "/".join(cfg["required"]) + ".")
+                "add a DESIGN: line and " + "/".join(cfg["required"]) + " to THIS card, then reassign THIS "
+                "card to the implementer. Do NOT create review/deploy/implementation child cards: "
+                "one card carries design, build, review, deploy and live proof (Den 2026-10-07).")
     else:
         reason = "brief_incomplete"
         note = (f"BLOCKER:DEP EM — [design-phase] brief incomplete: missing {', '.join(missing)}. "
