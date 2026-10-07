@@ -238,6 +238,64 @@ def _enforce_worker_task_ownership(tid: str) -> None:
             f"to hand off information to other tasks, or kanban_create to spawn follow-up work.")
 
 
+_HANDOFF_TOOLS_WAIT_FOR_WORKSPACE = frozenset({
+    "kanban_block", "kanban_complete", "kanban_request_review", "kanban_approve",
+})
+
+
+def _workspace_busy_pids(workspace: str) -> list[tuple[int, str]]:
+    """Live processes (other than this worker and its ancestors) whose cwd is inside the
+    card workspace: a pi/codex/claude run the worker started is still writing the change."""
+    try:
+        import psutil
+    except Exception:
+        return []
+    root = os.path.realpath(workspace).rstrip("/") + "/"
+    mine = {os.getpid()}
+    try:
+        mine.update(p.pid for p in psutil.Process().parents())
+    except Exception:
+        pass
+    busy = []
+    for p in psutil.process_iter(["pid", "name"]):
+        if p.info["pid"] in mine:
+            continue
+        try:
+            cwd = os.path.realpath(p.cwd()).rstrip("/") + "/"
+        except Exception:
+            continue
+        if cwd.startswith(root) and not p.info["name"] in {"zsh", "bash", "sh", "login"}:
+            busy.append((p.info["pid"], p.info["name"]))
+    return busy
+
+
+def _refuse_handoff_while_workspace_busy(tool_name: str, tid: str) -> None:
+    """A worker must not hand off its card while a process it launched is still writing in
+    the card workspace (t_d5a85393: the engineer blocked 'waiting on pi' and nobody resumed
+    when pi finished). Wait for it instead: poll it, then hand off with its result."""
+    if tool_name not in _HANDOFF_TOOLS_WAIT_FOR_WORKSPACE or not os.environ.get("HERMES_KANBAN_TASK"):
+        return
+    if (os.environ.get("HERMES_KANBAN_ALLOW_BUSY_HANDOFF") or "").strip() in {"1", "true"}:
+        return
+    try:
+        with _board(None, quiet_close=True) as (kb, conn):
+            task = kb.get_task(conn, tid)
+        workspace = getattr(task, "workspace_path", None)
+    except Exception:
+        return
+    if not workspace or not os.path.isdir(workspace):
+        return
+    busy = _workspace_busy_pids(workspace)
+    if busy:
+        listed = ", ".join(f"{name} pid {pid}" for pid, name in busy[:5])
+        raise _Reject(
+            f"{tool_name} refused: {listed} is still running in this card's workspace "
+            f"({workspace}). Do not hand off or block on your own subprocess. Keep the turn: "
+            "poll it with short calls (`sleep 120; tail <log>`, under the terminal limit) until "
+            "it exits, then verify its diff and continue the card yourself. Kill it only if it "
+            "is wedged, and say so in the handoff.")
+
+
 def _worker_guard(tool_name: str, args: dict) -> str:
     """Worker mutation preamble, in order: delegate-child rejection, task id
     resolution, task-scope ownership, run-identity proof. Returns the task id.
@@ -257,6 +315,7 @@ def _worker_guard(tool_name: str, args: dict) -> str:
     _reject_delegated_child_mutation(tool_name)
     tid = _require_task_id(args)
     _enforce_worker_task_ownership(tid)
+    _refuse_handoff_while_workspace_busy(tool_name, tid)
     if (
         tool_name in _RUN_LIFECYCLE_TOOLS
         and os.environ.get("HERMES_KANBAN_TASK")

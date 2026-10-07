@@ -370,6 +370,32 @@ def test_block_happy_path(worker_env):
         conn.close()
 
 
+def test_block_refused_while_own_subprocess_runs_in_workspace(worker_env, tmp_path):
+    """t_d5a85393: worker blocked 'waiting on pi' with pi still writing; nobody resumed it."""
+    import subprocess
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    conn = kbc.connect()
+    try:
+        conn.execute("UPDATE tasks SET workspace_path=? WHERE id=?", (str(ws), worker_env))
+        conn.commit()
+    finally:
+        conn.close()
+    child = subprocess.Popen(["sleep", "30"], cwd=str(ws))
+    try:
+        d = json.loads(kt._handle_block({"reason": "waiting on pi"}))
+        assert d.get("ok") is not True
+        assert "still running in this card's workspace" in json.dumps(d)
+    finally:
+        child.kill()
+        child.wait()
+    d = json.loads(kt._handle_block({"reason": "real blocker"}))
+    assert d["ok"] is True
+
+
 def _make_goal_mode_worker_env(monkeypatch, tmp_path):
     """Set up an isolated HERMES_HOME with one claimed goal_mode task,
     matching the pattern used by the kanban_complete judge gate tests."""
