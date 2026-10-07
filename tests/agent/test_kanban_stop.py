@@ -136,6 +136,26 @@ def test_no_nudge_after_handoff_tool(clear_kanban_env, tool_name, who):
     assert build_kanban_stop_nudge(messages=messages) is None
 
 
+def test_nudge_still_fires_when_terminal_tool_was_refused(clear_kanban_env):
+    """A refused kanban_complete leaves the card running: it is not a handoff."""
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_abc")
+    messages = [
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "1", "type": "function", "function": {"name": "kanban_complete", "arguments": "{}"}}]},
+        {"role": "tool", "name": "kanban_complete", "tool_call_id": "1",
+         "content": '{"error": "workspace busy: pi pid 79376 still running"}'},
+    ]
+    assert session_called_kanban_terminal(messages) is False
+    assert build_kanban_stop_nudge(messages=messages) is not None
+    # A later successful retry does count.
+    messages += [
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "2", "type": "function", "function": {"name": "kanban_complete", "arguments": "{}"}}]},
+        {"role": "tool", "name": "kanban_complete", "tool_call_id": "2", "content": '{"ok": true}'},
+    ]
+    assert session_called_kanban_terminal(messages) is True
+
+
 def test_nudge_still_fires_for_non_terminal_kanban_tool(clear_kanban_env):
     """Widening the set must not swallow the case the guard exists for."""
     clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_abc")
