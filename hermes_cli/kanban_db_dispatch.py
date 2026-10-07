@@ -3240,6 +3240,7 @@ def _dispatch_lane_task(
         # Force-load sdlc-review; the kanban lifecycle is already in every
         # worker's system prompt via KANBAN_GUIDANCE.
         claimed.skills = list(dict.fromkeys([*(claimed.skills or []), "sdlc-review"]))
+    _apply_worker_resume_plan(conn, claimed)
     try:
         pid = _call_spawn_fn(spawn_fn if spawn_fn is not None else _default_spawn, claimed, str(workspace), board)
         if pid:
@@ -3590,6 +3591,117 @@ def _dispatch_once_locked(
     return result
 
 
+# Run outcomes that mean "the worker was cut off mid-task", so its session holds useful
+# progress worth resuming (vs. a deliberate handoff like completed/blocked).
+RESUMABLE_RUN_OUTCOMES = frozenset({"crashed", "timed_out", "reclaimed"})
+DEFAULT_RESUME_INTERRUPTED_MAX = 2
+
+
+def resume_interrupted_max(kanban_cfg: Optional[dict] = None) -> int:
+    """``kanban.resume_interrupted_max``: consecutive resumes of one session before a fresh
+    start (0 disables resuming)."""
+    if kanban_cfg is None:
+        try:
+            from hermes_cli.config import load_config
+
+            kanban_cfg = (load_config().get("kanban") or {})
+        except Exception:
+            kanban_cfg = {}
+    return _positive_int((kanban_cfg or {}).get("resume_interrupted_max"),
+                         DEFAULT_RESUME_INTERRUPTED_MAX, minimum=0)
+
+
+def _profile_session_exists(profile: str, session_id: str) -> bool:
+    """True when ``session_id`` has a row in ``profile``'s state.db (read-only probe)."""
+    try:
+        from hermes_cli.profiles import normalize_profile_name, resolve_profile_env
+
+        home = resolve_profile_env(normalize_profile_name(profile))
+    except Exception:
+        return False
+    db_path = Path(home) / "state.db"
+    if not db_path.is_file():
+        return False
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2.0)
+        try:
+            return conn.execute(
+                "SELECT 1 FROM sessions WHERE id = ? LIMIT 1", (session_id,)).fetchone() is not None
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return False
+
+
+def plan_worker_resume(
+    conn: sqlite3.Connection, task: Task, *, max_resumes: Optional[int] = None,
+) -> Optional[dict]:
+    """Decide whether this spawn resumes the previous run's interrupted session.
+
+    Resume only when the most recent closed run of this task was the same assignee, ended
+    ``crashed``/``timed_out``/``reclaimed``, recorded its ``worker_session_id`` and that
+    session exists in the assignee's state.db; and fewer than ``max_resumes`` consecutive
+    resumes of that session preceded it. A resumed worker that fails to load its session
+    never stamps ``worker_session_id`` (the stamp happens after the agent builds), so the
+    next dispatch falls back to a fresh start instead of looping. Returns the plan or None.
+    """
+    cap = resume_interrupted_max() if max_resumes is None else max_resumes
+    if cap <= 0 or not task.assignee:
+        return None
+    sql = "SELECT * FROM task_runs WHERE task_id = ? AND ended_at IS NOT NULL"
+    params: list[Any] = [task.id]
+    if task.current_run_id is not None:
+        sql += " AND id <> ?"
+        params.append(int(task.current_run_id))
+    row = conn.execute(sql + " ORDER BY id DESC LIMIT 1", params).fetchone()
+    if row is None:
+        return None
+    prev = _kb.Run.from_row(row)
+    if prev.outcome not in RESUMABLE_RUN_OUTCOMES or prev.profile != task.assignee:
+        return None
+    meta = prev.metadata if isinstance(prev.metadata, dict) else {}
+    session_id = str(meta.get("worker_session_id") or "").strip()
+    if not session_id:
+        return None
+    streak = 0
+    if meta.get("resumed_from_session") == session_id:
+        try:
+            streak = int(meta.get("resume_streak") or 1)
+        except (TypeError, ValueError):
+            streak = 1
+    if streak >= cap:
+        return None
+    if not _profile_session_exists(task.assignee, session_id):
+        return None
+    return {"session_id": session_id, "previous_run": prev.id, "outcome": prev.outcome,
+            "streak": streak + 1}
+
+
+def _apply_worker_resume_plan(conn: sqlite3.Connection, task: Task) -> None:
+    """Pick resume-vs-fresh for a claimed task and record the choice on its run. Never raises."""
+    try:
+        plan = plan_worker_resume(conn, task)
+    except Exception as exc:
+        _kb._log.debug("kanban worker: resume plan failed for %s (%s)", task.id, exc)
+        return
+    if plan is None:
+        return
+    task.resume_session_id = plan["session_id"]
+    task.resume_outcome = plan["outcome"]
+    if task.current_run_id is None:
+        return
+    with contextlib.suppress(Exception):
+        _kb.merge_run_metadata(conn, task.id, task.current_run_id, {
+            "resumed_from_session": plan["session_id"], "resume_of_run": plan["previous_run"],
+            "resume_outcome": plan["outcome"], "resume_streak": plan["streak"],
+        })
+        with _kb.write_txn(conn):
+            _kb._append_event(conn, task.id, "worker_resumed", {
+                "session_id": plan["session_id"], "previous_run": plan["previous_run"],
+                "previous_outcome": plan["outcome"], "streak": plan["streak"],
+            }, run_id=task.current_run_id)
+
+
 def _positive_int(value: Any, default: int, *, minimum: int = 1) -> int:
     try:
         parsed = int(value)
@@ -3912,6 +4024,13 @@ def _worker_argv(task: Task, profile_arg: str, hermes_home: Optional[str]) -> li
     worker_toolsets = _resolve_worker_cli_toolsets(hermes_home)
     if worker_toolsets:
         cmd.extend(["--toolsets", ",".join(worker_toolsets)])
+    if task.resume_session_id:
+        cmd.extend([
+            "chat", "--resume", task.resume_session_id, "-q",
+            f"You were interrupted (previous run {task.resume_outcome or 'interrupted'}). "
+            f"Continue kanban task {task.id} from where you stopped; re-read the card first.",
+        ])
+        return cmd
     cmd.extend(["chat", "-q", f"work kanban task {task.id}"])
     # goal_mode rides the same `-q` path: cli.py runs the judge loop there too, so the
     # worker log keeps its live tool feed (forcing -Q blanked it).

@@ -888,6 +888,10 @@ class Task:
     # Unix time a ``scheduled`` card auto-wakes (promote_due_scheduled); NULL = manual unblock.
     scheduled_wake_at: Optional[int] = None
     outcome_key: Optional[str] = None   # one OPEN task per (project, key); see create_task
+    # Dispatch-time only (never a column): set by the dispatcher when this spawn resumes the
+    # interrupted session of the previous run instead of starting fresh.
+    resume_session_id: Optional[str] = None
+    resume_outcome: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -2146,6 +2150,7 @@ def _end_run(
     run_id = _current_run_id(conn, task_id)
     if run_id is None:
         return None
+    metadata = _carry_live_run_metadata(conn, run_id, metadata)
     conn.execute(
         """
         UPDATE task_runs
@@ -2163,6 +2168,41 @@ def _end_run(
     )
     conn.execute("UPDATE tasks SET current_run_id = NULL WHERE id = ?", (task_id,))
     return run_id
+
+
+# Keys a run collects while it is LIVE (the worker's own session id, the dispatcher's
+# resume record). Closing the run must not drop them: a crash/timeout/reclaim closes with
+# its own metadata, and the next dispatch reads these to resume the interrupted session.
+_LIVE_RUN_METADATA_KEYS = ("worker_session_id", "resumed_from_session", "resume_of_run",
+                           "resume_outcome", "resume_streak")
+
+
+def _carry_live_run_metadata(
+    conn: sqlite3.Connection, run_id: int, metadata: Optional[dict],
+) -> Optional[dict]:
+    row = conn.execute("SELECT metadata FROM task_runs WHERE id = ?", (run_id,)).fetchone()
+    live = _json_dict(row["metadata"] if row else None)
+    carried = {k: live[k] for k in _LIVE_RUN_METADATA_KEYS if k in live}
+    if not carried:
+        return metadata
+    return {**carried, **(metadata or {})}
+
+
+def merge_run_metadata(
+    conn: sqlite3.Connection, task_id: str, run_id: int, updates: dict,
+) -> bool:
+    """Merge ``updates`` into a still-open run's metadata; False when the run is closed/foreign."""
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT metadata FROM task_runs WHERE id = ? AND task_id = ? AND ended_at IS NULL",
+            (int(run_id), task_id),
+        ).fetchone()
+        if row is None:
+            return False
+        merged = {**_json_dict(row["metadata"]), **updates}
+        conn.execute("UPDATE task_runs SET metadata = ? WHERE id = ?",
+                     (json.dumps(merged, ensure_ascii=False), int(run_id)))
+    return True
 
 
 def _first_line(text: Optional[str], limit: int) -> str:

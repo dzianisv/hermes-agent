@@ -1897,6 +1897,10 @@ DEFAULT_CONFIG = {
         # early failure evidence from long-running workers.
         "worker_log_rotate_bytes": 2 * 1024 * 1024,
         "worker_log_backup_count": 1,
+        # A worker that ended crashed/timed_out/reclaimed is re-spawned with `chat --resume
+        # <its session>` instead of a fresh session, at most this many times in a row for the
+        # same session; then a fresh start. 0 disables resuming.
+        "resume_interrupted_max": 2,
         # Profile for the root/orchestration task after Triage decomposition; "" = default profile.
         # Does not control the decomposer LLM path (see auxiliary.kanban_decomposer).
         "orchestrator_profile": "",

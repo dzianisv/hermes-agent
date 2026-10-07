@@ -604,6 +604,10 @@ def _cmd_show(args: argparse.Namespace) -> int:
             print(f"  #{r.id:<3} {outcome:<12} @{r.profile or '-'}  {el}  {_fmt_ts(r.started_at)}")
             if r.summary:
                 print(f"        → {r.summary.splitlines()[0][:160]}")
+            _meta = r.metadata if isinstance(r.metadata, dict) else {}
+            if _meta.get("resumed_from_session"):
+                print(f"        ↻ resumed session {_meta['resumed_from_session']} "
+                      f"(after {_meta.get('resume_outcome') or '?'} run #{_meta.get('resume_of_run') or '?'})")
             if r.error:
                 print(f"        ! {r.error.splitlines()[0][:160]}")
     return 0

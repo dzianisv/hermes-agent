@@ -719,6 +719,11 @@ class CLIAgentSetupMixin:
             except Exception:
                 pass
             self._active_agent_route_signature = _route_signature(effective_model, runtime)
+            # Kanban worker: record this session on the live run NOW (not at handoff) so a
+            # crash/timeout/reclaim still leaves the id the next dispatch resumes. Only after a
+            # successful build, so a failed `--resume` never re-arms the same session.
+            from hermes_cli.kanban_worker_session import stamp_worker_session_on_run
+            stamp_worker_session_on_run(self.session_id)
 
             # Force-create DB row on /title intent, then apply title.
             if self._pending_title and self._session_db:
