@@ -1430,6 +1430,10 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
                     "limit_seconds": limit,
                     "sigkill": killed,
                     "retry_status": retry_status,
+                    "exit_reason": _kwe.build_exit_reason(
+                        conn, tid, reason=_kwe.TIMEOUT, run_id=_kb._current_run_id(conn, tid),
+                        sig=int(signal.SIGKILL if killed else signal.SIGTERM),
+                    ),
                 }
                 run_id = _kb._end_run(
                     conn, tid, outcome="timed_out", status="timed_out",
@@ -1537,6 +1541,9 @@ def detect_stale_running(
                 "retry_status": retry_status,
             }
             payload.update(termination)
+            payload["exit_reason"] = _kwe.build_exit_reason(
+                conn, tid, reason=_kwe.RECLAIMED, run_id=_kb._current_run_id(conn, tid),
+            )
 
             run_id = _kb._end_run(
                 conn, tid,
@@ -1598,6 +1605,9 @@ def reconcile_orphaned_running(conn: sqlite3.Connection) -> list[str]:
                 "claim_expires": _kb._opt_int(row["claim_expires"]),
                 "worker_pid": int(pid) if pid else None,
                 "now": now,
+                "exit_reason": _kwe.build_exit_reason(
+                    conn, tid, reason=_kwe.RECLAIMED, run_id=_kb._current_run_id(conn, tid),
+                ),
             }
             run_id = _kb._end_run(
                 conn, tid,
@@ -1632,7 +1642,7 @@ def _error_fingerprint(error_text: str) -> str:
 # The budget is a violation-only STREAK (``_protocol_violation_streak``),
 # independent of ``consecutive_failures``: other failure kinds neither consume
 # nor extend it. Per-task ``max_retries`` overrides it.
-_PROTOCOL_VIOLATION_FAILURE_LIMIT = 3
+_PROTOCOL_VIOLATION_FAILURE_LIMIT = 2  # == kanban_worker_exit.HARNESS_STREAK_LIMIT
 
 # Bounded retry budget for reclaims where we could NOT determine why the worker
 # died (``_classify_worker_exit`` -> "unknown"). The reap registry is in-memory,
@@ -1746,6 +1756,8 @@ class _DeadWorker:
     terminal_provider: bool = False
     """``KANBAN_TERMINAL_PROVIDER_EXIT_CODE``: the provider rejected the worker's
     credential/model — trips the breaker on this first occurrence."""
+    exit_reason: dict = field(default_factory=dict)
+    """Structured ``kanban_worker_exit`` record, stored on the closed run."""
 
     @property
     def run_outcome(self) -> str:
@@ -1879,6 +1891,12 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
             dead = _classify_dead_worker(pid, row["claim_lock"], task_id=row["id"], board=board)
             retry_status = _kb._retry_status_for_run(conn, row["id"])
             dead.event_payload["retry_status"] = retry_status
+            open_run = _kb._current_run_id(conn, row["id"])
+            dead.exit_reason = _kwe.exit_reason_for_dead_worker(
+                conn, row["id"], kind=dead.kind, code=dead.code, run_id=open_run,
+                run_started_at=_kwe.run_started_at(conn, open_run), board=board,
+            )
+            dead.event_payload["exit_reason"] = dead.exit_reason
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL "
@@ -1939,6 +1957,44 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
         fp_counts[fp] = fp_counts.get(fp, 0) + 1
     for tid, pid, claimer, dead in crash_details:
         error_text = dead.error_text
+        reason = dead.exit_reason.get("reason")
+        if dead.terminal_provider:
+            pass  # handled below: trips on first occurrence
+        elif reason in _kwe.HARNESS_REASONS:
+            # rc=0 without a handoff, or a non-zero rc: a harness/protocol problem a blind
+            # re-spawn rarely heals. Retry once; the second of the SAME class in a row blocks the card with a
+            # BLOCKER:HARNESS comment so it is flagged instead of looped. Per-task
+            # ``max_retries`` still overrides the streak limit.
+            streak, _newest = _kwe.reason_streak(conn, tid, frozenset({reason}))
+            trow = conn.execute("SELECT max_retries FROM tasks WHERE id = ?", (tid,)).fetchone()
+            if trow is None:
+                continue
+            override = _kb._row_get(trow, "max_retries")
+            limit = int(override) if override is not None else _kwe.HARNESS_STREAK_LIMIT
+            if streak < limit:
+                # Below the streak: already requeued with the error stamped. A non-zero rc
+                # still spends the unified budget (so alternating classes cannot loop); a
+                # clean exit never did and still does not.
+                if not dead.protocol_violation and _record_task_failure(
+                    conn, tid, error=error_text, outcome="crashed",
+                    release_claim=False, end_run=False,
+                    event_payload_extra={"pid": pid, "claimer": claimer},
+                ):
+                    auto_blocked.append(tid)
+                continue
+            if _kwe.harness_block(conn, tid, reason, streak, error_text[:300]):
+                auto_blocked.append(tid)
+            continue
+        elif reason in _kwe.TRANSIENT_REASONS:
+            # Killed by a signal or by the gateway going down: nothing about the card
+            # failed. Requeued (already back at its source phase) without spending the
+            # failure budget; the resume path re-enters the interrupted session. A long
+            # transient streak is still flagged rather than looped forever.
+            streak, _newest = _kwe.reason_streak(conn, tid, _kwe.TRANSIENT_REASONS)
+            if streak >= _kwe.TRANSIENT_STREAK_LIMIT:
+                if _kwe.harness_block(conn, tid, reason, streak, error_text[:300]):
+                    auto_blocked.append(tid)
+            continue
         if dead.protocol_violation:
             streak = _protocol_violation_streak(conn, tid)
             trow = conn.execute("SELECT max_retries FROM tasks WHERE id = ?", (tid,)).fetchone()
@@ -4308,3 +4364,4 @@ def run_daemon(
 from hermes_cli import kanban_db as _kb  # noqa: E402
 from hermes_cli import kanban_db_connect as _kbc  # noqa: E402
 from hermes_cli import kanban_db_workspace as _kbw  # noqa: E402
+from hermes_cli import kanban_worker_exit as _kwe  # noqa: E402

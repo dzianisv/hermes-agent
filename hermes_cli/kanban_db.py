@@ -2746,8 +2746,14 @@ def _record_reclaim(
 ) -> Optional[int]:
     """Close the active run as ``reclaimed`` and emit the ``reclaimed`` event
     (payload merged with the termination report). Caller holds the txn."""
+    from hermes_cli import kanban_worker_exit as kwe
+
+    exit_reason = kwe.build_exit_reason(
+        conn, task_id, reason=kwe.RECLAIMED, run_id=_current_run_id(conn, task_id),
+    )
     run_id = _end_run(
-        conn, task_id, outcome="reclaimed", status="reclaimed", error=error, metadata=termination,
+        conn, task_id, outcome="reclaimed", status="reclaimed", error=error,
+        metadata={**termination, "exit_reason": exit_reason},
     )
     payload.update(termination)
     _append_event(conn, task_id, "reclaimed", payload, run_id=run_id)

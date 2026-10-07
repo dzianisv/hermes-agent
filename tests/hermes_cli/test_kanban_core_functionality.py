@@ -1260,10 +1260,9 @@ def test_protocol_violation_budget_not_consumed_by_other_failures(kanban_home):
         assert task.status == "ready"
         assert task.consecutive_failures == 1
 
-        # Two violations after it: streak 1 and 2 — both retry, unified
-        # counter untouched. (Pre-fix: the crash consumed the budget and the
-        # violations blocked well before three of them happened.)
-        for i, pid in enumerate((991001, 991002)):
+        # A violation after it: streak 1 — retries, unified counter untouched.
+        # (Pre-fix: the crash consumed the budget and the violation blocked.)
+        for i, pid in enumerate((991001,)):
             _drive_protocol_violation(conn, tid, pid)
             task = kb.get_task(conn, tid)
             assert task.status == "ready", (
@@ -1274,13 +1273,13 @@ def test_protocol_violation_budget_not_consumed_by_other_failures(kanban_home):
                 "below-budget violations must not tick the unified counter"
             )
 
-        # Third consecutive violation: streak hits the bound — blocked.
+        # Second consecutive violation: streak hits the bound — blocked as a harness fault.
         _drive_protocol_violation(conn, tid, 991003)
         task = kb.get_task(conn, tid)
         assert task.status == "blocked"
         gave_up = [e for e in kb.list_events(conn, tid) if e.kind == "gave_up"]
         assert len(gave_up) == 1
-        assert (gave_up[0].payload or {}).get("protocol_violations") == \
+        assert (gave_up[0].payload or {}).get("harness_streak") == \
             _kbd._PROTOCOL_VIOLATION_FAILURE_LIMIT
     finally:
         conn.close()
