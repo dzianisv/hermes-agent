@@ -154,7 +154,8 @@ def _fetch_pr_status(owner: str, repo: str, number: str) -> Optional[dict]:
                 "-f", f"query={_PR_STATUS_GQL}",
                 "-F", f"owner={owner}", "-F", f"repo={repo}", "-F", f"number={number}",
             ],
-            capture_output=True, text=True, timeout=20,
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=20,
             env={**os.environ, "PAGER": "cat", "GH_PAGER": "cat"},
         )
         if proc.returncode != 0:
