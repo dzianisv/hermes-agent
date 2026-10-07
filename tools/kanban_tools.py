@@ -734,6 +734,7 @@ def _handle_complete(args: dict, **kw) -> str:
     summary = _redact_opt(args.get("summary"))
     result = _redact_opt(args.get("result"))
     metadata = args.get("metadata")
+    raw_metadata = metadata  # proof contract compares the command before redaction
     if isinstance(metadata, dict):
         # Keep the unredacted dict if the redacted JSON cannot be re-parsed.
         metadata = _redact_metadata(metadata) or metadata
@@ -751,6 +752,11 @@ def _handle_complete(args: dict, **kw) -> str:
         # actually reachable — see _goal_judge_available for why an unavailable judge fails open.
         task = kb.get_task(conn, tid)
         _goal_gate("kanban_complete", task, tid, (summary or result or "").strip())
+        # Live-proof contract: a PROOF: line in the body means "done" = the proof ran.
+        from hermes_cli.kanban_proof_contract import proof_violation
+        violation = proof_violation(task.body if task else None, raw_metadata)
+        if violation:
+            return tool_error(violation)
         try:
             ok = kb.complete_task(
                 conn, tid, result=result, summary=summary, metadata=metadata,
