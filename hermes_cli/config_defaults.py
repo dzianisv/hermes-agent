@@ -1901,6 +1901,14 @@ DEFAULT_CONFIG = {
         # <its session>` instead of a fresh session, at most this many times in a row for the
         # same session; then a fresh start. 0 disables resuming.
         "resume_interrupted_max": 2,
+        # Worker-context comment rendering. Spec comments (a line starting DESIGN:, SCOPE:,
+        # ACCEPTANCE:, PROOF:, R<n>:, "## Plan", "EM DECISION", "NEEDS-DESIGN") are always shown
+        # in full, oldest first. Routine comments: newest `context_max_comments`, each cut to
+        # `context_max_comment_chars`. Whole prompt budget `context_max_total_chars`; routine
+        # comments are dropped first. Every omitted comment is listed as a one-line pointer.
+        "context_max_comments": 30,
+        "context_max_comment_chars": 8 * 1024,
+        "context_max_total_chars": 100_000,
         # Profile for the root/orchestration task after Triage decomposition; "" = default profile.
         # Does not control the decomposer LLM path (see auxiliary.kanban_decomposer).
         "orchestrator_profile": "",

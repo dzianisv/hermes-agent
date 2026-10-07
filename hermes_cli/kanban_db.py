@@ -470,10 +470,11 @@ def _resolve_rate_limit_cooldown_seconds() -> int:
 
 # build_worker_context() caps, sized for a ~100k-char prompt with headroom.
 _CTX_MAX_PRIOR_ATTEMPTS = 10      # most recent N prior runs shown in full
-_CTX_MAX_COMMENTS       = 30      # most recent N comments shown in full
+_CTX_MAX_COMMENTS       = 30      # most recent N routine comments (config: kanban.context_max_comments)
 _CTX_MAX_FIELD_BYTES    = 4 * 1024   # per summary/error/metadata/result
 _CTX_MAX_BODY_BYTES     = 8 * 1024   # per task.body (opening post)
-_CTX_MAX_COMMENT_BYTES  = 2 * 1024   # per comment
+_CTX_MAX_COMMENT_BYTES  = 8 * 1024   # per routine comment (config: kanban.context_max_comment_chars)
+_CTX_MAX_TOTAL_CHARS    = 100_000    # whole prompt budget (config: kanban.context_max_total_chars)
 
 
 def _relative_age(ts: Optional[int], now: Optional[int] = None) -> str:
@@ -4413,6 +4414,40 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
+_SPEC_LINE_RE = re.compile(
+    r"^\s*(?:DESIGN:|SCOPE:|ACCEPTANCE:|PROOF:|R\d+:|## Plan\b|EM DECISION|NEEDS-DESIGN)",
+    re.MULTILINE,
+)
+
+
+def _is_spec_comment(body: Optional[str]) -> bool:
+    """A design/spec comment: never truncated, never dropped for age."""
+    return bool(body and _SPEC_LINE_RE.search(body))
+
+
+def _ctx_comment_limits() -> tuple[int, int, int]:
+    """(max routine comments, per-comment chars, total prompt chars) from
+    config.yaml ``kanban.context_*``, falling back to module defaults."""
+    try:
+        from hermes_cli.config import load_config_readonly
+        cfg = (load_config_readonly() or {}).get("kanban", {}) or {}
+    except Exception:
+        cfg = {}
+
+    def _int(key: str, default: int) -> int:
+        try:
+            v = int(cfg.get(key, default))
+            return v if v > 0 else default
+        except (TypeError, ValueError):
+            return default
+
+    return (
+        _int("context_max_comments", _CTX_MAX_COMMENTS),
+        _int("context_max_comment_chars", _CTX_MAX_COMMENT_BYTES),
+        _int("context_max_total_chars", _CTX_MAX_TOTAL_CHARS),
+    )
+
+
 def _ctx_cap(s: Optional[str], limit: int = _CTX_MAX_FIELD_BYTES) -> str:
     """Truncate to ``limit`` chars with a visible ellipsis."""
     if not s:
@@ -4588,21 +4623,73 @@ def _ctx_comments(lines: list[str], comments: list[Comment], now: int) -> None:
     worker" framing stops an operator-controlled HERMES_PROFILE like
     "hermes-system" being read as a system directive above an
     attacker-influenceable body (defense-in-depth)."""
-    shown, omitted_note = _ctx_tail(comments, _CTX_MAX_COMMENTS, "comment")
-    if not shown:
+    if not comments:
         return
-    lines.append("## Comment thread")
-    if omitted_note:
-        lines.append(omitted_note)
-    for c in shown:
+    max_routine, per_comment, total_budget = _ctx_comment_limits()
+
+    def _render(c: Comment, limit: Optional[int]) -> list[str]:
         # Render author with explicit "comment from worker" framing so operator-controlled HERMES_PROFILE
         # values like "hermes-system" or "operator" can't be misread by the next worker as a system
         # directive above the (attacker-influenceable) comment body. Defense-in-depth — the LLM-controlled
         # author-forgery surface was already closed in #22435. See #22452.
         safe_author = (c.author or "").replace("`", "")
-        lines.append(f"comment from worker `{safe_author}` at {_ctx_stamp(c.created_at, now)}:")
-        lines.append(_ctx_cap(c.body, _CTX_MAX_COMMENT_BYTES))
+        body = (c.body or "").strip() if limit is None else _ctx_cap(c.body, limit)
+        return [f"comment from worker `{safe_author}` (#{c.id}) at {_ctx_stamp(c.created_at, now)}:", body, ""]
+
+    def _pointer(c: Comment) -> str:
+        safe_author = (c.author or "").replace("`", "")
+        first = " ".join((c.body or "").split())[:120]
+        age = _relative_age(c.created_at, now) or _ctx_stamp(c.created_at, now)
+        return f"- #{c.id} `{safe_author}` ({age}): {first}"
+
+    def _size(block: list[str]) -> int:
+        return sum(len(s) + 1 for s in block)
+
+    # Spec/design comments: always in full, oldest first, whatever their age.
+    specs = [c for c in comments if _is_spec_comment(c.body)]
+    routine = [c for c in comments if not _is_spec_comment(c.body)]
+    spec_blocks = [_render(c, None) for c in specs]
+
+    # Routine comments: newest-first while they fit the remaining budget.
+    # Every routine comment starts as a one-line pointer; promoting it to a
+    # full render costs (render - pointer).
+    used = _size(lines) + sum(_size(b) for b in spec_blocks) + 400  # headers/notes slack
+    pointers = {c.id: _pointer(c) for c in routine}
+    used += sum(len(p) + 1 for p in pointers.values())
+    included: dict[int, list[str]] = {}
+    for c in reversed(routine):
+        if len(included) >= max_routine:
+            break
+        block = _render(c, per_comment)
+        extra = _size(block) - (len(pointers[c.id]) + 1)
+        if used + extra > total_budget:
+            break
+        included[c.id] = block
+        used += extra
+    omitted = [c for c in routine if c.id not in included]
+
+    lines.append("## Comment thread")
+    if specs:
+        lines.append(
+            f"### Design / spec comments ({len(specs)}, shown in full, oldest first)"
+        )
+        for b in spec_blocks:
+            lines.extend(b)
+    if omitted:
+        lines.append(
+            f"### Earlier comments not shown in full ({len(omitted)})"
+        )
+        lines.append(
+            "_Read any of these in full with `kanban_show` (or "
+            "`hermes kanban show <task>`) before relying on the thread:_"
+        )
+        lines.extend(pointers[c.id] for c in omitted)
         lines.append("")
+    if included:
+        lines.append(f"### Recent comments ({len(included)}, oldest first)")
+        for c in routine:
+            if c.id in included:
+                lines.extend(included[c.id])
 
 
 # --- Stats + SLA helpers ---
