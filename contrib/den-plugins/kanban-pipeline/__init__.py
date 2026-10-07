@@ -87,7 +87,6 @@ import json
 import logging
 import os
 import re
-import shutil
 import subprocess
 import threading
 import time
@@ -340,7 +339,9 @@ class ProbeError(RuntimeError):
 
 
 def _gh_json(args, timeout):
-    if not shutil.which("gh"):
+    from hermes_platform.resolver import locate_command
+
+    if not locate_command("gh").found:
         raise ProbeError("gh CLI not available for read-only artifact validation")
     try:
         proc = subprocess.run(
