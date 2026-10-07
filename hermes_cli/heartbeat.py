@@ -22,7 +22,8 @@ POLL_SECONDS = 5.0  # how often drivers poll for due heartbeats; not user-facing
 HEARTBEAT_PROMPT_TEMPLATE = (
     "[Heartbeat — recurring instruction, fires every {interval}]\n{prompt}\n\n"
     "If there is nothing meaningful to do or report for this instruction "
-    "right now, reply briefly that nothing has changed and stop — do not invent work."
+    "right now, reply with exactly [SILENT] (it is not delivered) and stop — do not invent work "
+    "and do not send a 'nothing changed' status."
 )
 
 _INTERVAL_RE = re.compile(
