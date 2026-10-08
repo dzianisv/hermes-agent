@@ -3276,11 +3276,20 @@ def _dispatch_lane_task(
     if claimed is None:
         return False
     try:
-        resolved_branch_name = None
-        if claimed.workspace_kind == "worktree":
-            workspace, resolved_branch_name = _kbw._resolve_worktree_workspace(claimed, board=board)
-        else:
-            workspace = _kbw.resolve_workspace(claimed, board=board)
+        workspace, resolved_kind, resolved_branch_name = _kbw.resolve_dispatch_workspace(
+            claimed, board=board,
+        )
+        if resolved_kind != (claimed.workspace_kind or "scratch"):
+            # dir -> worktree promotion: a shared git checkout became this
+            # card's own worktree; persist so retries/cleanup see the truth.
+            with _kb.write_txn(conn):
+                conn.execute("UPDATE tasks SET workspace_kind = ? WHERE id = ?",
+                             (resolved_kind, claimed.id))
+                _kb._append_event(conn, claimed.id, "workspace_isolated", {
+                    "from_kind": claimed.workspace_kind, "from_path": claimed.workspace_path,
+                    "to_path": str(workspace), "branch": resolved_branch_name,
+                })
+            claimed.workspace_kind = resolved_kind
     except Exception as exc:
         if _record_task_failure(
             conn, claimed.id, f"workspace: {exc}",

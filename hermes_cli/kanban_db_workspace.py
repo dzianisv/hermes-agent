@@ -525,6 +525,10 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> t
     repo_root = _git_toplevel(requested)
     if repo_root is not None and _path_key(requested_resolved) == _path_key(repo_root):
         return _anchored_worktree(repo_root, task.id, branch_name)
+    if requested.exists() and repo_root is not None:
+        # An existing path inside a MAIN checkout (not a linked worktree) is
+        # the shared tree itself — never hand it to a worker as "its" worktree.
+        return _anchored_worktree(repo_root, task.id, branch_name)
 
     repo_root = _repo_root_for_worktree_target(requested.parent)
     if repo_root is None:
@@ -534,6 +538,43 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> t
         )
     _ensure_git_worktree(repo_root, requested, branch_name)
     return requested, branch_name
+
+
+def _shared_checkout_repo(path: Path) -> Optional[Path]:
+    """Repo root when ``path`` lies inside a git MAIN checkout (shared by every
+    process working there); ``None`` for non-git dirs and linked worktrees."""
+    if not path.exists():
+        return None
+    repo_root = _git_toplevel(path)
+    if repo_root is None or _is_linked_worktree_checkout(path):
+        return None
+    return repo_root
+
+
+def resolve_dispatch_workspace(
+    task: Task, *, board: Optional[str] = None,
+) -> tuple[Path, str, Optional[str]]:
+    """Resolve ``task``'s workspace for a worker spawn -> ``(path, kind, branch)``.
+
+    A ``dir`` workspace inside a git main checkout (typically the board's
+    ``default_workdir`` inherited at create time) would put concurrent workers
+    in one shared tree. Such tasks are promoted to a per-card linked worktree
+    at ``<workspaces-root>/<task-id>/<repo-name>`` on ``wt/<task-id>``; the
+    caller persists the returned kind/path/branch so retries reuse it.
+    """
+    kind = task.workspace_kind or "scratch"
+    if kind == "dir" and task.workspace_path:
+        requested = Path(task.workspace_path).expanduser()
+        repo_root = _shared_checkout_repo(requested) if requested.is_absolute() else None
+        if repo_root is not None:
+            branch_name = (task.branch_name or "").strip() or f"wt/{task.id}"
+            target = _kb.workspaces_root(board=board) / task.id / repo_root.name
+            _ensure_git_worktree(repo_root, target, branch_name)
+            return target.resolve(strict=False), "worktree", branch_name
+    if kind == "worktree":
+        path, branch_name = _resolve_worktree_workspace(task, board=board)
+        return path, kind, branch_name
+    return resolve_workspace(task, board=board), kind, None
 
 
 def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
