@@ -5284,6 +5284,8 @@ def _cmd_stop(args):
     from hermes_cli.gateway_profile_lifecycle import profile_lifecycle
     if profile_lifecycle("stop", args):
         return
+    from hermes_cli.gateway_kanban_workers import announce_surviving_workers
+    announce_surviving_workers("stop")
     stop_all = getattr(args, "all", False)
     system = getattr(args, "system", False)
     if not stop_all and not find_gateway_pids() and (
@@ -5396,6 +5398,8 @@ def _cmd_restart(args):
     from hermes_cli.gateway_profile_lifecycle import profile_lifecycle
     if profile_lifecycle("restart", args):
         return
+    from hermes_cli.gateway_kanban_workers import announce_surviving_workers
+    announce_surviving_workers("restart")
     system = getattr(args, "system", False)
     restart_all = getattr(args, "all", False)
     force = getattr(args, "force", False)
