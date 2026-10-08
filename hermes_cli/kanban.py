@@ -386,16 +386,22 @@ def _cmd_create(args: argparse.Namespace) -> int:
             creator_task_id=(os.environ.get("HERMES_KANBAN_TASK")
                              if is_dispatcher_owned_worker_context() else None),
             outcome_key=getattr(args, "outcome_key", None),
+            allow_duplicate=bool(getattr(args, "allow_duplicate", False)),
         )
         if task_id is None:
             return 2
         deduped = bool(getattr(task_id, "deduped", False))
         if deduped:
             task = kb.get_task(conn, task_id)
+            reason = getattr(task_id, "dedupe_reason", None)
             if getattr(args, "json", False):
-                _print_json({**_task_to_dict(task), "deduped": True})
-            else:
+                _print_json({**_task_to_dict(task), "created": False, "deduped": True,
+                             "duplicate_of": str(task_id), "dedupe_reason": reason})
+            elif reason == "outcome_key":
                 print(f"deduped into {task_id}  ({task.status}, outcome_key={task.outcome_key})")
+            else:
+                print(f"exists: {task_id}  ({task.status}, matched={reason}; "
+                      "pass --allow-duplicate to create anyway)")
             return 0
         step = getattr(args, "step", None)
         if step:

@@ -1944,6 +1944,11 @@ DEFAULT_CONFIG = {
         # SCOPE:, ACCEPTANCE:, PROOF:, R<n>:, EM DECISION, NEEDS-DESIGN or BLOCKER: lines are
         # always stored.
         "comment_routing": True,
+        # True: a create matching an OPEN card on the same board (normalized title,
+        # idempotency key, or alert PR number + check name) returns that card's id
+        # instead of inserting; extra body text is appended as one comment.
+        # Bypass per call with `kanban create --allow-duplicate` / allow_duplicate=true.
+        "create_dedupe": True,
         "comment_dedupe_seconds": 86400,
         # kanban_heartbeat(note=...) keeps the latest note plus this many recent notes on the run.
         "progress_history_max": 10,

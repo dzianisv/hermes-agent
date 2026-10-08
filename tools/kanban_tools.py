@@ -1169,6 +1169,7 @@ def _handle_create(args: dict, **kw) -> str:
             creator_task_id=self_tid,
             idempotency_key=args.get("idempotency_key"),
             outcome_key=args.get("outcome_key"),
+            allow_duplicate=bool(args.get("allow_duplicate")),
             max_runtime_seconds=_opt_int(args.get("max_runtime_seconds")), skills=skills,
             model_override=model_override, provider_override=provider_override,
             goal_mode=goal_mode, goal_max_turns=_opt_int(args.get("goal_max_turns")),
@@ -1176,13 +1177,15 @@ def _handle_create(args: dict, **kw) -> str:
             initial_status=str(args.get("initial_status") or "running"),
             created_by=_persisted_identity(), session_id=session_id)
         if getattr(new_tid, "deduped", False):
-            return _ok(task_id=str(new_tid), deduped=True,
-                       message=f"deduped into {new_tid}",
+            return _ok(task_id=str(new_tid), id=str(new_tid), created=False, deduped=True,
+                       duplicate_of=str(new_tid),
+                       dedupe_reason=getattr(new_tid, "dedupe_reason", None),
+                       message=f"exists: {new_tid} (pass allow_duplicate=true to create anyway)",
                        **_fields(kb.get_task(conn, new_tid), _CREATED_FIELDS))
         landed = _fields(kb.get_task(conn, new_tid), _CREATED_FIELDS)
         wait = [e for e in kb.list_events(conn, new_tid) if e.kind == "dependency_wait"]
         gate = {"gated": True, "gated_by": wait[-1].payload["parent"]} if wait else {"gated": False}
-        return _ok(task_id=new_tid, **landed, **gate,
+        return _ok(task_id=new_tid, id=str(new_tid), created=True, **landed, **gate,
                    subscribed=_maybe_auto_subscribe(conn, new_tid))
 
 

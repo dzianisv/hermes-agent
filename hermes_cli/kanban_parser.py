@@ -194,6 +194,10 @@ _SPECS = [
         _arg("--idempotency-key",
              help="Dedup key. If a non-archived task with this key exists, "
                   "its id is returned instead of creating a duplicate."),
+        _arg("--allow-duplicate", action="store_true",
+             help="Create even if an open card on this board has the same normalized "
+                  "title / idempotency key / alert PR+check (kanban.create_dedupe). "
+                  "Without it a match prints 'exists: <id>' and creates nothing."),
         _arg("--outcome-key",
              help="Outcome identity (e.g. G3). At most one OPEN task per "
                   "(project, key): a duplicate create comments on the existing "

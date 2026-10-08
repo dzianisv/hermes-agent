@@ -45,7 +45,8 @@ def test_parent_tenant_is_inherited_at_creation_boundary(tmp_path, monkeypatch):
         unscoped = kb.create_task(conn, title="unscoped")
         parent = kb.create_task(conn, title="parent", tenant="business-a")
         for explicit, expected in [(None, "business-a"), ("business-b", "business-b")]:
-            child = kb.create_task(conn, title="child", parents=[unscoped, parent], tenant=explicit)
+            child = kb.create_task(conn, title="child", parents=[unscoped, parent], tenant=explicit,
+                                   allow_duplicate=True)
             assert kb.get_task(conn, child).tenant == expected
         result = json.loads(_handle_create({"title": "tool child", "assignee": "default", "parents": [parent]}))
         assert result["ok"]

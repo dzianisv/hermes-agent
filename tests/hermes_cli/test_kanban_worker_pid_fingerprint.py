@@ -30,7 +30,8 @@ def board(tmp_path, monkeypatch):
 
 
 def _claimed_running(conn, *, pid: int, started_at, max_runtime=None) -> str:
-    tid = kb.create_task(conn, title="job", assignee="worker", max_runtime_seconds=max_runtime)
+    tid = kb.create_task(conn, title="job", assignee="worker", max_runtime_seconds=max_runtime,
+                         allow_duplicate=True)
     kb.claim_task(conn, tid)
     kbd._set_worker_pid(conn, tid, pid)
     old = int(time.time()) - 3600

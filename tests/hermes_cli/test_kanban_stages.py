@@ -51,7 +51,7 @@ def _show(tid: str, capsys) -> dict:
 
 def _create(capsys, *extra) -> str:
     capsys.readouterr()
-    assert _run(["create", "stage test", "--triage", "--json", *extra]) == 0
+    assert _run(["create", "stage test", "--triage", "--json", "--allow-duplicate", *extra]) == 0
     return json.loads(capsys.readouterr().out)["id"]
 
 

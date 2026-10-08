@@ -34,7 +34,7 @@ def conn(tmp_path, monkeypatch):
 
 
 def _claimed_running_task(conn, *, live_worker: bool = True) -> tuple[str, int]:
-    tid = kb.create_task(conn, title="live", assignee="coder")
+    tid = kb.create_task(conn, title="live", assignee="coder", allow_duplicate=True)
     assert kb.claim_task(conn, tid, claimer=kb._claimer_id()) is not None
     if live_worker:
         # This process stands in for the spawned worker: alive, fingerprinted.

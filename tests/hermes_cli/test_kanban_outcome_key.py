@@ -45,7 +45,9 @@ def test_duplicate_create_folds_with_comment(kanban_home):
         assert kb.get_task(conn, a).outcome_key == "G3"
         # Different key / no key are unaffected.
         assert kb.create_task(conn, title="other", outcome_key="G4") != a
-        assert kb.create_task(conn, title="plain") != kb.create_task(conn, title="plain")
+        # Without an outcome_key, the open-card create dedupe is the gate; opting out inserts.
+        assert (kb.create_task(conn, title="plain", allow_duplicate=True)
+                != kb.create_task(conn, title="plain", allow_duplicate=True))
 
 
 def test_index_rejects_raw_duplicate_open_insert(kanban_home):

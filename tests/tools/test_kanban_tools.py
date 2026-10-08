@@ -598,7 +598,7 @@ def test_create_explicit_scratch_ignores_ambient_board_project(
 
     def create(**extra):
         result = json.loads(kt._handle_create(
-            {"board": "target", "title": "card", "assignee": "peer", **extra}))
+            {"board": "target", "title": "card", "assignee": "peer", "allow_duplicate": True, **extra}))
         assert result["ok"] is True
         return result["workspace_kind"], result["project_id"]
 

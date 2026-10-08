@@ -107,15 +107,107 @@ OUTCOME_KEY_CLOSED_STATUSES = ("archived", "done")
 
 
 class CreatedTaskId(str):
-    """Task id returned by ``create_task``; ``deduped`` is True when the create
-    was folded into an existing open task with the same outcome_key."""
+    """Task id returned by ``create_task``; ``deduped`` is True when no card was
+    inserted because an existing one matched (outcome_key, idempotency key, or
+    the open-card create dedupe). ``created`` is its inverse; ``dedupe_reason``
+    names the matching rule."""
 
     deduped: bool = False
+    dedupe_reason: Optional[str] = None
 
-    def __new__(cls, value: str, deduped: bool = False):
+    def __new__(cls, value: str, deduped: bool = False, dedupe_reason: Optional[str] = None):
         obj = super().__new__(cls, value)
         obj.deduped = deduped
+        obj.dedupe_reason = dedupe_reason if deduped else None
         return obj
+
+    @property
+    def created(self) -> bool:
+        return not self.deduped
+
+
+# --- create dedupe (kanban.create_dedupe) ----------------------------------
+# Trailing run identifiers that differ between repeats of the same report:
+# ``@<sha>``, ``#<run>``, ``(run 123)``, ISO dates/timestamps.
+_TRAILING_TOKEN = re.compile(
+    r"\s*[-—–:,(\[]*\s*(?:@[0-9a-f]{6,40}|#\d+|run\s*#?\d+|"
+    r"\d{4}-\d{2}-\d{2}(?:[t ]\d{2}:\d{2}(?::\d{2})?z?)?)\s*[)\]]*\s*$"
+)
+# ``PR #123`` / ``issue #123`` name the subject, not a run: never stripped.
+_SUBJECT_REF_END = re.compile(r"\b(?:pr|pull|issue|ticket|card)\s*#\d+\s*[)\]]*\s*$")
+_PR_REF = re.compile(r"\bpr\s*#\s*(\d+)", re.I)
+_CHECK_REF = re.compile(r"`([^`]+)`|\bcheck[:\s]+[\"']?([\w./:-]+)", re.I)
+
+
+def normalize_card_title(title: str) -> str:
+    """Dedupe form of a title: lowercase, whitespace collapsed, a leading
+    ``CI RED on main:``-style prefix kept, trailing ``@sha``/``#run``/date stripped."""
+    t = " ".join(str(title or "").lower().split())
+    while True:
+        m = _TRAILING_TOKEN.search(t)
+        if not m or m.start() == 0 or _SUBJECT_REF_END.search(t):
+            break
+        t = t[: m.start()].strip()
+    return t or " ".join(str(title or "").lower().split())
+
+
+def alert_signature(title: str) -> Optional[tuple[str, str]]:
+    """``(pr_number, check_name)`` for alert-style titles naming both, else None."""
+    pr = _PR_REF.search(title or "")
+    chk = _CHECK_REF.search(title or "")
+    if not pr or not chk:
+        return None
+    return pr.group(1), (chk.group(1) or chk.group(2) or "").strip().lower()
+
+
+def find_open_duplicate(
+    conn: sqlite3.Connection, title: str, idempotency_key: Optional[str] = None,
+) -> Optional[tuple[str, str]]:
+    """``(task_id, reason)`` of an open (not done/archived) card on this board
+    that a create of ``title`` would duplicate, else None. Oldest match wins."""
+    if idempotency_key:
+        row = conn.execute(
+            "SELECT id FROM tasks WHERE idempotency_key = ? AND status NOT IN ('done','archived') "
+            "ORDER BY created_at ASC LIMIT 1", (idempotency_key,),
+        ).fetchone()
+        if row:
+            return row["id"], "idempotency_key"
+    norm = normalize_card_title(title)
+    sig = alert_signature(title)
+    rows = conn.execute(
+        "SELECT id, title FROM tasks WHERE status NOT IN ('done','archived') "
+        "ORDER BY created_at ASC, id ASC"
+    ).fetchall()
+    for r in rows:
+        if normalize_card_title(r["title"]) == norm:
+            return r["id"], "title"
+    if sig:
+        for r in rows:
+            if alert_signature(r["title"]) == sig:
+                return r["id"], "alert"
+    return None
+
+
+def _create_dedupe_enabled() -> bool:
+    return _kanban_cfg().get("create_dedupe", True) is not False
+
+
+def _fold_duplicate_create(
+    conn: sqlite3.Connection, existing_id: str, *, title: str, body: Optional[str],
+    author: Optional[str], reason: str, now: int,
+) -> None:
+    """Append the new body (if it adds text) as one comment; record the event."""
+    text = (body or "").strip()
+    if text:
+        row = conn.execute("SELECT body FROM tasks WHERE id = ?", (existing_id,)).fetchone()
+        seen = [(row["body"] or "") if row else ""] + [
+            c["body"] or "" for c in conn.execute(
+                "SELECT body FROM task_comments WHERE task_id = ?", (existing_id,))
+        ]
+        if not any(text in s for s in seen):
+            _insert_comment(conn, existing_id, author or "kanban",
+                            f"Duplicate create ({reason}): {title.strip()}\n\n{text}", now)
+    _append_event(conn, existing_id, "deduped", {"reason": reason, "title": title.strip()})
 
 
 class OutcomeKeyError(ValueError):
@@ -1428,6 +1520,7 @@ def create_task(
     creator_task_id: Optional[str] = None,
     completion_contract: Optional[str] = None,
     outcome_key: Optional[str] = None,
+    allow_duplicate: bool = False,
 ) -> "CreatedTaskId":
     """Create a task (optionally under ``parents``); returns its id.
 
@@ -1443,6 +1536,11 @@ def create_task(
     worker model (provider requires model); ``reasoning_effort`` is independent.
     ``creator_task_id``: inherit durable session/subscriptions independently of
     dependency edges; an explicit ``session_id`` still wins.
+    Create dedupe (``kanban.create_dedupe``, default on; ``allow_duplicate=True``
+    bypasses): an OPEN card (not done/archived) on this board with the same
+    normalized title, the same ``idempotency_key``, or — for alert titles — the
+    same PR number and check name is returned with ``deduped=True`` instead of
+    inserting; a new body that adds text lands on it as one comment.
     ``project_source_task_id``: cross-profile fallback when ``project_id`` is not
     in the active profile's projects.db — see ``_resolve_project_link``.
     ``workspace_kind=None`` (omitted) inherits a project-scoped board's project;
@@ -1497,7 +1595,7 @@ def create_task(
             "ORDER BY created_at DESC LIMIT 1", (idempotency_key,),
         ).fetchone()
         if row:
-            return row["id"]
+            return CreatedTaskId(row["id"], deduped=True, dedupe_reason="idempotency_key")
 
     now = int(time.time())
 
@@ -1520,7 +1618,13 @@ def create_task(
                     if existing:
                         _fold_into_outcome_key(conn, existing, title=title, body=body,
                                                author=created_by, outcome_key=outcome_key, now=now)
-                        return CreatedTaskId(existing, deduped=True)
+                        return CreatedTaskId(existing, deduped=True, dedupe_reason="outcome_key")
+                if not allow_duplicate and _create_dedupe_enabled():
+                    dup = find_open_duplicate(conn, title, idempotency_key)
+                    if dup:
+                        _fold_duplicate_create(conn, dup[0], title=title, body=body,
+                                               author=created_by, reason=dup[1], now=now)
+                        return CreatedTaskId(dup[0], deduped=True, dedupe_reason=dup[1])
                 task_status, tenant = initial_task_state(conn, parents, initial_status, triage, tenant)
                 # Project worktree: fresh dir under the repo + deterministic
                 # branch, instead of the random ``wt/<id>`` worker fallback.
@@ -1606,7 +1710,7 @@ def create_task(
                     if existing:
                         _fold_into_outcome_key(conn, existing, title=title, body=body,
                                                author=created_by, outcome_key=outcome_key, now=now)
-                        return CreatedTaskId(existing, deduped=True)
+                        return CreatedTaskId(existing, deduped=True, dedupe_reason="outcome_key")
             if attempt == 1:
                 raise
     raise RuntimeError("unreachable")
