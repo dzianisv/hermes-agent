@@ -1876,6 +1876,9 @@ DEFAULT_CONFIG = {
         # kanban_create is called from a session with a persistent delivery channel. Disable for
         # profiles that prefer explicit kanban_notify-subscribe calls per task.
         "auto_subscribe_on_create": True,
+        # Change-request rounds before a reviewed card parks in triage for re-spec
+        # instead of respawning the implementer (0 disables).
+        "review_round_limit": 3,
         # Poll and deliver Kanban subscriptions from this gateway. Disable on profiles that do
         # not own notification subscriptions to avoid an idle five-second board probe.
         "notify_in_gateway": True,

@@ -348,6 +348,16 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 # Same-reason block -> unblock -> re-block cycles before routing to ``triage``.
 # Counts unblock recurrences, NOT dispatcher failures (``DEFAULT_FAILURE_LIMIT``).
 BLOCK_RECURRENCE_LIMIT = 2
+# Change-request rounds before a card parks in triage for re-spec
+# (config: kanban.review_round_limit; 0 disables).
+REVIEW_ROUND_LIMIT_DEFAULT = 3
+
+
+def review_round_limit() -> int:
+    try:
+        return max(0, int(_kanban_cfg().get("review_round_limit", REVIEW_ROUND_LIMIT_DEFAULT)))
+    except (TypeError, ValueError):
+        return REVIEW_ROUND_LIMIT_DEFAULT
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 
 
@@ -3972,6 +3982,18 @@ def request_changes(
         reviewer = _canonical_assignee(_nonblank_str(task_row["assignee"]))
 
         new_status = _landing_status_after_parents(conn, task_id)
+        # Review-loop budget: the Nth change request (N = review_round_limit)
+        # parks the card in triage for re-spec instead of respawning the
+        # implementer — live board showed cards bouncing 4-6 rounds on a
+        # brief that never named the proof.
+        prior_rounds = int(conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id = ? AND kind = 'changes_requested'",
+            (task_id,),
+        ).fetchone()[0])
+        rounds = prior_rounds + 1
+        round_limit = review_round_limit()
+        if round_limit and rounds >= round_limit:
+            new_status = "triage"
         # consecutive_failures deliberately PRESERVED: a review transition is
         # not evidence the pathology cleared; only complete_task resets it.
         # last_failure_error IS cleared: it is task-scoped text from an earlier
@@ -4004,9 +4026,16 @@ def request_changes(
                 "implementer": implementer,
                 "reviewer": reviewer,
                 "status": new_status,
+                "round": rounds,
             },
             run_id=run_id,
         )
+        if new_status == "triage":
+            _append_event(
+                conn, task_id, "review_loop_detected",
+                {"rounds": rounds, "limit": round_limit},
+                run_id=run_id,
+            )
     return True, implementer
 
 
