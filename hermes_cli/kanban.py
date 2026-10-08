@@ -211,7 +211,7 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "schedule", "unblock", "promote", "reopen-done", "archive", "dispatch", "daemon", "repair",
     "heartbeat", "notify-subscribe", "notify-unsubscribe", "specify", "decompose",
     "request-review", "request-changes", "reopen-review",
-    "gc", "step",
+    "gc", "step", "stage",
 })
 
 _DELEGATED_CHILD_DENIED_BOARD_ACTIONS: frozenset[str] = frozenset({
@@ -608,6 +608,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
             if _meta.get("resumed_from_session"):
                 print(f"        ↻ resumed session {_meta['resumed_from_session']} "
                       f"(after {_meta.get('resume_outcome') or '?'} run #{_meta.get('resume_of_run') or '?'})")
+            if _meta.get("progress_note"):
+                print(f"        … progress: {str(_meta['progress_note']).splitlines()[0][:160]}")
             if r.error:
                 print(f"        ! {r.error.splitlines()[0][:160]}")
     return 0
@@ -803,8 +805,13 @@ def _cmd_comment(args: argparse.Namespace) -> int:
             body = body[: max(0, args.max_len - len(suffix))].rstrip() + suffix
     author = args.author or _profile_author()
     with kbc.connect_closing() as conn:
-        kb.add_comment(conn, args.task_id, author, body)
-    print(f"Comment added to {args.task_id}")
+        cid = kb.add_comment(conn, args.task_id, author, body)
+    if not cid:
+        kind = kb.classify_comment(body)[0]
+        print(f"Routed to {'stage field' if kind == 'stage' else 'event log'} on {args.task_id} "
+              "(status lines are not stored as comments)")
+    else:
+        print(f"Comment added to {args.task_id}")
     return 0
 
 
@@ -1043,6 +1050,22 @@ def _cmd_step(args: argparse.Namespace) -> int:
     else:
         print(f"Moved {args.task_id} to stage {res['to']} (from {res['from'] or '-'}): "
               f"assignee={res['assignee'] or '-'}, status={res['status']}")
+    return 0
+
+
+def _cmd_stage(args: argparse.Namespace) -> int:
+    """``hermes kanban stage <id> <name> [--note]`` — set current_step_key + event, no comment."""
+    note = getattr(args, "note", None)
+    with kbc.connect_closing() as conn:
+        try:
+            prev = kb.set_stage(conn, args.task_id, args.name, note=note, author=_profile_author())
+        except ValueError as exc:
+            return _err(f"kanban stage: {exc}")
+        cur = kb.get_task(conn, args.task_id).current_step_key
+    if getattr(args, "json", False):
+        _print_json({"task_id": args.task_id, "from": prev, "to": cur})
+    else:
+        print(f"{args.task_id}: stage {prev or '-'} -> {cur}")
     return 0
 
 
@@ -1482,7 +1505,7 @@ _HANDLERS = {
     "link": _cmd_link, "unlink": _cmd_unlink, "claim": _cmd_claim,
     "comment": _cmd_comment, "attach": _cmd_attach,
     "attachments": _cmd_attachments, "attach-rm": _cmd_attach_rm,
-    "complete": _cmd_complete, "edit": _cmd_edit, "step": _cmd_step, "stages": _cmd_stages, "set-workspace": _cmd_set_workspace,
+    "complete": _cmd_complete, "edit": _cmd_edit, "step": _cmd_step, "stage": _cmd_stage, "stages": _cmd_stages, "set-workspace": _cmd_set_workspace,
     "block": _cmd_block,
     "schedule": _cmd_schedule, "unblock": _cmd_unblock,
     "request-review": _cmd_request_review, "request-changes": _cmd_request_changes,

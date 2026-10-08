@@ -110,8 +110,8 @@ def move_to_stage(
     author: str = "user", keep_status: bool = False,
 ) -> dict:
     """Move ``task_id`` to stage ``key``: set the step key, hand off to the owner,
-    set the stage status, comment ``STAGE: <key>`` (+ note) and log a
-    ``stage_changed`` event. ``keep_status`` records stage+owner but leaves the
+    set the stage status and log a ``stage_changed`` event (with the note;
+    no comment — stage is a field, not thread content). ``keep_status`` records stage+owner but leaves the
     status untouched (e.g. to stage a parked triage/scheduled card)."""
     from hermes_cli import kanban_db as kb
     from hermes_cli.kanban_db_connect import write_txn
@@ -145,11 +145,12 @@ def move_to_stage(
         payload = {"from": row["current_step_key"], "to": stage.key,
                    "assignee": owner, "from_assignee": row["assignee"],
                    "status": status, "from_status": row["status"]}
+        if note and note.strip():
+            payload["note"] = note.strip()
+        payload["author"] = author
         kb._append_event(conn, task_id, "stage_changed", payload)
         if owner != row["assignee"]:
             kb._append_event(conn, task_id, "assigned", {"assignee": owner, "from": row["assignee"]})
-        body = f"STAGE: {stage.key}" + (f"\n{note.strip()}" if note and note.strip() else "")
-        kb.add_comment(conn, task_id, author, body)
     if stage.status == "done" and not keep_status:
         if not kb.complete_task(conn, task_id, result=note or f"stage {stage.key}"):
             raise RuntimeError(f"stage {stage.key!r} recorded but {task_id} could not be completed "

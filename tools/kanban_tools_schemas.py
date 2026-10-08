@@ -300,8 +300,13 @@ KANBAN_HEARTBEAT_SCHEMA = _schema(
     {
         "task_id": _prop("string", _DESC_TASK_ID_DEFAULT),
         "note": _prop("string", (
-                "Optional short note describing current progress. "
-                "Shown in the event log."
+                "Optional short note describing current progress. Stored on "
+                "this run (latest note + short history) and shown to later "
+                "workers. Use this, not kanban_comment, for progress/status."
+        )),
+        "stage": _prop("string", (
+                "Optional current stage name (e.g. development, review, "
+                "merge). Sets the task's stage field; creates no comment."
         )),
     },
     [],
@@ -310,10 +315,12 @@ KANBAN_HEARTBEAT_SCHEMA = _schema(
 KANBAN_COMMENT_SCHEMA = _schema(
     "kanban_comment",
     (
-        "Append a comment to a task's thread. Use for durable notes "
-        "that should outlive this run (questions for the next worker, "
-        "partial findings, rationale). Ephemeral reasoning doesn't "
-        "belong here — use your normal response instead."
+        "Append a comment to a task's thread. Only for lasting content: "
+        "design, decisions, review findings, questions for the next "
+        "worker, final handoff. Progress and status do NOT go here — use "
+        "kanban_heartbeat(note=..., stage=...). Lines starting STAGE:, "
+        "SCHEDULED:, 'Specified —' or 'Unblocked' are routed to the stage "
+        "field / event log, and a repeat of the same body is not stored again."
     ),
     {
         "task_id": _prop("string", (

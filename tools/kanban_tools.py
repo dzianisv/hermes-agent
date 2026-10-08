@@ -965,6 +965,10 @@ def _handle_heartbeat(args: dict, **kw) -> str:
                 "conflict. Do not retry the heartbeat. A fresh dispatch will pick the "
                 "card up with up-to-date context.")
         _check(hb, f"could not heartbeat {tid} (unknown id — no such task on this board)")
+        stage = str(args.get("stage") or "").strip()
+        if stage:
+            kb.set_stage(conn, tid, stage, author=_persisted_identity())
+            return _ok(task_id=tid, stage=stage)
         return _ok(task_id=tid)
 
 
@@ -987,6 +991,12 @@ def _handle_comment(args: dict, **kw) -> str:
     author = _persisted_identity()
     with _board(args.get("board")) as (kb, conn):
         cid = kb.add_comment(conn, tid, author=author, body=str(body))
+        if not cid:
+            kind = kb.classify_comment(str(body))[0]
+            return _ok(task_id=tid, comment_id=None, routed=kind, note=(
+                "Not stored as a comment: stage/status lines go to the stage field "
+                "and event log. Use kanban_heartbeat(note=..., stage=...) for progress; "
+                "comments are for design, decisions, review findings and handoff."))
         return _ok(task_id=tid, comment_id=cid)
 
 

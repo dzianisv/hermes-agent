@@ -80,8 +80,9 @@ def test_step_reassigns_owner_and_status(kanban_home, capsys):
     out = _show(tid, capsys)
     t = out["task"]
     assert (t["current_step_key"], t["assignee"], t["status"]) == ("design", "architect-critic-fable", "ready")
-    assert any(c["body"] == "STAGE: design\nspec it" for c in out["comments"])
-    assert any(e["kind"] == "stage_changed" and e["payload"]["to"] == "design" for e in out["events"])
+    assert not any(c["body"].startswith("STAGE:") for c in out["comments"])
+    assert any(e["kind"] == "stage_changed" and e["payload"]["to"] == "design"
+               and e["payload"].get("note") == "spec it" for e in out["events"])
 
 
 def test_step_review_stage_uses_review_lane(kanban_home, capsys):

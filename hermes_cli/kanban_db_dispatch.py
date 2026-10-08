@@ -1307,6 +1307,31 @@ class HeartbeatResult:
         return self.kind == HEARTBEAT_UNKNOWN_TASK
 
 
+_PROGRESS_NOTE_MAX_CHARS = 500
+_PROGRESS_HISTORY_DEFAULT = 10
+
+
+def _record_progress_note(conn: sqlite3.Connection, run_id: int, note: str, now: int) -> None:
+    """Latest progress note + bounded history on the open run's metadata
+    (``kanban.progress_history_max``). Progress lives on the run, not in comments."""
+    try:
+        cap = int(_kb._kanban_cfg().get("progress_history_max", _PROGRESS_HISTORY_DEFAULT))
+    except (TypeError, ValueError):
+        cap = _PROGRESS_HISTORY_DEFAULT
+    cap = max(1, cap)
+    note = note[:_PROGRESS_NOTE_MAX_CHARS]
+    row = conn.execute("SELECT metadata FROM task_runs WHERE id = ? AND ended_at IS NULL",
+                       (int(run_id),)).fetchone()
+    if row is None:
+        return
+    meta = _kb._json_dict(row["metadata"])
+    hist = [h for h in (meta.get("progress_history") or []) if isinstance(h, dict)]
+    hist.append({"at": now, "note": note})
+    meta.update(progress_note=note, progress_at=now, progress_history=hist[-cap:])
+    conn.execute("UPDATE task_runs SET metadata = ? WHERE id = ?",
+                 (json.dumps(meta, ensure_ascii=False), int(run_id)))
+
+
 def heartbeat_worker(
     conn: sqlite3.Connection,
     task_id: str,
@@ -1345,6 +1370,8 @@ def heartbeat_worker(
         run_id = held if held is not None else _kb._current_run_id(conn, task_id)
         if run_id is not None:
             conn.execute("UPDATE task_runs SET last_heartbeat_at = ? WHERE id = ?", (now, run_id))
+            if note and str(note).strip():
+                _record_progress_note(conn, run_id, str(note).strip(), now)
         _kb._append_event(
             conn, task_id, "heartbeat",
             {"note": note} if note else None,

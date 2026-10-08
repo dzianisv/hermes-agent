@@ -69,10 +69,10 @@ def test_a_served_profiles_tick_authors_board_records_as_that_profile(board_env,
     root, tid = board_env
     monkeypatch.setenv("HERMES_PROFILE", "launch-host")  # the launch process's own pin
 
-    for name in ("alpha", "beta", "alpha"):
+    for i, name in enumerate(("alpha", "beta", "alpha")):
         token = set_hermes_home_override(root / "profiles" / name)
         try:
-            out = json.loads(kt._handle_comment({"task_id": tid, "body": f"from {name}"}))
+            out = json.loads(kt._handle_comment({"task_id": tid, "body": f"from {name} #{i}"}))
             assert out["ok"], out
             assert _last_comment_author(tid) == name
             child = json.loads(kt._handle_create(

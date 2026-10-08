@@ -350,12 +350,18 @@ _SPECS = [
         _TASK_ID,
         _arg("key", nargs="?", help="Stage key from kanban.stages"),
         _arg("--next", dest="next_stage", action="store_true", help="Advance to the next configured stage"),
-        _arg("--note", help="Note appended to the STAGE comment"),
+        _arg("--note", help="Note recorded on the stage_changed event"),
         _arg("--keep-status", action="store_true",
              help="Record stage + owner but leave the status unchanged (e.g. keep a parked card parked)"),
         _json_flag(),
     ], help="Move a task to a workflow stage: set current_step_key, hand off to the stage "
             "owner and set the stage status (kanban.stages)"),
+    _cmd("stage", [
+        _TASK_ID,
+        _arg("name", help="Stage name (free-form, e.g. development, review, merge)"),
+        _arg("--note", help="Short note recorded on the stage_set event"),
+        _json_flag(),
+    ], help="Set a task's current stage field (no comment, no handoff, no status change)"),
     _cmd("stages", [_json_flag()], help="List configured workflow stages (kanban.stages)"),
     _cmd("set-workspace", [
         _TASK_ID,

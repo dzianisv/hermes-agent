@@ -1950,16 +1950,116 @@ def task_graph_context(conn: sqlite3.Connection, task_id: str) -> dict:
 
 # --- Comments & events ---
 
+# Comments carry lasting content only (design, decisions, review findings,
+# handoff). Stage/status/progress lines are routed: ``STAGE:`` to
+# ``tasks.current_step_key`` (+ ``stage_set`` event), other status lines to a
+# ``status_note`` event. Lines with these markers are ALWAYS stored as comments.
+_KEEP_COMMENT_RE = re.compile(
+    r"^\s*(?:DESIGN:|SCOPE:|ACCEPTANCE:|PROOF:|R\d+:|EM DECISION|NEEDS-DESIGN|BLOCKER:|## Plan\b)",
+    re.MULTILINE,
+)
+_STAGE_LINE_RE = re.compile(r"^\s*stage\s*:\s*(.*)$", re.IGNORECASE)
+_STATUS_LINE_RE = re.compile(
+    r"^\s*(?:SCHEDULED:|Specified\s+[—-]|Unblock(?:ed)?\b|UNBLOCK:|Reopened from\b|"
+    r"STATUS:|PROGRESS:|Checkpoint\b)",
+    re.IGNORECASE,
+)
+_STAGE_KEY_MAX = 40
+
+
+def _kanban_cfg() -> dict:
+    try:
+        from hermes_cli.config import load_config_readonly
+        return (load_config_readonly() or {}).get("kanban", {}) or {}
+    except Exception:
+        return {}
+
+
+def classify_comment(body: Optional[str]) -> tuple[str, Optional[str], Optional[str]]:
+    """``(kind, stage, note)`` for a comment body. ``kind`` is ``comment``
+    (store), ``stage`` (stage update; ``stage`` is the key, ``note`` the rest)
+    or ``status`` (status-only line, kept as an event). Pure; no config."""
+    text = (body or "").strip()
+    if not text or _KEEP_COMMENT_RE.search(text):
+        return "comment", None, None
+    first, _, rest = text.partition("\n")
+    m = _STAGE_LINE_RE.match(first)
+    if m:
+        head = m.group(1).strip()
+        key_m = re.match(r"([^.(:;,\n]*)", head)
+        key = " ".join((key_m.group(1) if key_m else "").split()).lower()[:_STAGE_KEY_MAX].strip()
+        if key:
+            note = (head[len(key_m.group(1)):].lstrip(" .:;,") + ("\n" + rest if rest else "")).strip()
+            return "stage", key, note or None
+        return "status", None, text
+    if _STATUS_LINE_RE.match(first):
+        return "status", None, text
+    return "comment", None, None
+
+
+def set_stage(
+    conn: sqlite3.Connection, task_id: str, stage: str, *, note: Optional[str] = None,
+    author: Optional[str] = None,
+) -> Optional[str]:
+    """Write ``tasks.current_step_key`` + a ``stage_set`` event; no comment, no
+    handoff. Returns the previous stage. Free-form key (``kanban.stages`` not required)."""
+    key = " ".join((stage or "").split())[:_STAGE_KEY_MAX].strip()
+    if not key:
+        raise ValueError("stage name is required")
+    with write_txn(conn, allow_nested=True):
+        row = conn.execute("SELECT current_step_key FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if not row:
+            raise ValueError(f"unknown task {task_id}")
+        conn.execute("UPDATE tasks SET current_step_key = ? WHERE id = ?", (key, task_id))
+        payload: dict = {"from": row["current_step_key"], "to": key}
+        if author:
+            payload["author"] = author
+        if note and note.strip():
+            payload["note"] = note.strip()[:2000]
+        _append_event(conn, task_id, "stage_set", payload, run_id=_current_run_id(conn, task_id))
+    try:
+        notify_task_updated(conn, task_id, ("current_step_key",))
+    except Exception:
+        pass
+    return row["current_step_key"]
+
+
 def add_comment(conn: sqlite3.Connection, task_id: str, author: str, body: str) -> int:
+    """Store a comment; returns its id. With ``kanban.comment_routing`` (default
+    on) stage/status lines are routed (returns 0) and an identical body from the
+    same author within ``kanban.comment_dedupe_seconds`` returns the existing id."""
     if not body or not body.strip():
         raise ValueError("comment body is required")
     if not author or not author.strip():
         raise ValueError("comment author is required")
     now = int(time.time())
+    cfg = _kanban_cfg()
+    routing = cfg.get("comment_routing", True) is not False
+    try:
+        dedupe_s = int(cfg.get("comment_dedupe_seconds", 86400) or 0)
+    except (TypeError, ValueError):
+        dedupe_s = 86400
+    kind, stage, note = classify_comment(body) if routing else ("comment", None, None)
     # ``allow_nested=True``: graph builders (kanban_swarm blackboard seeding)
     # compose comment writes under one outer commit.
     with write_txn(conn, allow_nested=True):
         _require_task(conn, task_id)
+        if kind == "stage":
+            set_stage(conn, task_id, stage, note=note, author=author.strip())
+            return 0
+        if kind == "status":
+            _append_event(conn, task_id, "status_note",
+                          {"author": author.strip(), "note": body.strip()[:4000]},
+                          run_id=_current_run_id(conn, task_id))
+            return 0
+        if routing and dedupe_s > 0:
+            dup = conn.execute(
+                "SELECT id FROM task_comments WHERE task_id = ? AND author = ? AND body = ? "
+                "AND created_at >= ? ORDER BY id DESC LIMIT 1",
+                (task_id, author.strip(), body.strip(), now - dedupe_s),
+            ).fetchone()
+            if dup:
+                return int(dup["id"])
         cur = conn.execute(
             "INSERT INTO task_comments (task_id, author, body, created_at) "
             "VALUES (?, ?, ?, ?)", (task_id, author.strip(), body.strip(), now),
@@ -2175,7 +2275,8 @@ def _end_run(
 # resume record). Closing the run must not drop them: a crash/timeout/reclaim closes with
 # its own metadata, and the next dispatch reads these to resume the interrupted session.
 _LIVE_RUN_METADATA_KEYS = ("worker_session_id", "resumed_from_session", "resume_of_run",
-                           "resume_outcome", "resume_streak")
+                           "resume_outcome", "resume_streak",
+                           "progress_note", "progress_at", "progress_history")
 
 
 def _carry_live_run_metadata(
@@ -4490,6 +4591,8 @@ def _ctx_header(lines: list[str], task: Task) -> None:
     lines.append("")
     lines.append(f"Assignee: {task.assignee or '(unassigned)'}")
     lines.append(f"Status:   {task.status}")
+    if task.current_step_key:
+        lines.append(f"Stage:    {task.current_step_key}")
     if task.tenant:
         lines.append(f"Tenant:   {task.tenant}")
     lines.append(f"Workspace: {task.workspace_kind} @ {task.workspace_path or '(unresolved)'}")
@@ -4549,7 +4652,15 @@ def _ctx_prior_attempts(lines: list[str], conn: sqlite3.Connection, task_id: str
             lines.append(_ctx_cap(run.summary))
         if run.error and run.error.strip():
             lines.append(f"_error_: {_ctx_cap(run.error)}")
-        meta_line = _ctx_metadata_line(run.metadata)
+        meta = dict(run.metadata) if isinstance(run.metadata, dict) else run.metadata
+        if isinstance(meta, dict):
+            note = meta.pop("progress_note", None)
+            at = meta.pop("progress_at", None)
+            meta.pop("progress_history", None)
+            if note:
+                when = f" ({_ctx_stamp(int(at), now)})" if at else ""
+                lines.append(f"_latest progress_{when}: {_ctx_cap(str(note), 500)}")
+        meta_line = _ctx_metadata_line(meta)
         if meta_line:
             lines.append(meta_line)
         lines.append("")

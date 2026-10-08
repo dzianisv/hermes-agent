@@ -1937,6 +1937,16 @@ DEFAULT_CONFIG = {
         # (or --next) sets current_step_key, hands the task to `owner` and moves it to `status`
         # (ready = implementation lane, review = review lane, done completes). Empty = no stages.
         "stages": [],
+        # Comments hold lasting content only. True: comments whose first line is a stage/status
+        # line (STAGE:, SCHEDULED:, "Specified —", "Unblocked", ...) are routed to the stage
+        # field / a status_note event instead, and an identical body from the same author on the
+        # same task within comment_dedupe_seconds is not stored again. Comments with DESIGN:,
+        # SCOPE:, ACCEPTANCE:, PROOF:, R<n>:, EM DECISION, NEEDS-DESIGN or BLOCKER: lines are
+        # always stored.
+        "comment_routing": True,
+        "comment_dedupe_seconds": 86400,
+        # kanban_heartbeat(note=...) keeps the latest note plus this many recent notes on the run.
+        "progress_history_max": 10,
         # Per-home claim allowlist for boards shared across Hermes homes (#110995): profile names
         # this home's dispatcher may claim (list or comma-separated string). None = any existing
         # profile is claimable. Set = fail-closed (an empty list claims nothing). Every home has a
