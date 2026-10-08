@@ -72,3 +72,34 @@ def test_limit_zero_disables(kanban_home):
         _round(conn, tid)
         assert _round(conn, tid).status == "ready"
         assert not _events(conn, tid, "review_loop_detected")
+
+
+def _add_closed_run(conn, tid, seconds):
+    conn.execute(
+        "INSERT INTO task_runs (task_id, profile, status, outcome, started_at, ended_at) "
+        "VALUES (?, 'software-engineer', 'crashed', 'crashed', 1000, ?)", (tid, 1000 + seconds))
+    conn.commit()
+
+
+def test_claim_parks_card_past_24h_active_time(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="loops", assignee="software-engineer")
+        _add_closed_run(conn, tid, 86400)
+        assert kb.claim_task(conn, tid) is None
+        assert kb.get_task(conn, tid).status == "triage"
+        assert len(_events(conn, tid, "active_time_exceeded")) == 1
+
+
+def test_claim_under_24h_still_respawns(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="normal retry", assignee="software-engineer")
+        _add_closed_run(conn, tid, 86399)
+        assert kb.claim_task(conn, tid) is not None
+
+
+def test_active_limit_zero_disables(kanban_home):
+    (kanban_home / "config.yaml").write_text("kanban:\n  active_seconds_limit: 0\n")
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="x", assignee="software-engineer")
+        _add_closed_run(conn, tid, 10 * 86400)
+        assert kb.claim_task(conn, tid) is not None

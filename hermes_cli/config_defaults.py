@@ -1879,6 +1879,9 @@ DEFAULT_CONFIG = {
         # Change-request rounds before a reviewed card parks in triage for re-spec
         # instead of respawning the implementer (0 disables).
         "review_round_limit": 3,
+        # Summed run seconds before a card parks in triage instead of another
+        # spawn (0 disables).
+        "active_seconds_limit": 86400,
         # Poll and deliver Kanban subscriptions from this gateway. Disable on profiles that do
         # not own notification subscriptions to avoid an idle five-second board probe.
         "notify_in_gateway": True,

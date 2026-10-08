@@ -358,6 +358,18 @@ def review_round_limit() -> int:
         return max(0, int(_kanban_cfg().get("review_round_limit", REVIEW_ROUND_LIMIT_DEFAULT)))
     except (TypeError, ValueError):
         return REVIEW_ROUND_LIMIT_DEFAULT
+
+
+# Summed run time before a card parks in triage instead of respawning
+# (config: kanban.active_seconds_limit; 0 disables). 24h.
+ACTIVE_SECONDS_LIMIT_DEFAULT = 86400
+
+
+def active_seconds_limit() -> int:
+    try:
+        return max(0, int(_kanban_cfg().get("active_seconds_limit", ACTIVE_SECONDS_LIMIT_DEFAULT)))
+    except (TypeError, ValueError):
+        return ACTIVE_SECONDS_LIMIT_DEFAULT
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 
 
@@ -2727,6 +2739,27 @@ def claim_task(
             )
             _append_event(conn, task_id, "claim_rejected", {"reason": "parents_not_done"})
             return None
+        # Active-time budget: a card whose closed runs already sum past
+        # kanban.active_seconds_limit parks in triage for re-spec instead of
+        # another spawn (live board: 121 cards took 10+ runs, worst 108).
+        active_limit = active_seconds_limit()
+        if active_limit:
+            spent = int(conn.execute(
+                "SELECT COALESCE(SUM(ended_at - started_at), 0) FROM task_runs "
+                "WHERE task_id = ? AND ended_at IS NOT NULL AND started_at IS NOT NULL",
+                (task_id,),
+            ).fetchone()[0])
+            if spent >= active_limit:
+                parked = conn.execute(
+                    "UPDATE tasks SET status = 'triage' WHERE id = ? AND status = 'ready'",
+                    (task_id,),
+                )
+                if parked.rowcount == 1:
+                    _append_event(
+                        conn, task_id, "active_time_exceeded",
+                        {"active_seconds": spent, "limit": active_limit},
+                    )
+                return None
         # Close a leaked prior run so the CAS below doesn't strand it.
         _reclaim_dangling_run(
             conn, task_id, statuses=("ready",), now=now, note="invariant recovery on re-claim",
