@@ -4846,6 +4846,11 @@ def _start_gateway_housekeeping(
         # Restart-safe cron workers run outside the gateway cgroup and queue their final send for
         # whichever gateway is live; drained here (not the scheduler tick) so external providers get it too.
         chores.append((1, DRAIN_LABEL, lambda: _drain_restart_safe_cron_deliveries(adapters, loop, runner)))
+    if runner is not None and loop is not None:
+        # Goals parked on a wait barrier (judge `wait`, goal tool wait_on*) resume once the barrier
+        # lifts: the gateway has no CLI-style idle hook, so this tick is what wakes them.
+        from gateway.run_goal_wake import housekeeping_goal_barrier_wake
+        chores.append((1, "Goal barrier wake", lambda: housekeeping_goal_barrier_wake(runner, loop)))
     chores += [
         (5, "Channel directory refresh", lambda: adapters and _housekeeping_channel_directory(adapters, loop)),
         (60, "Media cache cleanup", _housekeeping_media_caches),

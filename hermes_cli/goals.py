@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import re
 import subprocess
@@ -55,6 +56,11 @@ _TRANSIENT_ALIASES = {"transient", "self_resolvable", "self-resolvable", "retrya
 # Hours a loop-parked goal (blocked / budget / judge failure — NOT an explicit /goal pause) keeps
 # the session's goal slot before a new agent declaration may replace it (``goals.parked_release_hours``).
 DEFAULT_PARKED_RELEASE_HOURS = 24.0
+# Longest a judge/tool wait barrier may park an AGENT-declared goal (``goals.max_wait_seconds``).
+# Muse semantics: waiting on CI / review / a background process / a subagent is itself a work item
+# (poll it, review the diff, prepare the next requirement), so an agent goal sleeps briefly and
+# wakes with a "check what you were waiting on" kick. User-typed goals keep the judge's full wait.
+DEFAULT_MAX_WAIT_SECONDS = 300
 _USER_PAUSED_REASON = "user-paused"
 # Cap on remembered waiting-on-user questions per goal (status line / tool view stay readable).
 _MAX_PENDING_HUMAN_DECISIONS = 8
@@ -72,6 +78,13 @@ CONTINUATION_PROMPT_HUMAN_PENDING_SUFFIX = (
 MUSE_CONTINUATION_PROMPT = (
     "Continue working toward the active goal, verify requirement by requirement.\n"
     "Goal: {goal}"
+)
+
+# Prepended to the continuation that resumes a goal after a wait barrier lifted (timer elapsed, pid
+# exited, watched session fired). Waiting on external work is a work item, not a stop: the agent
+# checks the thing it waited on and keeps going.
+WAIT_ELAPSED_CONTINUATION_PREFIX = (
+    "The wait has elapsed; check what you were waiting on and keep going.\n"
 )
 
 # Quality gates: deterministic shell commands that must pass before the judge may declare DONE. A
@@ -508,6 +521,9 @@ class GoalState:
     pending_human_decisions: List[str] = field(default_factory=list)
     # When the goal entered ``paused`` (0.0 = never / legacy row — ``last_turn_at`` is the fallback).
     paused_at: float = 0.0
+    # Set when ``is_waiting()`` lifted a barrier on its own (timer elapsed, pid exited, session
+    # fired); consumed by the next continuation prompt, which then opens with the wait-elapsed kick.
+    resumed_after_wait: bool = False
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False)
@@ -533,6 +549,7 @@ class GoalState:
             waiting_reason=data.get("waiting_reason"),
             contract=GoalContract.from_dict(data.get("contract")),
             source=str(data.get("source") or "user"),
+            resumed_after_wait=bool(data.get("resumed_after_wait") or False),
             linked_task_ids=[str(t).strip() for t in (data.get("linked_task_ids") or []) if str(t).strip()],
             gates=[
                 GoalGate.from_dict(g) for g in (data.get("gates") or [])
@@ -578,6 +595,7 @@ class GoalState:
         self.waiting_on_delegations = 0
         self.waiting_reason = None
         self.waiting_since = 0.0
+        self.resumed_after_wait = False
 
 
 # ── Persistence (SessionDB state_meta) ────────────────────────────────
@@ -860,6 +878,48 @@ def parked_release_hours() -> float:
     except Exception:
         pass
     return DEFAULT_PARKED_RELEASE_HOURS
+
+
+def max_wait_seconds() -> int:
+    """``goals.max_wait_seconds``: the cap on any wait barrier set on an AGENT-declared goal.
+    0 / negative / garbage → default (never "no cap")."""
+    try:
+        from hermes_cli.config import load_config
+
+        value = int((load_config().get("goals") or {}).get("max_wait_seconds", DEFAULT_MAX_WAIT_SECONDS))
+        if value > 0:
+            return value
+    except Exception:
+        pass
+    return DEFAULT_MAX_WAIT_SECONDS
+
+
+def list_parked_goals() -> List[Tuple[str, GoalState]]:
+    """``[(session_id, GoalState), ...]`` for every ACTIVE goal that carries a wait barrier (pid,
+    session or deadline); ``[]`` on any DB error. Used by the gateway's barrier-lift wake, which
+    scans on a coarse tick; whether the barrier still holds is ``GoalManager.is_waiting()``'s call."""
+    db = _get_session_db()
+    if db is None:
+        return []
+    out: List[Tuple[str, GoalState]] = []
+    try:
+        rows = db.list_meta_prefix("goal:")
+    except Exception as exc:
+        logger.debug("list_parked_goals: list_meta_prefix failed: %s", exc)
+        return []
+    for key, raw in rows:
+        session_id = key[len("goal:"):]
+        if not session_id or not raw:
+            continue
+        try:
+            state = GoalState.from_json(raw)
+        except Exception:
+            continue
+        if state.status == "active" and (
+            state.waiting_on_pid is not None or state.waiting_on_session is not None or state.waiting_until
+        ):
+            out.append((session_id, state))
+    return out
 
 
 def _archive_key(session_id: str, ts: Optional[float] = None) -> str:
@@ -1546,11 +1606,21 @@ class GoalManager:
     def _park(self, reason: str, **barrier) -> GoalState:
         state = self._require_active()
         state.clear_wait()
+        if state.source == "agent" and barrier.get("waiting_until"):
+            # Agent goal: a timed wait sleeps at most ``goals.max_wait_seconds`` — the wake then
+            # tells the agent to check what it waited on (poll, review) and keep going.
+            cap = time.time() + max_wait_seconds()
+            barrier["waiting_until"] = min(float(barrier["waiting_until"]), cap)
         for k, v in barrier.items():
             setattr(state, k, v)
         state.waiting_reason = (reason or "").strip() or None
         state.waiting_since = time.time()
         return self._save()
+
+    def _barrier_age_cap_s(self, state: GoalState) -> int:
+        """How long a pid/session barrier may hold before judging resumes regardless: the agent-goal
+        wait cap for agent goals, the generous stuck-poller cap for user goals."""
+        return max_wait_seconds() if state.source == "agent" else _MAX_BARRIER_WAIT_S
 
     def wait_on(self, pid: int, reason: str = "") -> GoalState:
         """Park the goal loop until a background PID exits (no turn burned, no judge call). For a
@@ -1615,12 +1685,17 @@ class GoalManager:
                     still = False
         else:
             return False
-        if still and s.waiting_since and s.waiting_until == 0.0 and time.time() - s.waiting_since > _MAX_BARRIER_WAIT_S:
+        age_cap = self._barrier_age_cap_s(s)
+        if still and s.waiting_since and s.waiting_until == 0.0 and time.time() - s.waiting_since > age_cap:
             logger.info("goal %s: wait barrier on %s exceeded %ds; resuming judging",
-                        self.session_id, s.waiting_on_session or s.waiting_on_pid, _MAX_BARRIER_WAIT_S)
+                        self.session_id, s.waiting_on_session or s.waiting_on_pid, age_cap)
             still = False
         if not still:
             self.stop_waiting()
+            # Lifted here (not by unwait/pause/resume): the next continuation opens with the
+            # "wait has elapsed" kick so the agent checks what it waited on instead of recapping.
+            s.resumed_after_wait = True
+            self._save()
         return still
 
     # --- the main entry point called after every turn -----------------
@@ -1653,8 +1728,9 @@ class GoalManager:
                 logger.info("goal judge: wait_on_pid %s is not alive on this host; continuing", pid)
                 return None
         else:
-            self.wait_for_seconds(int(wait_directive["seconds"]), reason=reason, on_delegations=active_delegations)
-            tgt = f"{wait_directive['seconds']}s"
+            parked_state = self.wait_for_seconds(int(wait_directive["seconds"]), reason=reason, on_delegations=active_delegations)
+            # Agent goals are capped (goals.max_wait_seconds): report the real sleep, not the ask.
+            tgt = f"{max(0, math.ceil(parked_state.waiting_until - time.time()))}s"
         return _decision("active", False, None, "wait", reason, f"⏳ Goal parked (judge) — waiting on {tgt}: {reason}")
 
     def _budget_pause(self, state: GoalState, verdict: str, reason: str, note: str = "") -> Dict[str, Any]:
@@ -1802,8 +1878,18 @@ class GoalManager:
         if s.source == "agent":
             # Muse semantics: the harness kick is a fixed sentence plus the contract/requirements
             # and any questions already owed by the user; completion is claimed through the tool.
-            return self._muse_kick_prompt(s)
-        return self._continuation_body(s)
+            body = self._muse_kick_prompt(s)
+        else:
+            body = self._continuation_body(s)
+        if body and s.resumed_after_wait:
+            # One-shot. Agent goals: the kick opens by pointing the agent at the thing it was
+            # waiting on (poll it, review it) instead of a generic recap. User goals keep their
+            # template verbatim (the gateway recognises queued continuations by its first line).
+            s.resumed_after_wait = False
+            self._save()
+            if s.source == "agent":
+                body = WAIT_ELAPSED_CONTINUATION_PREFIX + body
+        return body
 
     @staticmethod
     def _muse_kick_prompt(s: "GoalState") -> str:
