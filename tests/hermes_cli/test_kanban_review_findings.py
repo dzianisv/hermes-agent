@@ -148,8 +148,8 @@ def test_round2_brief_without_sha_says_so_and_falls_back(kanban_home):
 
 
 def test_rereview_model_config(monkeypatch):
-    monkeypatch.setattr(kb, "_kanban_cfg", lambda: {})
+    monkeypatch.setattr("hermes_cli.kanban_db._kanban_cfg", lambda: {})
     assert krb.rereview_model() == (None, None)
-    monkeypatch.setattr(kb, "_kanban_cfg",
+    monkeypatch.setattr("hermes_cli.kanban_db._kanban_cfg",
                         lambda: {"rereview_model": "gpt-5-mini", "rereview_provider": "openai"})
     assert krb.rereview_model() == ("gpt-5-mini", "openai")

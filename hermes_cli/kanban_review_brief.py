@@ -164,7 +164,7 @@ def _git_diff_since(workspace: Optional[str], sha: str) -> tuple[Optional[str], 
         return None, "no workspace to diff in"
     try:
         r = subprocess.run(["git", "-C", workspace, "diff", f"{sha}..HEAD"],
-                           capture_output=True, text=True, timeout=30)
+                           capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)
     except Exception as exc:
         return None, f"git diff failed: {type(exc).__name__}"
     if r.returncode != 0:

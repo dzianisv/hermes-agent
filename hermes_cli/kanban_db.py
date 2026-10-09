@@ -3986,7 +3986,7 @@ def _workspace_head(workspace: Optional[str]) -> Optional[str]:
         return None
     try:
         r = subprocess.run(["git", "-C", workspace, "rev-parse", "HEAD"],
-                           capture_output=True, text=True, timeout=10)
+                           capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10)
     except Exception:
         return None
     sha = (r.stdout or "").strip()
