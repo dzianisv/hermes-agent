@@ -1,0 +1,12 @@
+{
+ "object": "block",
+ "id": "3efac25e-b49f-81ef-a2cc-d436ac390ad6",
+ "type": "paragraph",
+ "has_children": false,
+ "archived": false,
+ "parent": {
+  "type": "page_id",
+  "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+ },
+ "paragraph": {}
+}

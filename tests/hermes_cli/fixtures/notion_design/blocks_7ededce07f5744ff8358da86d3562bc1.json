@@ -1,0 +1,19 @@
+{
+ "object": "block",
+ "id": "7ededce0-7f57-44ff-8358-da86d3562bc1",
+ "type": "heading_3",
+ "has_children": false,
+ "archived": false,
+ "in_trash": false,
+ "parent": {
+  "type": "page_id",
+  "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+ },
+ "heading_3": {
+  "rich_text": [
+   {
+    "plain_text": "16.1 v7.2.1 \u2014 corrected contract (applies astra F1-F5 in place; where \u00a716.1 differs from the \u00a716 text above, \u00a716.1 is binding; all file:line = #5447 head 4caf7b7c; the \u00a716 decisions D1, D2, D5, D6 and the queue/outbox model are NOT reopened)"
+   }
+  ]
+ }
+}

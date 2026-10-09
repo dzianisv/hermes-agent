@@ -1,0 +1,1318 @@
+{
+ "object": "list",
+ "results": [
+  {
+   "object": "block",
+   "id": "3efac25e-b49f-81ef-a2cc-d436ac390ad6",
+   "type": "paragraph",
+   "has_children": false,
+   "archived": false,
+   "parent": {
+    "type": "page_id",
+    "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+   },
+   "paragraph": {}
+  },
+  {
+   "object": "block",
+   "id": "3efac25e-b49f-81db-b581-eee95f1eb97c",
+   "type": "heading_2",
+   "has_children": false,
+   "archived": false,
+   "parent": {
+    "type": "page_id",
+    "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+   },
+   "heading_2": {
+    "rich_text": [
+     {
+      "plain_text": "1. The model in one paragraph"
+     }
+    ]
+   }
+  },
+  {
+   "object": "block",
+   "id": "3efac25e-b49f-81a5-abd4-e984b5831883",
+   "type": "paragraph",
+   "has_children": false,
+   "archived": false,
+   "parent": {
+    "type": "page_id",
+    "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+   },
+   "paragraph": {}
+  },
+  {
+   "object": "block",
+   "id": "3efac25e-b49f-8167-8e31-cec662bf1416",
+   "type": "heading_2",
+   "has_children": false,
+   "archived": false,
+   "parent": {
+    "type": "page_id",
+    "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+   },
+   "heading_2": {
+    "rich_text": [
+     {
+      "plain_text": "2. What main does today (measured; why each piece exists)"
+     }
+    ]
+   }
+  },
+  {
+   "object": "block",
+   "id": "3efac25e-b49f-81bf-a024-d06dcfb4e7be",
+   "type": "bulleted_list_item",
+   "has_children": false,
+   "archived": false,
+   "parent": {
+    "type": "page_id",
+    "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+   },
+   "bulleted_list_item": {}
+  },
+  {
+   "object": "block",
+   "id": "3efac25e-b49f-8112-9f4c-f09190cd8147",
+   "type": "bulleted_list_item",
+   "has_children": false,
+   "archived": false,
+   "parent": {
+    "type": "page_id",
+    "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+   },
+   "bulleted_list_item": {}
+  },
+  {
+   "object": "block",
+   "id": "3efac25e-b49f-8106-b828-c69dc4ae1d79",
+   "type": "bulleted_list_item",
+   "has_children": false,
+   "archived": false,
+   "parent": {
+    "type": "page_id",
+    "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+   },
+   "bulleted_list_item": {}
+  },
+  {
+   "object": "block",
+   "id": "3efac25e-b49f-8131-95a6-c91c184d3806",
+   "type": "bulleted_list_item",
+   "has_children": false,
+   "archived": false,
+   "parent": {
+    "type": "page_id",
+    "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+   },
+   "bulleted_list_item": {}
+  },
+  {
+   "object": "block",
+   "id": "3efac25e-b49f-814f-9182-e8e010edf1d2",
+   "type": "bulleted_list_item",
+   "has_children": false,
+   "archived": false,
+   "parent": {
+    "type": "page_id",
+    "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+   },
+   "bulleted_list_item": {}
+  },
+  {
+   "object": "block",
+   "id": "3efac25e-b49f-8189-bd1a-fbed4607abc3",
+   "type": "bulleted_list_item",
+   "has_children": false,
+   "archived": false,
+   "parent": {
+    "type": "page_id",
+    "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+   },
+   "bulleted_list_item": {}
+  },
+  {
+   "object": "block",
+   "id": "3efac25e-b49f-817e-9407-c14ebcbca81d",
+   "type": "bulleted_list_item",
+   "has_children": false,
+   "archived": false,
+   "parent": {
+    "type": "page_id",
+    "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+   },
+   "bulleted_list_item": {}
+  },
+  {
+   "object": "block",
+   "id": "3efac25e-b49f-816c-839b-edd2ad6bfa2a",
+   "type": "heading_2",
+   "has_children": false,
+   "archived": false,
+   "parent": {
+    "type": "page_id",
+    "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+   },
+   "heading_2": {
+    "rich_text": [
+     {
+      "plain_text": "3. Requirement (3): one state machine, one writer per transition"
+     }
+    ]
+   }
+  },
+  {
+   "object": "block",
+   "id": "3efac25e-b49f-81f1-9959-dd967885089a",
+   "type": "paragraph",
+   "has_children": false,
+   "archived": false,
+   "parent": {
+    "type": "page_id",
+    "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+   },
+   "paragraph": {}
+  },
+  {
+   "object": "block",
+   "id": "3efac25e-b49f-810d-a0fc-d333c08223e9",
+   "type": "paragraph",
+   "has_children": false,
+   "archived": false,
+   "parent": {
+    "type": "page_id",
+    "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+   },
+   "paragraph": {}
+  },
+  {
+   "object": "block",
+   "id": "3efac25e-b49f-8156-9ae0-ddadbe5175f2",
+   "type": "paragraph",
+   "has_children": false,
+   "archived": false,
+   "parent": {
+    "type": "page_id",
+    "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+   },
+   "paragraph": {}
+  },
+  {
+   "object": "block",
+   "id": "3efac25e-b49f-8193-ba6f-d059e1b7d600",
+   "type": "paragraph",
+   "has_children": false,
+   "archived": false,
+   "parent": {
+    "type": "page_id",
+    "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+   },
+   "paragraph": {}
+  },
+  {
+   "object": "block",
+   "id": "3efac25e-b49f-8104-81b9-d7f9df283cbd",
+   "type": "paragraph",
+   "has_children": false,
+   "archived": false,
+   "parent": {
+    "type": "page_id",
+    "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+   },
+   "paragraph": {}
+  },
+  {
+   "object": "block",
+   "id": "3efac25e-b49f-815f-bd4d-dcc9c5158fc0",
+   "type": "paragraph",
+   "has_children": false,
+   "archived": false,
+   "parent": {
+    "type": "page_id",
+    "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+   },
+   "paragraph": {}
+  },
+  {
+   "object": "block",
+   "id": "3efac25e-b49f-8130-8b2f-f19d154bc9d5",
+   "type": "paragraph",
+   "has_children": false,
+   "archived": false,
+   "parent": {
+    "type": "page_id",
+    "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+   },
+   "paragraph": {}
+  },
+  {
+   "object": "block",
+   "id": "3efac25e-b49f-8148-8597-fba32de29e48",
+   "type": "paragraph",
+   "has_children": false,
+   "archived": false,
+   "parent": {
+    "type": "page_id",
+    "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+   },
+   "paragraph": {}
+  },
+  {
+   "object": "block",
+   "id": "3efac25e-b49f-81cc-8e66-e000b8e52f63",
+   "type": "paragraph",
+   "has_children": false,
+   "archived": false,
+   "parent": {
+    "type": "page_id",
+    "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+   },
+   "paragraph": {}
+  },
+  {
+   "object": "block",
+   "id": "3efac25e-b49f-81f4-b203-f8be40294d47",
+   "type": "paragraph",
+   "has_children": false,
+   "archived": false,
+   "parent": {
+    "type": "page_id",
+    "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+   },
+   "paragraph": {}
+  },
+  {
+   "object": "block",
+   "id": "3efac25e-b49f-810f-8d09-fdfb0b7de70a",
+   "type": "heading_2",
+   "has_children": false,
+   "archived": false,
+   "parent": {
+    "type": "page_id",
+    "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+   },
+   "heading_2": {
+    "rich_text": [
+     {
+      "plain_text": "4. Requirement (2): one lease per tenant"
+     }
+    ]
+   }
+  },
+  {
+   "object": "block",
+   "id": "3efac25e-b49f-8188-81e1-f860cd79881d",
+   "type": "paragraph",
+   "has_children": false,
+   "archived": false,
+   "parent": {
+    "type": "page_id",
+    "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+   },
+   "paragraph": {}
+  },
+  {
+   "object": "block",
+   "id": "3efac25e-b49f-815d-b770-ce58cbde412d",
+   "type": "paragraph",
+   "has_children": false,
+   "archived": false,
+   "parent": {
+    "type": "page_id",
+    "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+   },
+   "paragraph": {}
+  },
+  {
+   "object": "block",
+   "id": "3efac25e-b49f-81b4-a5c2-c57fa04de38b",
+   "type": "paragraph",
+   "has_children": false,
+   "archived": false,
+   "parent": {
+    "type": "page_id",
+    "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+   },
+   "paragraph": {}
+  },
+  {
+   "object": "block",
+   "id": "3efac25e-b49f-812c-925c-f5e225e89212",
+   "type": "paragraph",
+   "has_children": false,
+   "archived": false,
+   "parent": {
+    "type": "page_id",
+    "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+   },
+   "paragraph": {}
+  },
+  {
+   "object": "block",
+   "id": "3efac25e-b49f-8163-8715-de1ff6f3491a",
+   "type": "paragraph",
+   "has_children": false,
+   "archived": false,
+   "parent": {
+    "type": "page_id",
+    "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+   },
+   "paragraph": {}
+  },
+  {
+   "object": "block",
+   "id": "3efac25e-b49f-8185-a64b-e6250524d880",
+   "type": "paragraph",
+   "has_children": false,
+   "archived": false,
+   "parent": {
+    "type": "page_id",
+    "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+   },
+   "paragraph": {}
+  },
+  {
+   "object": "block",
+   "id": "3efac25e-b49f-813f-bbac-c16e95b23230",
+   "type": "heading_2",
+   "has_children": false,
+   "archived": false,
+   "parent": {
+    "type": "page_id",
+    "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+   },
+   "heading_2": {
+    "rich_text": [
+     {
+      "plain_text": "5. Requirement (2) for remote effects, and requirement (1): the reconciler"
+     }
+    ]
+   }
+  },
+  {
+   "object": "block",
+   "id": "3efac25e-b49f-81a5-9a45-e456309f2070",
+   "type": "paragraph",
+   "has_children": false,
+   "archived": false,
+   "parent": {
+    "type": "page_id",
+    "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+   },
+   "paragraph": {}
+  },
+  {
+   "object": "block",
+   "id": "3efac25e-b49f-81cb-9957-f1f37d34cd7b",
+   "type": "paragraph",
+   "has_children": false,
+   "archived": false,
+   "parent": {
+    "type": "page_id",
+    "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+   },
+   "paragraph": {}
+  },
+  {
+   "object": "block",
+   "id": "3efac25e-b49f-8157-9b7e-c89994cb26ec",
+   "type": "bulleted_list_item",
+   "has_children": false,
+   "archived": false,
+   "parent": {
+    "type": "page_id",
+    "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+   },
+   "bulleted_list_item": {}
+  },
+  {
+   "object": "block",
+   "id": "3efac25e-b49f-81a2-a08e-e000df89fe4f",
+   "type": "bulleted_list_item",
+   "has_children": false,
+   "archived": false,
+   "parent": {
+    "type": "page_id",
+    "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+   },
+   "bulleted_list_item": {}
+  },
+  {
+   "object": "block",
+   "id": "3efac25e-b49f-81bd-8991-c0d6ac41e6c0",
+   "type": "bulleted_list_item",
+   "has_children": false,
+   "archived": false,
+   "parent": {
+    "type": "page_id",
+    "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+   },
+   "bulleted_list_item": {}
+  },
+  {
+   "object": "block",
+   "id": "3efac25e-b49f-81f6-8949-ef6a57b4ebf9",
+   "type": "bulleted_list_item",
+   "has_children": false,
+   "archived": false,
+   "parent": {
+    "type": "page_id",
+    "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+   },
+   "bulleted_list_item": {}
+  },
+  {
+   "object": "block",
+   "id": "3efac25e-b49f-818c-91f0-d0f536fad8bd",
+   "type": "bulleted_list_item",
+   "has_children": false,
+   "archived": false,
+   "parent": {
+    "type": "page_id",
+    "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+   },
+   "bulleted_list_item": {}
+  },
+  {
+   "object": "block",
+   "id": "3efac25e-b49f-81d5-8822-c87d84db7853",
+   "type": "paragraph",
+   "has_children": false,
+   "archived": false,
+   "parent": {
+    "type": "page_id",
+    "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+   },
+   "paragraph": {}
+  },
+  {
+   "object": "block",
+   "id": "3efac25e-b49f-8132-9038-f13f8ecd3637",
+   "type": "paragraph",
+   "has_children": false,
+   "archived": false,
+   "parent": {
+    "type": "page_id",
+    "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+   },
+   "paragraph": {}
+  },
+  {
+   "object": "block",
+   "id": "3efac25e-b49f-8124-a6aa-c32b4988db4f",
+   "type": "heading_2",
+   "has_children": false,
+   "archived": false,
+   "parent": {
+    "type": "page_id",
+    "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+   },
+   "heading_2": {
+    "rich_text": [
+     {
+      "plain_text": "6. One delete function, two modes (card item 2; astra F1/F3)"
+     }
+    ]
+   }
+  },
+  {
+   "object": "block",
+   "id": "3efac25e-b49f-818a-bf55-de83f94f4960",
+   "type": "paragraph",
+   "has_children": false,
+   "archived": false,
+   "parent": {
+    "type": "page_id",
+    "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+   },
+   "paragraph": {}
+  },
+  {
+   "object": "block",
+   "id": "3efac25e-b49f-81cc-bdec-c72fad87f41e",
+   "type": "paragraph",
+   "has_children": false,
+   "archived": false,
+   "parent": {
+    "type": "page_id",
+    "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+   },
+   "paragraph": {}
+  },
+  {
+   "object": "block",
+   "id": "3efac25e-b49f-8184-8c03-d17b1079faeb",
+   "type": "heading_2",
+   "has_children": false,
+   "archived": false,
+   "parent": {
+    "type": "page_id",
+    "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+   },
+   "heading_2": {
+    "rich_text": [
+     {
+      "plain_text": "7. Snapshot-before-delete gate (card item 4)"
+     }
+    ]
+   }
+  },
+  {
+   "object": "block",
+   "id": "3efac25e-b49f-8193-add1-d739fb0d56d1",
+   "type": "paragraph",
+   "has_children": false,
+   "archived": false,
+   "parent": {
+    "type": "page_id",
+    "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+   },
+   "paragraph": {}
+  },
+  {
+   "object": "block",
+   "id": "3efac25e-b49f-81f7-aca5-d910ec70edb0",
+   "type": "heading_2",
+   "has_children": false,
+   "archived": false,
+   "parent": {
+    "type": "page_id",
+    "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+   },
+   "heading_2": {
+    "rich_text": [
+     {
+      "plain_text": "8. Placement (card item 5)"
+     }
+    ]
+   }
+  },
+  {
+   "object": "block",
+   "id": "3efac25e-b49f-8183-84cc-e9def6621fa4",
+   "type": "paragraph",
+   "has_children": false,
+   "archived": false,
+   "parent": {
+    "type": "page_id",
+    "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+   },
+   "paragraph": {}
+  },
+  {
+   "object": "block",
+   "id": "3efac25e-b49f-8170-8e68-e54f5103d621",
+   "type": "heading_2",
+   "has_children": false,
+   "archived": false,
+   "parent": {
+    "type": "page_id",
+    "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+   },
+   "heading_2": {
+    "rich_text": [
+     {
+      "plain_text": "9. Tests (card item 6)"
+     }
+    ]
+   }
+  },
+  {
+   "object": "block",
+   "id": "3efac25e-b49f-814e-84c5-eda69ea52ef3",
+   "type": "paragraph",
+   "has_children": false,
+   "archived": false,
+   "parent": {
+    "type": "page_id",
+    "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+   },
+   "paragraph": {}
+  },
+  {
+   "object": "block",
+   "id": "3efac25e-b49f-8158-aba0-e7ea8b3bdf8f",
+   "type": "heading_2",
+   "has_children": false,
+   "archived": false,
+   "parent": {
+    "type": "page_id",
+    "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+   },
+   "heading_2": {
+    "rich_text": [
+     {
+      "plain_text": "10. Migration (card item 7; no hand DB writes)"
+     }
+    ]
+   }
+  },
+  {
+   "object": "block",
+   "id": "3efac25e-b49f-81a8-934f-fb20de9d7a6f",
+   "type": "paragraph",
+   "has_children": false,
+   "archived": false,
+   "parent": {
+    "type": "page_id",
+    "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+   },
+   "paragraph": {}
+  },
+  {
+   "object": "block",
+   "id": "3efac25e-b49f-8111-a58a-f0591127b67c",
+   "type": "heading_2",
+   "has_children": false,
+   "archived": false,
+   "parent": {
+    "type": "page_id",
+    "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+   },
+   "heading_2": {
+    "rich_text": [
+     {
+      "plain_text": "11. Closed PRs \u2014 kept / rejected"
+     }
+    ]
+   }
+  },
+  {
+   "object": "block",
+   "id": "3efac25e-b49f-8139-b25a-dca4a3db16f0",
+   "type": "paragraph",
+   "has_children": false,
+   "archived": false,
+   "parent": {
+    "type": "page_id",
+    "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+   },
+   "paragraph": {}
+  },
+  {
+   "object": "block",
+   "id": "3efac25e-b49f-81cb-b870-fe0801f4ee27",
+   "type": "heading_2",
+   "has_children": false,
+   "archived": false,
+   "parent": {
+    "type": "page_id",
+    "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+   },
+   "heading_2": {
+    "rich_text": [
+     {
+      "plain_text": "12. Implementation cards (3)"
+     }
+    ]
+   }
+  },
+  {
+   "object": "block",
+   "id": "3efac25e-b49f-81f2-bf92-d7caa3fa1234",
+   "type": "paragraph",
+   "has_children": false,
+   "archived": false,
+   "parent": {
+    "type": "page_id",
+    "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+   },
+   "paragraph": {}
+  },
+  {
+   "object": "block",
+   "id": "3efac25e-b49f-8149-b5de-c53a979113f0",
+   "type": "paragraph",
+   "has_children": false,
+   "archived": false,
+   "parent": {
+    "type": "page_id",
+    "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+   },
+   "paragraph": {}
+  },
+  {
+   "object": "block",
+   "id": "3efac25e-b49f-81c6-935b-f052afc52c2d",
+   "type": "paragraph",
+   "has_children": false,
+   "archived": false,
+   "parent": {
+    "type": "page_id",
+    "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+   },
+   "paragraph": {}
+  },
+  {
+   "object": "block",
+   "id": "3efac25e-b49f-81ef-95a1-f4811c930c70",
+   "type": "paragraph",
+   "has_children": false,
+   "archived": false,
+   "parent": {
+    "type": "page_id",
+    "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+   },
+   "paragraph": {}
+  },
+  {
+   "object": "block",
+   "id": "3efac25e-b49f-81a2-929c-d3952932829b",
+   "type": "heading_2",
+   "has_children": false,
+   "archived": false,
+   "parent": {
+    "type": "page_id",
+    "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+   },
+   "heading_2": {
+    "rich_text": [
+     {
+      "plain_text": "13. Open disagreement for the EM (one)"
+     }
+    ]
+   }
+  },
+  {
+   "object": "block",
+   "id": "3efac25e-b49f-811d-a43a-d050fea63838",
+   "type": "paragraph",
+   "has_children": false,
+   "archived": false,
+   "parent": {
+    "type": "page_id",
+    "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+   },
+   "paragraph": {}
+  },
+  {
+   "object": "block",
+   "id": "3efac25e-b49f-81be-800e-d55bcf8e6311",
+   "type": "heading_2",
+   "has_children": false,
+   "archived": false,
+   "parent": {
+    "type": "page_id",
+    "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+   },
+   "heading_2": {
+    "rich_text": [
+     {
+      "plain_text": "14. Changelog v6 -> v7"
+     }
+    ]
+   }
+  },
+  {
+   "object": "block",
+   "id": "3efac25e-b49f-81f1-98ca-d4c17c1ba6a1",
+   "type": "bulleted_list_item",
+   "has_children": false,
+   "archived": false,
+   "parent": {
+    "type": "page_id",
+    "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+   },
+   "bulleted_list_item": {}
+  },
+  {
+   "object": "block",
+   "id": "3efac25e-b49f-8192-9615-cbe68850bef6",
+   "type": "heading_2",
+   "has_children": false,
+   "archived": false,
+   "parent": {
+    "type": "page_id",
+    "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+   },
+   "heading_2": {
+    "rich_text": [
+     {
+      "plain_text": "15. Changelog v7 -> v7.1 (EM disposition 2026-10-04 on astra v7 F1-F3; edits in place, no new mechanism)"
+     }
+    ]
+   }
+  },
+  {
+   "object": "block",
+   "id": "3efac25e-b49f-81e2-8008-ff129a044b97",
+   "type": "bulleted_list_item",
+   "has_children": false,
+   "archived": false,
+   "parent": {
+    "type": "page_id",
+    "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+   },
+   "bulleted_list_item": {}
+  },
+  {
+   "object": "block",
+   "id": "3efac25e-b49f-81a6-a4e8-c87d9bf78658",
+   "type": "bulleted_list_item",
+   "has_children": false,
+   "archived": false,
+   "parent": {
+    "type": "page_id",
+    "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+   },
+   "bulleted_list_item": {}
+  },
+  {
+   "object": "block",
+   "id": "3efac25e-b49f-8161-b2ea-f160092609b8",
+   "type": "bulleted_list_item",
+   "has_children": false,
+   "archived": false,
+   "parent": {
+    "type": "page_id",
+    "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+   },
+   "bulleted_list_item": {}
+  },
+  {
+   "object": "block",
+   "id": "3efac25e-b49f-81f8-8a89-c04a6c839b7c",
+   "type": "bulleted_list_item",
+   "has_children": false,
+   "archived": false,
+   "parent": {
+    "type": "page_id",
+    "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+   },
+   "bulleted_list_item": {}
+  },
+  {
+   "object": "block",
+   "id": "db90b4da-bfb5-4581-873b-82e2a9e095f3",
+   "type": "heading_2",
+   "has_children": false,
+   "archived": false,
+   "parent": {
+    "type": "page_id",
+    "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+   },
+   "heading_2": {
+    "rich_text": [
+     {
+      "plain_text": "16. v7.2 \u2014 provision-failure notification contract (t_5598219a, EM 20:40; replaces the \"notification\" line of \u00a715; inputs: reviewer comment on #5447 head 4caf7b7c)"
+     }
+    ]
+   }
+  },
+  {
+   "object": "block",
+   "id": "370fed62-c2ee-4521-89ad-5295b6c18ba2",
+   "type": "paragraph",
+   "has_children": false,
+   "archived": false,
+   "parent": {
+    "type": "page_id",
+    "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+   },
+   "paragraph": {}
+  },
+  {
+   "object": "block",
+   "id": "52f78c25-8c30-4cd0-89fa-1e058992468a",
+   "type": "paragraph",
+   "has_children": false,
+   "archived": false,
+   "parent": {
+    "type": "page_id",
+    "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+   },
+   "paragraph": {}
+  },
+  {
+   "object": "block",
+   "id": "c53e27e4-7dac-4482-8fe9-9a0b5471630c",
+   "type": "paragraph",
+   "has_children": false,
+   "archived": false,
+   "parent": {
+    "type": "page_id",
+    "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+   },
+   "paragraph": {}
+  },
+  {
+   "object": "block",
+   "id": "666d9a9d-b0c4-474f-93d7-5097ac8411d8",
+   "type": "bulleted_list_item",
+   "has_children": false,
+   "archived": false,
+   "parent": {
+    "type": "page_id",
+    "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+   },
+   "bulleted_list_item": {}
+  },
+  {
+   "object": "block",
+   "id": "7fd4d662-9752-4a09-8364-e7a54093ed13",
+   "type": "bulleted_list_item",
+   "has_children": false,
+   "archived": false,
+   "parent": {
+    "type": "page_id",
+    "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+   },
+   "bulleted_list_item": {}
+  },
+  {
+   "object": "block",
+   "id": "8bc67240-b52e-4a34-ad4d-eb1b168a96fb",
+   "type": "bulleted_list_item",
+   "has_children": true,
+   "archived": false,
+   "parent": {
+    "type": "page_id",
+    "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+   },
+   "bulleted_list_item": {}
+  },
+  {
+   "object": "block",
+   "id": "8a5d66c6-6bab-45d9-9077-3926e08da104",
+   "type": "bulleted_list_item",
+   "has_children": false,
+   "archived": false,
+   "parent": {
+    "type": "page_id",
+    "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+   },
+   "bulleted_list_item": {}
+  },
+  {
+   "object": "block",
+   "id": "8a60994f-1fad-4f19-b672-bf306d3f9111",
+   "type": "bulleted_list_item",
+   "has_children": false,
+   "archived": false,
+   "parent": {
+    "type": "page_id",
+    "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+   },
+   "bulleted_list_item": {}
+  },
+  {
+   "object": "block",
+   "id": "c01310eb-0b2a-403d-97b2-28aa57b97c7a",
+   "type": "bulleted_list_item",
+   "has_children": false,
+   "archived": false,
+   "parent": {
+    "type": "page_id",
+    "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+   },
+   "bulleted_list_item": {}
+  },
+  {
+   "object": "block",
+   "id": "e2bb734c-a21b-4042-959d-be8b0fbaa48a",
+   "type": "paragraph",
+   "has_children": false,
+   "archived": false,
+   "parent": {
+    "type": "page_id",
+    "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+   },
+   "paragraph": {}
+  },
+  {
+   "object": "block",
+   "id": "678df88c-cb9b-41d2-9fed-77441c9efb01",
+   "type": "table",
+   "has_children": true,
+   "archived": false,
+   "parent": {
+    "type": "page_id",
+    "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+   },
+   "table": {}
+  },
+  {
+   "object": "block",
+   "id": "273773c4-1386-421e-a27e-ffe84c08d593",
+   "type": "paragraph",
+   "has_children": false,
+   "archived": false,
+   "parent": {
+    "type": "page_id",
+    "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+   },
+   "paragraph": {}
+  },
+  {
+   "object": "block",
+   "id": "7ededce0-7f57-44ff-8358-da86d3562bc1",
+   "type": "heading_3",
+   "has_children": false,
+   "archived": false,
+   "parent": {
+    "type": "page_id",
+    "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+   },
+   "heading_3": {
+    "rich_text": [
+     {
+      "plain_text": "16.1 v7.2.1 \u2014 corrected contract (applies astra F1-F5 in place; where \u00a716.1 differs from the \u00a716 text above, \u00a716.1 is binding; all file:line = #5447 head 4caf7b7c; the \u00a716 decisions D1, D2, D5, D6 and the queue/outbox model are NOT reopened)"
+     }
+    ]
+   }
+  },
+  {
+   "object": "block",
+   "id": "da38a7ff-3ca1-43b1-abea-c61d8ec5c5f1",
+   "type": "paragraph",
+   "has_children": false,
+   "archived": false,
+   "parent": {
+    "type": "page_id",
+    "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+   },
+   "paragraph": {}
+  },
+  {
+   "object": "block",
+   "id": "66f0754a-4dcd-4fff-8776-701a75668646",
+   "type": "bulleted_list_item",
+   "has_children": false,
+   "archived": false,
+   "parent": {
+    "type": "page_id",
+    "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+   },
+   "bulleted_list_item": {}
+  },
+  {
+   "object": "block",
+   "id": "a46203d3-76e9-4f86-a074-4a56d57211a4",
+   "type": "bulleted_list_item",
+   "has_children": false,
+   "archived": false,
+   "parent": {
+    "type": "page_id",
+    "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+   },
+   "bulleted_list_item": {}
+  },
+  {
+   "object": "block",
+   "id": "23268aa1-e9ab-4863-be0f-ba2c15328068",
+   "type": "bulleted_list_item",
+   "has_children": false,
+   "archived": false,
+   "parent": {
+    "type": "page_id",
+    "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+   },
+   "bulleted_list_item": {}
+  },
+  {
+   "object": "block",
+   "id": "4da5c4ab-ab30-496b-a9fb-921ac2142459",
+   "type": "bulleted_list_item",
+   "has_children": false,
+   "archived": false,
+   "parent": {
+    "type": "page_id",
+    "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+   },
+   "bulleted_list_item": {}
+  },
+  {
+   "object": "block",
+   "id": "22fcf1ee-e838-4922-a7a0-c2f663bcc785",
+   "type": "paragraph",
+   "has_children": false,
+   "archived": false,
+   "parent": {
+    "type": "page_id",
+    "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+   },
+   "paragraph": {}
+  },
+  {
+   "object": "block",
+   "id": "2b5d6abb-eeb8-4377-8db3-48bd0e7f05fc",
+   "type": "paragraph",
+   "has_children": false,
+   "archived": false,
+   "parent": {
+    "type": "page_id",
+    "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+   },
+   "paragraph": {}
+  },
+  {
+   "object": "block",
+   "id": "daa6aa1e-525a-4ae2-86b0-22c0dab807bb",
+   "type": "paragraph",
+   "has_children": false,
+   "archived": false,
+   "parent": {
+    "type": "page_id",
+    "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+   },
+   "paragraph": {}
+  },
+  {
+   "object": "block",
+   "id": "166fe770-6d83-4eec-bac1-b31e12b3a760",
+   "type": "bulleted_list_item",
+   "has_children": false,
+   "archived": false,
+   "parent": {
+    "type": "page_id",
+    "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+   },
+   "bulleted_list_item": {}
+  },
+  {
+   "object": "block",
+   "id": "60493025-2eab-4682-ad50-d83d2c1533de",
+   "type": "bulleted_list_item",
+   "has_children": false,
+   "archived": false,
+   "parent": {
+    "type": "page_id",
+    "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+   },
+   "bulleted_list_item": {}
+  },
+  {
+   "object": "block",
+   "id": "67b5c017-dc70-4c07-a36d-c74c57c61949",
+   "type": "bulleted_list_item",
+   "has_children": false,
+   "archived": false,
+   "parent": {
+    "type": "page_id",
+    "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+   },
+   "bulleted_list_item": {}
+  },
+  {
+   "object": "block",
+   "id": "54111c24-6497-4e5d-bc54-76a83bc456ed",
+   "type": "paragraph",
+   "has_children": false,
+   "archived": false,
+   "parent": {
+    "type": "page_id",
+    "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+   },
+   "paragraph": {}
+  },
+  {
+   "object": "block",
+   "id": "d26d8ac2-2bab-4797-a635-e21e67a4a4cc",
+   "type": "paragraph",
+   "has_children": false,
+   "archived": false,
+   "parent": {
+    "type": "page_id",
+    "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+   },
+   "paragraph": {}
+  },
+  {
+   "object": "block",
+   "id": "8f86e18a-68c2-410b-b8cb-ae59e498c56e",
+   "type": "bulleted_list_item",
+   "has_children": false,
+   "archived": false,
+   "parent": {
+    "type": "page_id",
+    "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+   },
+   "bulleted_list_item": {}
+  },
+  {
+   "object": "block",
+   "id": "482e04bb-8d38-4214-9255-76c5785ecda7",
+   "type": "bulleted_list_item",
+   "has_children": false,
+   "archived": false,
+   "parent": {
+    "type": "page_id",
+    "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+   },
+   "bulleted_list_item": {}
+  },
+  {
+   "object": "block",
+   "id": "06be88ff-a5f8-4ed1-a564-a8b3bac0d12e",
+   "type": "table",
+   "has_children": true,
+   "archived": false,
+   "parent": {
+    "type": "page_id",
+    "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+   },
+   "table": {}
+  },
+  {
+   "object": "block",
+   "id": "be181908-25a5-4f48-8221-62e48279c80a",
+   "type": "paragraph",
+   "has_children": false,
+   "archived": false,
+   "parent": {
+    "type": "page_id",
+    "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+   },
+   "paragraph": {}
+  },
+  {
+   "object": "block",
+   "id": "b38e8c30-7581-442b-80d6-607ff9fb5815",
+   "type": "heading_3",
+   "has_children": false,
+   "archived": false,
+   "parent": {
+    "type": "page_id",
+    "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+   },
+   "heading_3": {
+    "rich_text": [
+     {
+      "plain_text": "Astra independent review of \u00a716 \u2014 required edits"
+     }
+    ]
+   }
+  },
+  {
+   "object": "block",
+   "id": "5d96fb0f-8fb9-47e0-b8aa-385ec63a6680",
+   "type": "paragraph",
+   "has_children": false,
+   "archived": false,
+   "parent": {
+    "type": "page_id",
+    "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+   },
+   "paragraph": {}
+  },
+  {
+   "object": "block",
+   "id": "6db0bb10-d9e3-4dfc-b5a3-f07f15da51ea",
+   "type": "paragraph",
+   "has_children": false,
+   "archived": false,
+   "parent": {
+    "type": "page_id",
+    "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+   },
+   "paragraph": {}
+  }
+ ],
+ "next_cursor": "78fccac3-e747-43da-b38c-f8536fddc5ad",
+ "has_more": true,
+ "type": "block",
+ "block": {},
+ "request_id": "29a98387-77ab-41c1-a91e-69c287fad95e"
+}
