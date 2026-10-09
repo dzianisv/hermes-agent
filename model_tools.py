@@ -772,6 +772,16 @@ def _pre_dispatch_guards(function_name: str, function_args: Dict[str, Any], skip
     """
     # pre_tool_call fires exactly once per execution: one invoke_hook pass yields
     # both the block message and modified args. skip=True: caller already fired it.
+    # agent-cli-fence: built-in, config-gated; runs regardless of plugin hooks.
+    try:
+        from tools.agent_cli_fence import check as _agent_cli_fence_check
+        _fence_msg = _agent_cli_fence_check(function_name, function_args)
+    except Exception as _fence_err:
+        logger.debug("agent-cli-fence error: %s", _fence_err)
+        _fence_msg = None
+    if _fence_msg is not None:
+        return function_args, (tool_error(_fence_msg), "agent_cli_fence", _fence_msg)
+
     if not skip_pre_tool_call_hook:
         block_message: Optional[str] = None
         try:
