@@ -1260,7 +1260,11 @@ CREATE TABLE IF NOT EXISTS tasks (
     block_recurrences    INTEGER NOT NULL DEFAULT 0,
     -- Unix time a ``scheduled`` task auto-wakes (promote_due_scheduled);
     -- NULL = waits for a manual unblock. Cleared when it leaves ``scheduled``.
-    scheduled_wake_at    INTEGER
+    scheduled_wake_at    INTEGER,
+    -- External handle a scheduled card waits on (kanban_wait_on.py).
+    wait_on              TEXT,
+    wait_on_fingerprint  TEXT,
+    wait_on_checked_at   INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -2416,7 +2420,9 @@ def _end_run(
 # its own metadata, and the next dispatch reads these to resume the interrupted session.
 _LIVE_RUN_METADATA_KEYS = ("worker_session_id", "resumed_from_session", "resume_of_run",
                            "resume_outcome", "resume_streak",
-                           "progress_note", "progress_at", "progress_history")
+                           "progress_note", "progress_at", "progress_history",
+                           # workspace HEAD at spawn (kanban_wait_on no-progress rule)
+                           "head_start")
 
 
 def _carry_live_run_metadata(
@@ -4244,7 +4250,8 @@ def _resume_parked_task_locked(
     placeholders = ", ".join("?" for _ in statuses)
     cur = conn.execute(
         "UPDATE tasks SET status = ?, current_run_id = NULL, "
-        "consecutive_failures = 0, last_failure_error = NULL, scheduled_wake_at = NULL "
+        "consecutive_failures = 0, last_failure_error = NULL, scheduled_wake_at = NULL, "
+        "wait_on = NULL, wait_on_fingerprint = NULL, wait_on_checked_at = NULL "
         f"WHERE id = ? AND status IN ({placeholders})", (new_status, task_id, *statuses),
     )
     if cur.rowcount != 1:

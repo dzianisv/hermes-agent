@@ -851,6 +851,17 @@ def _handle_block(args: dict, **kw) -> str:
     reason = _redact(
         _require_text(args, "reason", "reason is required — explain what input you need"))
     kind = args.get("kind")
+    wait_on = (args.get("wait_on") or "").strip()
+    if wait_on:
+        from hermes_cli import kanban_wait_on as kwo
+        try:
+            kwo.parse_handle(wait_on)
+        except ValueError as exc:
+            return tool_error(str(exc))
+        with _board(args.get("board")) as (kb, conn):
+            ok = kwo.wait_on_task(conn, tid, wait_on, reason=reason, expected_run_id=_worker_run_id(tid))
+            _check(ok, f"could not park {tid} on {wait_on}")
+            return _ok_landed(kb, conn, tid, "scheduled", wait_on=wait_on)
     with _board(args.get("board")) as (kb, conn):
         _check(kind is None or kind in kb.VALID_BLOCK_KINDS,
                f"kind must be one of {sorted(kb.VALID_BLOCK_KINDS)} (or omit it)")

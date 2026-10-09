@@ -195,6 +195,12 @@ KANBAN_BLOCK_SCHEMA = _schema(
                 "The others surface to a human. Omit only if none apply."
             ),
         },
+        "wait_on": _prop("string", (
+            "Waiting on something external that will change by itself? Give its handle and the "
+            "card parks until it changes (no re-claim, no human): 'gh-run:<owner/repo>:<run_id>', "
+            "'pr:<owner/repo>#<n>[@<sha>]' or 'card:<task_id>'. Use this for red/pending CI "
+            "instead of blocking or completing; kind is ignored."
+        )),
     },
     ["reason"],
 )

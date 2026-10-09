@@ -3279,6 +3279,21 @@ def _dispatch_lane_task(
         if dp_reason is not None:
             result.respawn_guarded.append((task_id, dp_reason))
             return False
+    # No-progress rule: N runs in a row with no new commit, no status change and
+    # no new passing check send the card to the architect for re-spec instead
+    # of a third identical claim. The run caps (review_round_limit,
+    # active_seconds_limit) remain the backstop.
+    if not dry_run:
+        try:
+            from hermes_cli.kanban_wait_on import no_progress_guard
+            _ws = conn.execute("SELECT workspace_path FROM tasks WHERE id = ?", (task_id,)).fetchone()
+            np_reason = no_progress_guard(conn, task_id, assignee, _ws["workspace_path"] if _ws else None)
+        except Exception as exc:  # never break dispatch
+            _kb._log.warning("kanban dispatcher: no-progress guard failed for %s: %s", task_id, exc)
+            np_reason = None
+        if np_reason is not None:
+            result.respawn_guarded.append((task_id, np_reason))
+            return False
     guard_exemptions: list = []
     guard_reason = check_respawn_guard(conn, task_id, lane=lane, exempt_out=guard_exemptions)
     if guard_reason is not None:
@@ -3338,6 +3353,11 @@ def _dispatch_lane_task(
             result.auto_blocked.append(claimed.id)
         return False
     _kbw.set_workspace_path(conn, claimed.id, str(workspace))
+    try:
+        from hermes_cli.kanban_wait_on import default_head, record_run_head
+        record_run_head(conn, claimed.current_run_id, default_head(str(workspace)))
+    except Exception:
+        pass
     if claimed.workspace_kind == "worktree":
         _kbw.set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
     _kbw._maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
@@ -3433,6 +3453,13 @@ def _run_reclaim_phase(
     result.timed_out = enforce_max_runtime(conn)
     # Timed waits wake before ready-promotion so a woken card is dispatchable this tick.
     result.woken_scheduled = len(_kb.promote_due_scheduled(conn))
+    # Cards parked on a wait_on handle (CI run, PR, card) wake only when the
+    # handle's fingerprint changes; polls are rate-limited inside.
+    try:
+        from hermes_cli.kanban_wait_on import poll_wait_on
+        result.woken_scheduled += len(poll_wait_on(conn))
+    except Exception as exc:  # never break dispatch
+        _kb._log.warning("kanban dispatcher: wait_on poll failed: %s", exc)
     result.promoted = _kb.recompute_ready(conn, failure_limit=failure_limit)
 
 
