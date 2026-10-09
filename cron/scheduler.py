@@ -2223,6 +2223,17 @@ def _prepare_job_prompt(
                 "Script gate returned `wakeAgent=false` — agent skipped.\n"
             )
             return (True, silent_doc, SILENT_MARKER, None), None
+        from cron import facts_gate
+
+        if facts_gate.check(job, prerun_script, extra_prompt):
+            logger.info("Job '%s' (ID: %s): %s", job_name, job_id, facts_gate.SKIP_LOG)
+            skip_doc = (
+                f"# Cron Job: {job_name}\n\n"
+                f"**Job ID:** {job_id}\n"
+                f"**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                f"**Status:** silent ({facts_gate.SKIP_LOG})\n"
+            )
+            return (True, skip_doc, SILENT_MARKER, None), None
 
     try:
         prompt = _build_job_prompt(
@@ -3069,6 +3080,10 @@ def _finish_completed_run(d: _RunDelivery, fire_owner: Optional[str], execution_
     # A run that removed its own record has nothing left to mark; the delivery above is its result.
     marked = self_removal_delivery_allowed(job["id"]) or mark_job_run(
         job["id"], d.success, d.error, **mark_kwargs)
+    if marked and d.success and not d.delivery_error:
+        from cron import facts_gate
+
+        facts_gate.record_delivered(job)
     if fire_owner is not None and not marked:
         finish_execution(
             execution_id, success=False,
