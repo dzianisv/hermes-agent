@@ -3159,7 +3159,179 @@ def _design_phase_cfg() -> Optional[dict]:
         "required": list(cfg.get("required") or []),
         # Notion page ids that hold designs; empty = any Notion link (legacy).
         "design_pages": {str(p).replace("-", "").lower() for p in (cfg.get("design_pages") or [])},
+        # Verify the cited page + section heading exist via the Notion API at dispatch.
+        "verify_notion": bool(cfg.get("verify_notion", True)),
+        "notion_api_base": str(cfg.get("notion_api_base") or "https://api.notion.com").rstrip("/"),
+        "notion_token_env": str(cfg.get("notion_token_env") or "NOTION_TOKEN"),
+        "notion_env_file": str(cfg.get("notion_env_file") or "~/.env.d/notion.env"),
+        "notion_cache_seconds": int(cfg.get("notion_cache_seconds", 600)),
+        "notion_timeout": float(cfg.get("notion_timeout", 10)),
     }
+
+
+# (api_base, block_id) -> (fetched_at, value). Successful lookups only: a
+# transient Notion failure must be retried next tick, never remembered.
+_NOTION_CACHE: dict = {}
+_NOTION_HEADING_TYPES = ("heading_1", "heading_2", "heading_3", "heading_4")
+_NOTION_CONTAINER_TYPES = {"toggle", "column_list", "column", "callout", "synced_block", *_NOTION_HEADING_TYPES}
+
+
+class _NotionUnreachable(Exception):
+    pass
+
+
+def _notion_token(cfg: dict) -> Optional[str]:
+    tok = os.environ.get(cfg["notion_token_env"])
+    if tok:
+        return tok.strip()
+    try:
+        for line in Path(os.path.expanduser(cfg["notion_env_file"])).read_text().splitlines():
+            line = line.strip()
+            if line.startswith("export "):
+                line = line[7:]
+            k, _, v = line.partition("=")
+            if k.strip() == cfg["notion_token_env"] and v.strip():
+                return v.strip().strip("'\"")
+    except OSError:
+        pass
+    return None
+
+
+def _notion_get(cfg: dict, path: str) -> Optional[dict]:
+    """GET a Notion API path. ``None`` on 404 (does not exist / not shared);
+    raises :class:`_NotionUnreachable` on anything else."""
+    import urllib.error
+    import urllib.request
+    tok = _notion_token(cfg)
+    if not tok:
+        raise _NotionUnreachable(f"no {cfg['notion_token_env']} (env or {cfg['notion_env_file']})")
+    req = urllib.request.Request(
+        cfg["notion_api_base"] + path,
+        headers={"Authorization": f"Bearer {tok}", "Notion-Version": "2022-06-28"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=cfg["notion_timeout"]) as r:
+            return json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        if e.code in (400, 404):  # 400 = malformed / not-a-block id
+            return None
+        raise _NotionUnreachable(f"Notion HTTP {e.code} on {path}") from e
+    except Exception as e:
+        raise _NotionUnreachable(f"Notion unreachable on {path}: {e}") from e
+
+
+def _notion_cached(cfg: dict, key: str, fn):
+    k = (cfg["notion_api_base"], key)
+    hit = _NOTION_CACHE.get(k)
+    if hit is not None and time.time() - hit[0] < cfg["notion_cache_seconds"]:
+        return hit[1]
+    val = fn()
+    if val is not None:
+        _NOTION_CACHE[k] = (time.time(), val)
+    return val
+
+
+def _notion_block(cfg: dict, block_id: str) -> Optional[dict]:
+    def fetch():
+        b = _notion_get(cfg, f"/v1/blocks/{block_id}")
+        if b is None or b.get("archived") or b.get("in_trash"):
+            return None
+        return {"type": b.get("type"), "parent": b.get("parent") or {}}
+    return _notion_cached(cfg, "block:" + block_id, fetch)
+
+
+def _notion_headings(cfg: dict, page_id: str) -> list:
+    """Heading texts on a page (top level plus inside toggles/columns, depth 3)."""
+    def walk(bid: str, depth: int, out: list) -> None:
+        cursor = None
+        while True:
+            q = "?page_size=100" + (f"&start_cursor={cursor}" if cursor else "")
+            d = _notion_get(cfg, f"/v1/blocks/{bid}/children{q}")
+            if d is None:
+                return
+            for b in d.get("results") or []:
+                t = b.get("type")
+                if t in _NOTION_HEADING_TYPES:
+                    out.append("".join(x.get("plain_text", "") for x in (b.get(t) or {}).get("rich_text") or []))
+                if b.get("has_children") and t in _NOTION_CONTAINER_TYPES and depth < 3:
+                    walk(b["id"].replace("-", ""), depth + 1, out)
+            if not d.get("has_more"):
+                return
+            cursor = d.get("next_cursor")
+    return _notion_cached(cfg, "headings:" + page_id, lambda: (lambda o: (walk(page_id, 0, o), o)[1])([]))
+
+
+def _notion_block_on_page(cfg: dict, block_id: str, page_id: str) -> bool:
+    bid = block_id
+    for _ in range(8):
+        b = _notion_block(cfg, bid)
+        if b is None:
+            return False
+        par = b["parent"]
+        pid = str(par.get("page_id") or par.get("block_id") or "").replace("-", "").lower()
+        if not pid:
+            return False
+        if pid == page_id:
+            return True
+        bid = pid
+    return False
+
+
+def _section_matches(heading: str, sec: str) -> bool:
+    h = heading.strip().lstrip("§").strip()
+    if not h.startswith(sec):
+        return False
+    rest = h[len(sec):]
+    return not rest or not (rest[0].isdigit() or re.match(r"\.\d", rest))
+
+
+def _verify_design_line(cfg: dict, line: str) -> Optional[str]:
+    """``None`` when the DESIGN: line cites an existing Notion page AND an
+    existing section on it; else a human-readable failure. Raises
+    :class:`_NotionUnreachable` when Notion cannot be asked."""
+    ids = list(dict.fromkeys(re.findall(r"[0-9a-f]{32}", line.replace("-", "").lower())))
+    pages = [i for i in ids if not cfg["design_pages"] or i in cfg["design_pages"]]
+    if not pages:
+        return "DESIGN: names no configured design page"
+    page = pages[0]
+    if _notion_block(cfg, page) is None:
+        return f"design page {page} does not exist (or is not shared with the integration)"
+    blocks = [i for i in ids if i != page]
+    secs = re.findall(r"§\s*(\d+(?:\.\d+)*)", line)
+    if not blocks and not secs:
+        return "DESIGN: cites no section (add §N or a #block link to the section heading)"
+    for bid in blocks:
+        b = _notion_block(cfg, bid)
+        if b is None:
+            return f"cited section block {bid} does not exist"
+        if b["type"] not in _NOTION_HEADING_TYPES:
+            return f"cited block {bid} is a {b['type']}, not a section heading"
+        if not _notion_block_on_page(cfg, bid, page):
+            return f"cited section block {bid} is not on design page {page}"
+    if secs:
+        heads = _notion_headings(cfg, page)
+        for sec in secs:
+            if not any(_section_matches(h, sec) for h in heads):
+                return f"section §{sec} has no heading on design page {page}"
+    return None
+
+
+def _park_design_unverified(conn: sqlite3.Connection, task_id: str, cfg: dict, reason: str, why: str) -> None:
+    """Reassign to the architect and park in ``triage`` (human/architect lane;
+    never dispatched) with the reason as a comment and event."""
+    from hermes_cli.kanban_db_connect import write_txn
+    if cfg["architect"]:
+        _kb.assign_task(conn, task_id, cfg["architect"])
+    note = (f"BLOCKER:DEP architect — [design-phase] {why}. Parked in triage and assigned to "
+            f"{cfg['architect']}: fix the DESIGN: line to cite an existing design page and section "
+            "heading (e.g. `DESIGN: <page url> §16`), then move the card back to the implementer.")
+    _kb.add_comment(conn, task_id, "kanban-dispatcher", note)
+    with write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET status = 'triage', claim_lock = NULL, claim_expires = NULL "
+            "WHERE id = ? AND status IN ('todo', 'ready', 'blocked', 'scheduled')", (task_id,),
+        )
+        _kb._append_event(conn, task_id, "respawn_guarded", {"reason": reason, "detail": why})
 
 
 _POST_DESIGN_STAGES = frozenset({"review", "merge", "deploy", "verify", "acceptance"})
@@ -3225,6 +3397,31 @@ def _design_phase_guard(conn: sqlite3.Connection, task_id: str, assignee: str) -
                 ok = bool(ids) or bool(re.search(r"notion\.(so|com)/", v))
             if ok:
                 break
+        if ok and cfg["verify_notion"]:
+            # Naming a design page is not enough: t_5598219a-style cards cited any
+            # section. Resolve the cited page + section in Notion; unreachable
+            # Notion parks too (a gate that passes on error is no gate).
+            fails = []
+            reason = None
+            for v in re.findall(r"DESIGN:[ \t]*(.+)", text):
+                if "[design-phase]" in v:
+                    continue
+                try:
+                    why = _verify_design_line(cfg, v)
+                except _NotionUnreachable as exc:
+                    why, reason = f"could not verify DESIGN: in Notion ({exc})", "design_unverifiable"
+                if why is None:
+                    fails = []
+                    break
+                fails.append(why)
+            if fails:
+                reason = reason if len(fails) == 1 and reason else "design_section_missing"
+                try:
+                    _park_design_unverified(conn, task_id, cfg, reason, "; ".join(fails))
+                except Exception as exc:  # never break dispatch; still refuse the claim
+                    import logging as _lg
+                    _lg.getLogger(__name__).warning("design-phase park failed for %s: %s", task_id, exc)
+                return reason
     low = text.lower()
     missing = [r for r in cfg["required"] if r.lower() not in low]
     if ok and not missing:

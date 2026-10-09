@@ -1,0 +1,19 @@
+{
+ "object": "block",
+ "id": "db90b4da-bfb5-4581-873b-82e2a9e095f3",
+ "type": "heading_2",
+ "has_children": false,
+ "archived": false,
+ "in_trash": false,
+ "parent": {
+  "type": "page_id",
+  "page_id": "3eeac25e-b49f-814d-a4d1-d8fce929cbf4"
+ },
+ "heading_2": {
+  "rich_text": [
+   {
+    "plain_text": "16. v7.2 \u2014 provision-failure notification contract (t_5598219a, EM 20:40; replaces the \"notification\" line of \u00a715; inputs: reviewer comment on #5447 head 4caf7b7c)"
+   }
+  ]
+ }
+}
