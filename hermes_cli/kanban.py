@@ -986,6 +986,10 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                                  f"worker, `hermes kanban reclaim {tid}` to release it, or re-run with "
                                  f"--force to close its run and complete anyway.")
                 return False
+            except kb.ProofFailedError as proof_err:
+                fail_msg[tid] = (f"cannot complete {tid}: {proof_err}\nFix the work so the proof "
+                                 f"passes, then retry (the card is unchanged).")
+                return False
             except kb.EmptyCompletionError as empty_err:
                 fail_msg[tid] = (f"cannot complete {tid}: {empty_err}. Pass --result/--summary "
                                  f"describing what was done (an empty completion is not evidence).")

@@ -3189,6 +3189,54 @@ class EmptyCompletionError(ValueError):
         )
 
 
+class ProofFailedError(ValueError):
+    """``complete_task`` refused: the harness re-ran a ``PROOF-CMD:`` line from the
+    card body and it exited non-zero or timed out. ``.failed`` is the harness
+    record (command, exit_code, timed_out, output_tail). Nothing was mutated
+    except an auditable ``proof_run`` event."""
+
+    def __init__(self, task_id: str, failed: dict, proof_runs: list):
+        self.task_id, self.failed, self.proof_runs = task_id, failed, list(proof_runs)
+        super().__init__(
+            f"completion blocked: harness re-ran PROOF-CMD `{failed['command']}` and it exited "
+            f"{failed['exit_code']}{' (timed out)' if failed.get('timed_out') else ''}. "
+            f"Output tail:\n{(failed.get('output_tail') or '')[-800:]}"
+        )
+
+
+def _harness_proof_covered(metadata, cmds) -> bool:
+    """True when ``metadata.proof_run`` already holds passing harness records for every
+    command (the caller — e.g. the kanban_complete tool — just ran them)."""
+    runs = metadata.get("proof_run") if isinstance(metadata, dict) else None
+    if not isinstance(runs, list):
+        return False
+    ok = {r.get("command") for r in runs
+          if isinstance(r, dict) and r.get("runner") == "harness" and r.get("exit_code") == 0}
+    return all(c in ok for c in cmds)
+
+
+def _gate_proof_cmds(conn, task_id: str, metadata):
+    """Run the card's sync ``PROOF-CMD:`` lines (shared by every completion path:
+    CLI, tool, dashboard, stages). Returns metadata with ``proof_run`` recorded;
+    raises :class:`ProofFailedError` on non-zero exit / timeout."""
+    from hermes_cli import kanban_proof_contract as kpc
+    row = conn.execute("SELECT body, workspace_path, status FROM tasks WHERE id = ?",
+                       (task_id,)).fetchone()
+    if not row or row["status"] not in ("running", "ready", "blocked", "review"):
+        return metadata
+    cmds = [c for c, is_async in kpc.proof_cmds(row["body"]) if not is_async]
+    if not cmds or _harness_proof_covered(metadata, cmds):
+        return metadata
+    proof_runs, failed = kpc.run_sync_proofs(row["body"], row["workspace_path"])
+    with write_txn(conn):
+        _append_event(conn, task_id, "proof_run",
+                      {"proof_run": proof_runs, "passed": failed is None})
+    if failed:
+        raise ProofFailedError(task_id, failed, proof_runs)
+    base = metadata if isinstance(metadata, dict) else {}
+    return {**base, "proof_run": proof_runs}
+
+
 class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
@@ -3252,6 +3300,7 @@ def complete_task(
     from hermes_cli.kanban_pr_acceptance_store import prepare_acceptance, record_acceptance
     verified_cards = _gate_created_cards(conn, task_id, created_cards, summary or result)
     _gate_empty_completion(conn, task_id, result=result, summary=summary)
+    metadata = _gate_proof_cmds(conn, task_id, metadata)
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
