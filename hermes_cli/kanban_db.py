@@ -277,6 +277,17 @@ def check_outcome_key(outcome_key: Optional[str], board: Optional[str] = None) -
     return key
 
 
+def _open_task_for_idempotency_key(conn: sqlite3.Connection, key: str) -> Optional[str]:
+    """Id of the open (not done/archived) task holding ``key``; at most one
+    exists, enforced by the partial UNIQUE index uq_tasks_open_idempotency_key."""
+    row = conn.execute(
+        "SELECT id FROM tasks WHERE idempotency_key = ? AND status NOT IN (?, ?) "
+        "ORDER BY created_at ASC LIMIT 1",
+        (key, *OUTCOME_KEY_CLOSED_STATUSES),
+    ).fetchone()
+    return row["id"] if row else None
+
+
 def _open_task_for_outcome_key(
     conn: sqlite3.Connection, project_id: Optional[str], outcome_key: str,
 ) -> Optional[str]:
@@ -1610,16 +1621,12 @@ def create_task(
     # The connection's board is the real target; ``board`` is only a hint.
     outcome_key = check_outcome_key(outcome_key, board_for_conn(conn) or board)
 
-    # Idempotency check BEFORE the write txn (no lock held); a concurrent-create
-    # race may insert twice, the next lookup stabilises on the newest.
+    # Fast path only: the partial UNIQUE index uq_tasks_open_idempotency_key is
+    # the real guard; a racing insert lands in the IntegrityError handler below.
     if idempotency_key:
-        row = conn.execute(
-            "SELECT id FROM tasks WHERE idempotency_key = ? "
-            "AND status != 'archived' "
-            "ORDER BY created_at DESC LIMIT 1", (idempotency_key,),
-        ).fetchone()
-        if row:
-            return CreatedTaskId(row["id"], deduped=True, dedupe_reason="idempotency_key")
+        existing_idem = _open_task_for_idempotency_key(conn, idempotency_key)
+        if existing_idem:
+            return CreatedTaskId(existing_idem, deduped=True, dedupe_reason="idempotency_key")
 
     now = int(time.time())
 
@@ -1727,6 +1734,11 @@ def create_task(
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
             return CreatedTaskId(task_id)
         except sqlite3.IntegrityError:
+            # A concurrent create won the open idempotency_key slot: return it.
+            if idempotency_key and not conn.in_transaction:
+                existing_idem = _open_task_for_idempotency_key(conn, idempotency_key)
+                if existing_idem:
+                    return CreatedTaskId(existing_idem, deduped=True, dedupe_reason="idempotency_key")
             # A concurrent create won the (project, outcome_key) slot: fold into it.
             if outcome_key and not conn.in_transaction:
                 with write_txn(conn):

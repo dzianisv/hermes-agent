@@ -936,6 +936,27 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         f"WHERE outcome_key IS NOT NULL AND status NOT IN ({_closed_sql})"
     )
 
+    # One OPEN task per idempotency_key. Legacy boards may already hold open
+    # duplicates (the old SELECT-then-INSERT raced); never rewrite user data and
+    # never brick init over it -- warn and skip until they are closed.
+    idem_dupes = conn.execute(
+        "SELECT idempotency_key, GROUP_CONCAT(id, ', ') FROM tasks "
+        f"WHERE idempotency_key IS NOT NULL AND status NOT IN ({_closed_sql}) "
+        "GROUP BY 1 HAVING COUNT(*) > 1"
+    ).fetchall()
+    if idem_dupes:
+        import logging as _logging
+        _logging.getLogger(__name__).warning(
+            "kanban migration: uq_tasks_open_idempotency_key not created; open duplicates: %s",
+            "; ".join(f"{d[0]!r}: {d[1]}" for d in idem_dupes),
+        )
+    else:
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_tasks_open_idempotency_key "
+            "ON tasks(idempotency_key) "
+            f"WHERE idempotency_key IS NOT NULL AND status NOT IN ({_closed_sql})"
+        )
+
     # task_events.run_id back-fills as NULL for historical events (they predate
     # runs and can't be attributed).
     if "run_id" not in _column_names(conn, "task_events"):
