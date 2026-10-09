@@ -253,9 +253,20 @@ continuation prompts fire when the agent stops early (they remind it to close th
 `/goal status` shows the goal as `self-set`. Nothing is inferred behind the agent's back and there is
 no extra model call per turn — the goal is declared inside the turn, with full context.
 
-If the judge rules a self-set goal BLOCKED (you did the work yourself, scope moved on), it is parked,
-not paused-with-a-nag: `/goal resume` keeps it, or the agent declares a new one over it. A goal you
-typed with `/goal` still pauses and waits for you.
+A self-set goal follows Muse semantics: there is **no park-on-blocked**. It ends only through an
+audited `complete`, your `/goal pause` / `/goal clear`, or the turn-budget safety stop. When the judge
+rules it BLOCKED the loop fires the continuation `Continue working toward the active goal, verify
+requirement by requirement.` instead. If the blocker is `human_only` (a Touch ID prompt, a spend
+approval, a permission only you can grant) the exact question is appended to the goal's
+`pending_human_decisions` (deduplicated) and the kick adds `Step needing the human: <question> — record
+it as waiting-on-user in your status and keep working the other requirements`; `/goal status` and the
+status bar show `waiting on user: …`, and `goal get` returns the list. A goal you typed with `/goal`
+still pauses and waits for you on BLOCKED.
+
+A paused self-set goal (turn budget, or a row parked before this behaviour) releases the session's goal
+slot after `goals.parked_release_hours` (default 24): the agent's next `goal create` archives the old
+state under `goal_archive:<session>:<timestamp>` and takes over. A goal you paused yourself with
+`/goal pause`, or any `/goal`-typed goal, is never released this way.
 
 ### Choosing the judge model
 

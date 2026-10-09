@@ -44,14 +44,35 @@ DEFAULT_MAX_CONSECUTIVE_PARSE_FAILURES = 3
 # Consecutive transport failures (401, timeout, DNS) before auto-pause: a broken API key returns
 # 401 every call and must not spend every turn on an unreachable judge.
 DEFAULT_MAX_CONSECUTIVE_TRANSPORT_FAILURES = 5
-# Agent-declared goals: consecutive BLOCKED verdicts on a transient / self-resolvable blocker
-# (approval timeout, protected-file refusal, tool error, CI) that are answered with a "take a
-# different route" continuation before the goal is parked.
-DEFAULT_MAX_CONSECUTIVE_TRANSIENT_BLOCKS = 3
+# Agent-declared goals follow Muse semantics: the judge's BLOCKED never parks them. A transient
+# blocker gets a "take a different route" continuation; a human-only blocker is recorded as
+# waiting-on-user and the agent keeps working the other requirements. Only an audited `complete`,
+# a user /goal pause|clear, or the max_turns safety stop ends an active agent goal.
 BLOCKER_HUMAN_ONLY = "human_only"
 BLOCKER_TRANSIENT = "transient"
 _HUMAN_ONLY_ALIASES = {"human_only", "human-only", "human", "human_decision", "needs_human", "user_decision"}
 _TRANSIENT_ALIASES = {"transient", "self_resolvable", "self-resolvable", "retryable", "tool_error", "temporary"}
+# Hours a loop-parked goal (blocked / budget / judge failure — NOT an explicit /goal pause) keeps
+# the session's goal slot before a new agent declaration may replace it (``goals.parked_release_hours``).
+DEFAULT_PARKED_RELEASE_HOURS = 24.0
+_USER_PAUSED_REASON = "user-paused"
+# Cap on remembered waiting-on-user questions per goal (status line / tool view stay readable).
+_MAX_PENDING_HUMAN_DECISIONS = 8
+
+# Fed back when ONE step needs the human: record the question as waiting-on-user and keep moving
+# on the other requirements instead of stopping the goal.
+CONTINUATION_PROMPT_HUMAN_PENDING_SUFFIX = (
+    "\n\nStep needing the human: {question} — record it as waiting-on-user in your status and keep "
+    "working the other requirements. It is already listed in /goal status ({count} waiting on the "
+    "user); do not retry that step and do not ask again."
+)
+
+# Muse harness kick for agent-declared goals: fixed sentence, fired whenever a turn ends with the
+# goal still active (idle, stopped, blocked). The goal is never parked by the judge.
+MUSE_CONTINUATION_PROMPT = (
+    "Continue working toward the active goal, verify requirement by requirement.\n"
+    "Goal: {goal}"
+)
 
 # Quality gates: deterministic shell commands that must pass before the judge may declare DONE. A
 # failed gate short-circuits the judge — its output IS the continuation prompt, so the agent works
@@ -146,9 +167,11 @@ JUDGE_SYSTEM_PROMPT = (
     "classify it in ``blocker``:\n"
     "- \"human_only\" — only a human may decide: spending money, deleting or "
     "irreversibly changing customer/production data, granting credentials, "
-    "access or secrets, legal/contract commitments, or a genuine product "
-    "choice between options. Also give ``human_decision``: the exact "
-    "question the human must answer, phrased as one concrete question.\n"
+    "access or secrets, legal/contract commitments, a device-bound action "
+    "(Touch ID, hardware key), or a genuine product choice between options. "
+    "Also give ``human_decision``: the exact question the human must answer, "
+    "phrased as one concrete question. A human block on ONE step never stops "
+    "the rest of the goal — the agent keeps working the other requirements.\n"
     "- \"transient\" — the agent could get past it on its own: a tool-approval "
     "prompt timed out or was not answered, a write to a protected file was "
     "refused, a tool/command errored, CI or a deploy is still running, a "
@@ -480,6 +503,11 @@ class GoalState:
     # Kanban card ids this goal is about (goal tool ``link``). Board wakes for cards not tied to the
     # goal (here, or by id in the goal/contract/subgoal text) are held by the kanban-wake gate.
     linked_task_ids: List[str] = field(default_factory=list)
+    # Questions only the user can answer, recorded by a human_only BLOCKED verdict that still left
+    # other work open (the goal keeps running). Surfaced in the status line and the goal tool view.
+    pending_human_decisions: List[str] = field(default_factory=list)
+    # When the goal entered ``paused`` (0.0 = never / legacy row — ``last_turn_at`` is the fallback).
+    paused_at: float = 0.0
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False)
@@ -489,8 +517,10 @@ class GoalState:
         data = json.loads(raw)
         raw_subgoals = data.get("subgoals") or []
         ints = {k: int(data.get(k) or 0) for k in ("turns_used", "consecutive_parse_failures", "consecutive_transport_failures", "waiting_on_delegations", "consecutive_blocked")}
-        floats = {k: float(data.get(k) or 0.0) for k in ("created_at", "last_turn_at", "waiting_until", "waiting_since")}
+        floats = {k: float(data.get(k) or 0.0) for k in ("created_at", "last_turn_at", "waiting_until", "waiting_since", "paused_at")}
+        raw_pending = data.get("pending_human_decisions") or []
         return cls(
+            pending_human_decisions=[str(q).strip() for q in raw_pending if str(q).strip()] if isinstance(raw_pending, list) else [],
             goal=data.get("goal", ""),
             status=data.get("status", "active"),
             max_turns=int(data.get("max_turns") or DEFAULT_MAX_TURNS),
@@ -523,6 +553,23 @@ class GoalState:
         objective, contract or subgoals."""
         text = " ".join([self.goal or "", *self.subgoals, *(self.contract.to_dict().values() if self.contract else [])])
         return set(self.linked_task_ids) | set(re.findall(r"\bt_[0-9a-f]{6,}\b", text))
+
+    def parked_since(self) -> float:
+        """Epoch when this paused goal was parked; falls back to the last turn / creation for rows
+        written before ``paused_at`` existed. 0.0 when not paused."""
+        if self.status != "paused":
+            return 0.0
+        return self.paused_at or self.last_turn_at or self.created_at
+
+    def record_pending_human_decision(self, question: str) -> bool:
+        """Remember a question only the user can answer. Returns False when it is already recorded
+        (the judge repeats the same block every turn — never grows the list with duplicates)."""
+        question = (question or "").strip()
+        if not question or question in self.pending_human_decisions:
+            return False
+        self.pending_human_decisions.append(question)
+        del self.pending_human_decisions[:-_MAX_PENDING_HUMAN_DECISIONS]
+        return True
 
     def clear_wait(self) -> None:
         self.waiting_on_pid = None
@@ -799,6 +846,41 @@ def _goal_judge_setting(key: str, default, cast):
     except Exception:
         pass
     return default
+
+
+def parked_release_hours() -> float:
+    """``goals.parked_release_hours``: how long a loop-parked goal holds the slot before an agent
+    declaration may replace it. 0 / negative / garbage → default (never "release immediately")."""
+    try:
+        from hermes_cli.config import load_config
+
+        value = float((load_config().get("goals") or {}).get("parked_release_hours", DEFAULT_PARKED_RELEASE_HOURS))
+        if value > 0:
+            return value
+    except Exception:
+        pass
+    return DEFAULT_PARKED_RELEASE_HOURS
+
+
+def _archive_key(session_id: str, ts: Optional[float] = None) -> str:
+    return f"goal_archive:{session_id}:{int(ts or time.time())}"
+
+
+def archive_goal(session_id: str, state: GoalState) -> Optional[str]:
+    """Copy a goal row aside under ``goal_archive:<session>:<ts>`` before it is replaced, so a
+    released parked goal (and its pending human questions) is never lost. Returns the key."""
+    if not session_id or state is None:
+        return None
+    db = _get_session_db()
+    if db is None:
+        return None
+    key = _archive_key(session_id)
+    try:
+        db.set_meta(key, state.to_json())
+    except Exception as exc:
+        logger.debug("GoalManager: archive set_meta failed: %s", exc)
+        return None
+    return key
 
 
 def _goal_judge_max_tokens() -> int:
@@ -1178,18 +1260,20 @@ class GoalManager:
         src = ", self-set" if s.source == "agent" else ""
         meta = f"{turns}{sub}{con}{gat}{src}"
         if s.status == "active":
+            pend = f" — waiting on user: {'; '.join(s.pending_human_decisions)}" if s.pending_human_decisions else ""
             if s.waiting_on_session and _session_waiting(s.waiting_on_session):
-                return f"⏳ Goal (parked on {s.waiting_reason or f'session {s.waiting_on_session}'}, {meta}): {s.goal}"
+                return f"⏳ Goal (parked on {s.waiting_reason or f'session {s.waiting_on_session}'}, {meta}): {s.goal}{pend}"
             if s.waiting_on_pid and _pid_alive(s.waiting_on_pid):
-                return f"⏳ Goal (parked on {s.waiting_reason or f'pid {s.waiting_on_pid}'}, {meta}): {s.goal}"
+                return f"⏳ Goal (parked on {s.waiting_reason or f'pid {s.waiting_on_pid}'}, {meta}): {s.goal}{pend}"
             if s.waiting_until and time.time() < s.waiting_until:
                 remaining = int(s.waiting_until - time.time())
                 wr = s.waiting_reason or f"{remaining}s"
-                return f"⏳ Goal (parked {remaining}s — {wr}, {meta}): {s.goal}"
-            return f"⊙ Goal (active, {meta}): {s.goal}"
+                return f"⏳ Goal (parked {remaining}s — {wr}, {meta}): {s.goal}{pend}"
+            return f"⊙ Goal (active, {meta}): {s.goal}{pend}"
         if s.status == "paused":
             extra = f" — {s.paused_reason}" if s.paused_reason else ""
-            return f"⏸ Goal (paused, {meta}{extra}): {s.goal}"
+            pend = f" — waiting on user: {'; '.join(s.pending_human_decisions)}" if s.pending_human_decisions else ""
+            return f"⏸ Goal (paused, {meta}{extra}): {s.goal}{pend}"
         if s.status == "done":
             return f"✓ Goal done ({meta}): {s.goal}"
         return f"Goal ({s.status}, {meta}): {s.goal}"
@@ -1213,6 +1297,7 @@ class GoalManager:
     def _pause_state(self, reason: str) -> None:
         self._state.status = "paused"
         self._state.paused_reason = reason
+        self._state.paused_at = time.time()
         self._save()
 
     def _pause_decision(self, paused_reason: str, verdict: str, reason: str, message: str) -> Dict[str, Any]:
@@ -1233,18 +1318,43 @@ class GoalManager:
     def set_agent_goal(self, objective: str, *, contract: Optional[GoalContract] = None,
                        max_turns: Optional[int] = None) -> Optional[GoalState]:
         """Install a goal the agent declared on itself (``source="agent"``). Never overwrites an
-        active goal or any user-declared goal — the user always wins; returns None in that case."""
+        active goal or any user-declared goal — the user always wins; returns None in that case.
+        A parked agent goal it replaces is archived first (``goal_archive:<session>:<ts>``)."""
         if not self.accepts_agent_goal():
             return None
+        previous = self._state
+        if previous is not None and previous.status == "paused":
+            archive_goal(self.session_id, previous)
         state = self.set(objective, contract=contract, max_turns=max_turns)
         state.source = "agent"
         return self._save()
 
     def accepts_agent_goal(self) -> bool:
-        """No goal, or a parked (paused) agent goal, may be replaced by a new declaration; an active
-        goal or any user-set goal never is."""
+        """Whether a new agent declaration may take the slot: no goal, or an agent goal the LOOP
+        parked that has sat parked for at least ``goals.parked_release_hours`` (a goal the user
+        paused explicitly, an active goal, or any user-set goal is never replaced).
+
+        The window keeps a fresh park (the user is about to answer the question) from being papered
+        over by the next declaration, while making sure a block nobody answers cannot pin the
+        session's goal slot for weeks (#goal-park-no-stall)."""
         s = self._state
-        return not self.has_goal() or (s.source == "agent" and s.status == "paused")
+        if not self.has_goal():
+            return True
+        if s.source != "agent" or s.status != "paused":
+            return False
+        return self.parked_goal_releasable(s)
+
+    @staticmethod
+    def parked_goal_releasable(s: GoalState, *, now: Optional[float] = None) -> bool:
+        """True when a paused agent goal has been parked by the loop longer than the release window."""
+        if s.status != "paused" or s.source != "agent":
+            return False
+        if s.paused_reason == _USER_PAUSED_REASON:
+            return False
+        since = s.parked_since()
+        if not since:
+            return True   # no timestamp at all: nothing to measure, do not pin the slot
+        return ((now if now is not None else time.time()) - since) >= parked_release_hours() * 3600.0
 
     def link_tasks(self, task_ids) -> Optional[GoalState]:
         """Tie kanban card ids to the current goal (dedup, order kept). None without a goal."""
@@ -1268,6 +1378,7 @@ class GoalManager:
             return None
         self._state.status = "paused"
         self._state.paused_reason = reason
+        self._state.paused_at = time.time()
         self._state.clear_wait()   # a wait barrier is meaningless once paused
         return self._save()
 
@@ -1276,6 +1387,9 @@ class GoalManager:
             return None
         self._state.status = "active"
         self._state.paused_reason = None
+        self._state.paused_at = 0.0
+        # The user came back: whatever they were asked is answered or moot.
+        self._state.pending_human_decisions = []
         self._state.clear_wait()   # resuming starts fresh
         if reset_budget:
             self._state.turns_used = 0
@@ -1594,38 +1708,37 @@ class GoalManager:
             if parked is not None:
                 return parked
 
-        # BLOCKED is NOT done: pause so the user sees the judge's reason and can re-scope or override,
-        # instead of burning turns on an unachievable goal or waving it through as complete.
-        # BLOCKED verdict: the judge ruled the goal genuinely cannot be satisfied as stated (impossible, out
-        # of scope, needs user input). See #100954.
+        # BLOCKED is NOT done. For a USER goal: pause so the user sees the judge's reason and can
+        # re-scope or override (#100954). For an AGENT goal: never pause — see below.
         if verdict == "blocked":
-            # An agent-declared goal was never asked for by the user, so it must not nag them to
-            # re-scope. BLOCKED can mean a temporary blocker (approval, credentials) as well as
-            # obsolete work, so the goal is parked, not discarded: /goal resume keeps it, and the
-            # agent may declare a new goal over it.
+            # Muse semantics for agent-declared goals: there is NO park-on-blocked. An active agent
+            # goal ends only through an audited `complete`, a user /goal pause|clear, or the
+            # max_turns safety stop. BLOCKED is answered with the Muse continuation; a human-only
+            # step is recorded as waiting-on-user (visible in /goal status) and the agent keeps
+            # working the other requirements.
             if state.source == "agent":
                 info = wait_directive if isinstance(wait_directive, dict) and "blocker" in wait_directive else {}
                 category = info.get("blocker") or "unknown"
-                if category != BLOCKER_HUMAN_ONLY:
-                    state.consecutive_blocked += 1
-                    if (state.consecutive_blocked <= DEFAULT_MAX_CONSECUTIVE_TRANSIENT_BLOCKS
-                            and state.turns_used < state.max_turns):
-                        self._save()
-                        n = state.consecutive_blocked
-                        return _decision(
-                            "active", True, self._reroute_prompt(state, reason), "blocked_transient", reason,
-                            f"↻ Blocker looks self-resolvable ({category}, {n}/{DEFAULT_MAX_CONSECUTIVE_TRANSIENT_BLOCKS}) "
-                            f"— rerouting instead of parking: {reason}",
-                        )
-                    question = (f"The agent could not get past this after {state.consecutive_blocked - 1} "
-                                f"alternative attempt(s): {reason} — how should it proceed?")
-                else:
+                if state.turns_used >= state.max_turns:
+                    return self._budget_pause(state, "blocked", reason, note=" (last turn ended blocked)")
+                if category == BLOCKER_HUMAN_ONLY:
                     question = info.get("human_decision") or f"{reason} — approve or decide how to proceed?"
-                state.consecutive_blocked = 0
-                return self._pause_decision(
-                    f"agent goal parked ({category}): {reason}", "blocked", reason,
-                    f"⊙ Goal parked — human decision needed: {question} "
-                    "(answer, then /goal resume; the agent may set a new goal)",
+                    state.record_pending_human_decision(question)
+                    state.consecutive_blocked = 0
+                    self._save()
+                    n_pending = len(state.pending_human_decisions)
+                    return _decision(
+                        "active", True, self._human_pending_prompt(question, n_pending),
+                        "blocked_human_pending", reason,
+                        f"⊙ Step needs the human ({n_pending} waiting on you): {question} "
+                        f"— recorded; continuing on the other requirements: {reason}",
+                    )
+                state.consecutive_blocked += 1
+                self._save()
+                n = state.consecutive_blocked
+                return _decision(
+                    "active", True, self._reroute_prompt(state, reason), "blocked_transient", reason,
+                    f"↻ Blocked ({category}, {n} in a row) — rerouting, not parking: {reason}",
                 )
             return self._pause_decision(
                 f"judged unachievable: {reason}", "blocked", reason,
@@ -1665,29 +1778,45 @@ class GoalManager:
             f"↻ Continuing toward goal ({state.turns_used}/{state.max_turns}): {reason}",
         )
 
+    def _human_pending_prompt(self, question: str, count: int) -> str:
+        body = self.next_continuation_prompt() or ""
+        return body + CONTINUATION_PROMPT_HUMAN_PENDING_SUFFIX.format(question=question, count=count)
+
     def _reroute_prompt(self, state: "GoalState", reason: str) -> str:
         body = self.next_continuation_prompt() or ""
         return (
-            body + "\n\n[Blocker is self-resolvable — do NOT stop or ask the user to retry]\n"
-            f"Last turn ended blocked: {reason}\n"
+            body + "\n\n[Last turn ended blocked — do NOT stop or ask the user to retry]\n"
+            f"Blocker: {reason}\n"
             "Take a different route this turn, for example: put the change in a non-protected file "
             "(a skill, profile notes, or a new doc) instead of the protected one; re-request a timed-out "
             "approval once; retry a failed tool with a different command or tool; while CI runs, move to "
-            "the next unmet acceptance criterion. Only stop if the remaining step truly needs a human to "
-            "spend money, delete/alter customer data irreversibly, or grant credentials/access — and then "
-            "state the exact question."
+            "the next unmet requirement. If a step truly needs a human (spend money, delete/alter customer "
+            "data irreversibly, grant credentials/access, a device-bound action), state the exact question, "
+            "record it as waiting-on-user, and keep working the other requirements."
         )
 
     def next_continuation_prompt(self) -> Optional[str]:
         s = self._state
         if not s or s.status != "active":
             return None
-        prompt = self._continuation_body(s)
-        if prompt and s.source == "agent":
-            # Muse-style probe: an agent-declared goal is closed by the agent itself, through the
-            # tool, with evidence — not by announcing completion in prose.
-            prompt += AGENT_GOAL_CONTINUATION_SUFFIX
-        return prompt
+        if s.source == "agent":
+            # Muse semantics: the harness kick is a fixed sentence plus the contract/requirements
+            # and any questions already owed by the user; completion is claimed through the tool.
+            return self._muse_kick_prompt(s)
+        return self._continuation_body(s)
+
+    @staticmethod
+    def _muse_kick_prompt(s: "GoalState") -> str:
+        parts = [MUSE_CONTINUATION_PROMPT.format(goal=s.goal)]
+        block = s.contract.render_block() if s.has_contract() else ""
+        if s.subgoals:
+            block = f"{block}\n{_render_extra_criteria(s.subgoals)}" if block else s.render_subgoals_block()
+        if block:
+            parts.append(f"Requirements:\n{block}")
+        if s.pending_human_decisions:
+            parts.append("Waiting on the user (recorded — do not ask again, work around them):\n"
+                         + "\n".join(f"- {q}" for q in s.pending_human_decisions))
+        return "\n\n".join(parts) + AGENT_GOAL_CONTINUATION_SUFFIX
 
     @staticmethod
     def _continuation_body(s: "GoalState") -> Optional[str]:

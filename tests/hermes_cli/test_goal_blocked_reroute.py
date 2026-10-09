@@ -56,15 +56,15 @@ def test_approval_timeout_reroutes_instead_of_parking(goals_mod, monkeypatch):
     assert "human_only" in seen[0]  # judge prompt asks for the category
 
 
-def test_unknown_category_is_transient_within_budget_then_parks_with_question(goals_mod, monkeypatch):
+def test_repeated_blocked_verdicts_never_park_an_agent_goal(goals_mod, monkeypatch):
+    # Muse semantics: no park-on-blocked. Only complete / user pause|clear / max_turns end it.
     _judge(goals_mod, monkeypatch, {"verdict": "blocked", "reason": "tool error"}, [])
     mgr = _agent_goal(goals_mod)
-    for i in range(goals_mod.DEFAULT_MAX_CONSECUTIVE_TRANSIENT_BLOCKS):
+    for i in range(6):
         d = mgr.evaluate_after_turn(f"stuck {i}")
-        assert d["should_continue"] is True, d
-    d = mgr.evaluate_after_turn("stuck again")
-    assert d["status"] == "paused" and d["should_continue"] is False
-    assert "human decision needed" in d["message"] and "how should it proceed?" in d["message"]
+        assert d["should_continue"] is True and d["status"] == "active", d
+        assert "Continue working toward the active goal" in d["continuation_prompt"]
+    assert goals_mod.GoalManager(session_id="s1").state.status == "active"
 
 
 def test_progress_resets_blocked_budget(goals_mod, monkeypatch):
@@ -77,14 +77,17 @@ def test_progress_resets_blocked_budget(goals_mod, monkeypatch):
     assert mgr.state.consecutive_blocked == 0
 
 
-def test_human_only_parks_immediately_with_exact_question(goals_mod, monkeypatch):
+def test_human_only_records_the_question_and_keeps_going(goals_mod, monkeypatch):
     q = "Approve spending $240/month on a second GPU node?"
     _judge(goals_mod, monkeypatch, {"verdict": "blocked", "blocker": "human_only",
                                      "human_decision": q, "reason": "needs budget approval"}, [])
     mgr = _agent_goal(goals_mod)
     d = mgr.evaluate_after_turn("I need approval to buy a node")
-    assert d["status"] == "paused" and d["should_continue"] is False
+    assert d["status"] == "active" and d["should_continue"] is True
     assert q in d["message"]
+    assert "Continue working toward the active goal" in d["continuation_prompt"]
+    assert f"Step needing the human: {q}" in d["continuation_prompt"]
+    assert goals_mod.GoalManager(session_id="s1").state.pending_human_decisions == [q]
 
 
 def test_user_goal_blocked_still_pauses(goals_mod, monkeypatch):

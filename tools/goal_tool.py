@@ -113,6 +113,8 @@ def _state_view(mgr) -> Dict[str, Any]:
         view["contract"] = {k: getattr(c, k) for k in ("outcome", "verification", "stop_when") if getattr(c, k, None)}
     if s.linked_task_ids:
         view["linked_task_ids"] = list(s.linked_task_ids)
+    if s.pending_human_decisions:
+        view["pending_human_decisions"] = list(s.pending_human_decisions)
     return view
 
 
@@ -146,6 +148,11 @@ def goal_tool(action: str, *, objective: str = "", evidence: str = "", max_turns
         if not (_MIN_OBJECTIVE_CHARS <= len(objective) <= _MAX_OBJECTIVE_CHARS):
             return tool_error(f"objective must be {_MIN_OBJECTIVE_CHARS}–{_MAX_OBJECTIVE_CHARS} chars")
         if not mgr.accepts_agent_goal():
+            s = mgr.state
+            if s is not None and s.status == "paused" and s.source == "agent":
+                return tool_error("this session's goal is parked and still holds the slot; the user answers "
+                                  "its pending question and runs /goal resume, or it becomes replaceable after "
+                                  "goals.parked_release_hours", **_state_view(mgr))
             return tool_error("a goal is already set for this session; finish it with complete, "
                               "or the user clears it with /goal clear", **_state_view(mgr))
         contract = _build_contract(objective, acceptance_criteria, verification)

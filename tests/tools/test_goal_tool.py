@@ -1,5 +1,6 @@
 """goal tool: the agent declares, inspects and closes its own session goal through the registry."""
 import json
+import time
 
 import pytest
 
@@ -67,15 +68,28 @@ def test_complete_without_evidence_or_goal_errors():
     assert "error" in _call(action="complete", evidence="ok")
 
 
-def test_blocked_agent_goal_parks_not_nags(monkeypatch):
+def test_blocked_agent_goal_keeps_working_and_shows_the_question(monkeypatch):
     _call(action="create", objective="Tag v1.2.14 after the owner approves the release")
     monkeypatch.setattr(goals_mod, "judge_goal", lambda *a, **kw: ("blocked", "needs owner approval", False,
                         {"blocker": "human_only", "human_decision": "Approve tagging v1.2.14?"}, False))
     mgr = goals_mod.GoalManager(session_id="s1")
     d = mgr.evaluate_after_turn("Waiting on your approval to tag.")
-    assert d["status"] == "paused" and "Re-scope" not in d["message"]
-    assert "Approve tagging v1.2.14?" in d["message"]
-    # a parked self-set goal can be replaced by a new declaration
+    assert d["status"] == "active" and d["should_continue"] is True and "Re-scope" not in d["message"]
+    assert "Continue working toward the active goal" in d["continuation_prompt"]
+    # the tool's own view surfaces the pending question, and the slot stays held while active
+    view = _call(action="get")
+    assert view["pending_human_decisions"] == ["Approve tagging v1.2.14?"]
+    assert "error" in _call(action="create", objective="Verify the canary rollout of v1.2.14 is green")
+
+
+def test_legacy_parked_agent_goal_releases_the_slot_after_the_window():
+    _call(action="create", objective="Tag v1.2.14 after the owner approves the release")
+    s = goals_mod.load_goal("s1")
+    s.status, s.paused_reason, s.paused_at = "paused", "agent goal parked (human_only): legacy row", time.time()
+    goals_mod.save_goal("s1", s)
+    assert "error" in _call(action="create", objective="Verify the canary rollout of v1.2.14 is green")
+    s.paused_at -= 48 * 3600
+    goals_mod.save_goal("s1", s)
     assert _call(action="create", objective="Verify the canary rollout of v1.2.14 is green")["created"]
 
 
