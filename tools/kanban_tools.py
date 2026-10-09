@@ -757,6 +757,31 @@ def _handle_complete(args: dict, **kw) -> str:
         violation = proof_violation(task.body if task else None, raw_metadata)
         if violation:
             return tool_error(violation)
+        # Harness-run proof: PROOF-CMD lines are executed here, not trusted from the worker.
+        from hermes_cli import kanban_proof_contract as kpc
+        body = task.body if task else None
+        proof_runs, failed = kpc.run_sync_proofs(body, task.workspace_path if task else None)
+        if proof_runs:
+            kb._append_event(conn, tid, "proof_run", {"proof_run": proof_runs,
+                                                      "passed": failed is None},
+                             run_id=_worker_run_id(tid))
+            metadata = {**(metadata or {}), "proof_run": proof_runs}
+        if failed:
+            return tool_error(
+                f"kanban_complete refused: harness re-ran PROOF-CMD `{failed['command']}` and it "
+                f"exited {failed['exit_code']}{' (timed out)' if failed['timed_out'] else ''}. "
+                f"Output tail:\n{failed['output_tail'][-800:]}\nFix the work so the proof "
+                f"passes, then retry kanban_complete, or kanban_block with 'BLOCKER:EXTERNAL'. "
+                f"Your task is still in-flight (no state change).")
+        if any(a for _, a in kpc.proof_cmds(body)):
+            # Long/live proof: park in review (the verify state); rerun_pending_proofs completes it.
+            ok = kb.request_review(conn, tid, summary=summary, metadata=metadata,
+                                   expected_run_id=_worker_run_id(tid))
+            _check(ok, f"could not move {tid} to review for async proof verification")
+            kb._append_event(conn, tid, "proof_async_pending",
+                             {"commands": [c for c, a in kpc.proof_cmds(body) if a]})
+            return _ok(task_id=tid, status="review", proof_async_pending=True,
+                       proof_run=proof_runs)
         try:
             ok = kb.complete_task(
                 conn, tid, result=result, summary=summary, metadata=metadata,
@@ -1185,8 +1210,11 @@ def _handle_create(args: dict, **kw) -> str:
         landed = _fields(kb.get_task(conn, new_tid), _CREATED_FIELDS)
         wait = [e for e in kb.list_events(conn, new_tid) if e.kind == "dependency_wait"]
         gate = {"gated": True, "gated_by": wait[-1].payload["parent"]} if wait else {"gated": False}
+        from hermes_cli.kanban_proof_contract import missing_proof_warning
+        warn = missing_proof_warning(str(title), args.get("body"))
+        extra = {"warnings": [warn]} if warn else {}
         return _ok(task_id=new_tid, id=str(new_tid), created=True, **landed, **gate,
-                   subscribed=_maybe_auto_subscribe(conn, new_tid))
+                   subscribed=_maybe_auto_subscribe(conn, new_tid), **extra)
 
 
 def _resolve_notify_target() -> Optional[dict[str, Any]]:
