@@ -2718,6 +2718,25 @@ def configured_max_in_progress() -> Optional[int]:
     return mip
 
 
+def configured_board_max_in_progress(board: Optional[str]) -> Optional[int]:
+    """Per-board ``kanban.boards.<slug>.max_in_progress``, or None when unset.
+
+    ``board=None`` means the current board. None (or a read failure) falls
+    back to the global ``kanban.max_in_progress`` / ``max_spawn`` caps only.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+        from hermes_cli.kanban_dispatch_caps import positive_cap
+        slug = board or _kb.get_current_board()
+        kanban = (load_config_readonly() or {}).get("kanban", {})
+        boards = kanban.get("boards") if isinstance(kanban, dict) else None
+        entry = boards.get(slug) if isinstance(boards, dict) else None
+        raw = entry.get("max_in_progress") if isinstance(entry, dict) else None
+    except Exception:
+        return None
+    return positive_cap(raw)
+
+
 def configured_max_in_progress_per_profile() -> Optional[int]:
     """Board-level ``kanban.max_in_progress_per_profile``, or None when unset.
 
@@ -3491,14 +3510,23 @@ def _tick_spawn_budget(
     # board call (kanban_complete/kanban_block/kanban_request_review) or the TTL reclaims them.
     running_count = 0
     spawn_budget: Optional[int] = None
-    if max_spawn is not None or max_in_progress is not None:
+    board_cap = configured_board_max_in_progress(board)
+    if max_spawn is not None or max_in_progress is not None or board_cap is not None:
         running_count = count_running_tasks(conn)
+
+    # Per-board cap (``kanban.boards.<slug>.max_in_progress``): counts only
+    # this board's running cards. Unset -> only the global caps apply.
+    if board_cap is not None:
+        if running_count >= board_cap:
+            return False, None
+        spawn_budget = board_cap - running_count
 
     # Both ready and review loops consume from the same budget.
     if max_spawn is not None:
         if running_count >= max_spawn:
             return False, None
-        spawn_budget = max_spawn - running_count
+        if spawn_budget is None or spawn_budget > max_spawn - running_count:
+            spawn_budget = max_spawn - running_count
 
     if max_in_progress is not None:
         total_running = running_count + count_running_tasks_other_boards(board)
