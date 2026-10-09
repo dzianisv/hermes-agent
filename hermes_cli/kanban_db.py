@@ -3997,8 +3997,23 @@ def _nonblank_str(value: Any) -> Optional[str]:
     return value if isinstance(value, str) and value.strip() else None
 
 
+def _workspace_head(workspace: Optional[str]) -> Optional[str]:
+    """``git rev-parse HEAD`` in ``workspace``; None when unavailable."""
+    import subprocess
+    if not workspace or not os.path.isdir(workspace):
+        return None
+    try:
+        r = subprocess.run(["git", "-C", workspace, "rev-parse", "HEAD"],
+                           capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10)
+    except Exception:
+        return None
+    sha = (r.stdout or "").strip()
+    return sha if r.returncode == 0 and re.fullmatch(r"[0-9a-f]{7,64}", sha) else None
+
+
 def request_changes(
     conn: sqlite3.Connection, task_id: str, *, reason: str, expected_run_id: Optional[int] = None,
+    metadata: Optional[dict] = None,
 ) -> tuple[bool, Optional[str]]:
     """Close an active reviewer run (claimed from ``review``) and hand the task
     back to the implementer from the latest ``review_requested`` event, parent
@@ -4006,6 +4021,12 @@ def request_changes(
     reason = str(redact_review_value(reason or "")).strip()
     if not reason:
         return False, "reason is required"
+    # Record the head this round reviewed so round 2+ gets only the diff since it.
+    if not (isinstance(metadata, dict) and (metadata.get("reviewed_sha") or metadata.get("head_sha"))):
+        ws_row = conn.execute("SELECT workspace_path FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        head = _workspace_head(ws_row[0] if ws_row else None)
+        if head:
+            metadata = {**(metadata if isinstance(metadata, dict) else {}), "reviewed_sha": head}
 
     with write_txn(conn):
         task_row = conn.execute(
@@ -4031,6 +4052,15 @@ def request_changes(
         if implementer is None:
             return False, "review handoff has no valid implementer provenance"
         reviewer = _canonical_assignee(_nonblank_str(task_row["assignee"]))
+
+        # Every R/ACCEPTANCE line of the card needs a PASS/FAIL finding (#20).
+        from hermes_cli import kanban_review_brief as _krb
+        texts = [conn.execute("SELECT body FROM tasks WHERE id = ?", (task_id,)).fetchone()[0] or ""]
+        texts += [r[0] or "" for r in conn.execute(
+            "SELECT body FROM task_comments WHERE task_id = ? ORDER BY id", (task_id,))]
+        refusal = _krb.check_findings(texts, metadata)
+        if refusal:
+            return False, refusal
 
         new_status = _landing_status_after_parents(conn, task_id)
         # Review-loop budget: the Nth change request (N = review_round_limit)
@@ -4078,6 +4108,10 @@ def request_changes(
                 "reviewer": reviewer,
                 "status": new_status,
                 "round": rounds,
+                **({"findings": metadata["findings"]}
+                   if isinstance(metadata, dict) and isinstance(metadata.get("findings"), list) else {}),
+                **({"reviewed_sha": str(metadata.get("reviewed_sha") or metadata.get("head_sha")).strip()}
+                   if isinstance(metadata, dict) and (metadata.get("reviewed_sha") or metadata.get("head_sha")) else {}),
             },
             run_id=run_id,
         )

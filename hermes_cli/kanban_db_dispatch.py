@@ -3366,9 +3366,16 @@ def _dispatch_lane_task(
         # worker's system prompt via KANBAN_GUIDANCE.
         claimed.skills = list(dict.fromkeys([*(claimed.skills or []), "sdlc-review"]))
     _apply_worker_resume_plan(conn, claimed)
-    from hermes_cli.kanban_review_brief import build_review_brief, is_review_spawn
+    from hermes_cli.kanban_review_brief import (
+        build_review_brief, is_review_spawn, prior_review, rereview_model)
     if is_review_spawn(claimed, lane):
-        claimed.review_brief = build_review_brief(conn, claimed)
+        claimed.review_brief = build_review_brief(conn, claimed, workspace=str(workspace))
+        # Round 2+ reviews an incremental diff: optional cheaper model
+        # (kanban.rereview_model / kanban.rereview_provider). Per-task override wins.
+        if not claimed.model_override and prior_review(conn, claimed.id) is not None:
+            rr_model, rr_provider = rereview_model()
+            if rr_model:
+                claimed.model_override, claimed.provider_override = rr_model, rr_provider
     try:
         pid = _call_spawn_fn(spawn_fn if spawn_fn is not None else _default_spawn, claimed, str(workspace), board)
         if pid:
