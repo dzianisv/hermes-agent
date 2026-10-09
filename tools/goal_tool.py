@@ -50,7 +50,7 @@ GOAL_SCHEMA = {
     "parameters": {
         "type": "object",
         "properties": {
-            "action": {"type": "string", "enum": ["get", "create", "complete"]},
+            "action": {"type": "string", "enum": ["get", "create", "link", "complete"]},
             "objective": {
                 "type": "string",
                 "description": "For create: the outcome in one sentence, verifiable, 12–600 chars.",
@@ -69,6 +69,13 @@ GOAL_SCHEMA = {
             "evidence": {
                 "type": "string",
                 "description": "For complete: what proves the acceptance criteria are met (commands run, URLs, ids).",
+            },
+            "task_ids": {
+                "type": "array", "items": {"type": "string"},
+                "description": (
+                    "For create/link: kanban card ids (t_...) this goal is about. Board DONE wakes for "
+                    "cards not linked to the active goal are held until the next admitted wake."
+                ),
             },
             "max_turns": {
                 "type": "integer",
@@ -104,6 +111,8 @@ def _state_view(mgr) -> Dict[str, Any]:
     if s.has_contract():
         c = s.contract
         view["contract"] = {k: getattr(c, k) for k in ("outcome", "verification", "stop_when") if getattr(c, k, None)}
+    if s.linked_task_ids:
+        view["linked_task_ids"] = list(s.linked_task_ids)
     return view
 
 
@@ -124,7 +133,7 @@ def _build_contract(objective: str, acceptance_criteria: str, verification: str)
 
 def goal_tool(action: str, *, objective: str = "", evidence: str = "", max_turns: Optional[int] = None,
               acceptance_criteria: str = "", verification: str = "",
-              session_id: Optional[str] = None) -> str:
+              task_ids: Optional[list] = None, session_id: Optional[str] = None) -> str:
     mgr = _manager(session_id)
     if mgr is None:
         return tool_error("goal tool needs a session; none is bound to this call")
@@ -143,7 +152,16 @@ def goal_tool(action: str, *, objective: str = "", evidence: str = "", max_turns
         state = mgr.set_agent_goal(objective, contract=contract, max_turns=max_turns)
         if state is None:
             return tool_error("goal not set", **_state_view(mgr))
+        if task_ids:
+            mgr.link_tasks(task_ids)
         return _ok(created=True, **_state_view(mgr))
+
+    if action == "link":
+        if not task_ids:
+            return tool_error("link needs task_ids")
+        if mgr.link_tasks(task_ids) is None:
+            return tool_error("no goal to link cards to")
+        return _ok(linked=True, **_state_view(mgr))
 
     if action == "complete":
         if not mgr.has_goal():
@@ -172,6 +190,7 @@ registry.register(
     handler=lambda args, **kw: goal_tool(
         str(args.get("action") or ""), objective=args.get("objective") or "", evidence=args.get("evidence") or "",
         acceptance_criteria=args.get("acceptance_criteria") or "", verification=args.get("verification") or "",
-        max_turns=args.get("max_turns"), session_id=kw.get("session_id")),
+        max_turns=args.get("max_turns"),
+        task_ids=args.get("task_ids") if isinstance(args.get("task_ids"), list) else None, session_id=kw.get("session_id")),
     emoji="⊙",
 )

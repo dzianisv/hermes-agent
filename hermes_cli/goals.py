@@ -477,6 +477,9 @@ class GoalState:
     gates: List[GoalGate] = field(default_factory=list)
     # "user" (typed /goal) or "agent" (declared by the agent via the goal tool, goals.agent_tool).
     source: str = "user"
+    # Kanban card ids this goal is about (goal tool ``link``). Board wakes for cards not tied to the
+    # goal (here, or by id in the goal/contract/subgoal text) are held by the kanban-wake gate.
+    linked_task_ids: List[str] = field(default_factory=list)
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False)
@@ -500,6 +503,7 @@ class GoalState:
             waiting_reason=data.get("waiting_reason"),
             contract=GoalContract.from_dict(data.get("contract")),
             source=str(data.get("source") or "user"),
+            linked_task_ids=[str(t).strip() for t in (data.get("linked_task_ids") or []) if str(t).strip()],
             gates=[
                 GoalGate.from_dict(g) for g in (data.get("gates") or [])
                 if isinstance(g, dict) and str(g.get("command") or "").strip()
@@ -513,6 +517,12 @@ class GoalState:
     def render_subgoals_block(self) -> str:
         """Numbered ``- N. text`` block; empty when there are no subgoals."""
         return "\n".join(f"- {i}. {text}" for i, text in enumerate(self.subgoals, start=1))
+
+    def task_refs(self) -> set:
+        """Card ids this goal references: ``linked_task_ids`` plus any ``t_<hex>`` id named in the
+        objective, contract or subgoals."""
+        text = " ".join([self.goal or "", *self.subgoals, *(self.contract.to_dict().values() if self.contract else [])])
+        return set(self.linked_task_ids) | set(re.findall(r"\bt_[0-9a-f]{6,}\b", text))
 
     def clear_wait(self) -> None:
         self.waiting_on_pid = None
@@ -1235,6 +1245,16 @@ class GoalManager:
         goal or any user-set goal never is."""
         s = self._state
         return not self.has_goal() or (s.source == "agent" and s.status == "paused")
+
+    def link_tasks(self, task_ids) -> Optional[GoalState]:
+        """Tie kanban card ids to the current goal (dedup, order kept). None without a goal."""
+        if not self.has_goal():
+            return None
+        for t in task_ids or []:
+            t = str(t).strip()
+            if t and t not in self._state.linked_task_ids:
+                self._state.linked_task_ids.append(t)
+        return self._save()
 
     def set_contract(self, contract: GoalContract) -> Optional[GoalState]:
         """Attach or replace the completion contract on the active goal."""

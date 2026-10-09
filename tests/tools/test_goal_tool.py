@@ -117,3 +117,19 @@ def test_create_without_criteria_falls_back_to_drafted_contract(monkeypatch):
                         lambda objective, **kw: goals_mod.GoalContract(outcome="drafted outcome"))
     r = _call(action="create", objective="Ship the release notes page for v1.3")
     assert r["contract"]["outcome"] == "drafted outcome"
+
+
+def test_create_with_task_ids_and_link_action():
+    r = _call(action="create", objective="Ship the release once card t_aaaaaa lands", task_ids=["t_bbbbbb"])
+    assert r["linked_task_ids"] == ["t_bbbbbb"]
+    r = _call(action="link", task_ids=["t_cccccc", "t_bbbbbb"])
+    assert r["linked"] and r["linked_task_ids"] == ["t_bbbbbb", "t_cccccc"]
+    st = goals_mod.GoalManager(session_id="s1").state
+    assert st.task_refs() == {"t_aaaaaa", "t_bbbbbb", "t_cccccc"}
+    assert goals_mod.GoalState.from_json(st.to_json()).linked_task_ids == ["t_bbbbbb", "t_cccccc"]
+
+
+def test_link_without_goal_or_ids_errors():
+    assert "error" in _call(action="link", task_ids=["t_aaaaaa"])
+    _call(action="create", objective="Ship the release once the signup test passes")
+    assert "error" in _call(action="link")
