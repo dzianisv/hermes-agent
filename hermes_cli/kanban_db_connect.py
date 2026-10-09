@@ -842,6 +842,11 @@ _LATER_TASK_COLUMNS = (
     ("worker_started_at", "worker_started_at INTEGER"),
     # Auto-wake time for ``scheduled`` tasks; NULL keeps the manual-unblock contract.
     ("scheduled_wake_at", "scheduled_wake_at INTEGER"),
+    # External handle a ``scheduled`` card waits on (hermes_cli/kanban_wait_on.py),
+    # its fingerprint when parked and when it was last polled. NULL = no handle.
+    ("wait_on", "wait_on TEXT"),
+    ("wait_on_fingerprint", "wait_on_fingerprint TEXT"),
+    ("wait_on_checked_at", "wait_on_checked_at INTEGER"),
 )
 
 _NOTIFY_SUB_COLUMNS = (
