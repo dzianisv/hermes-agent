@@ -44,6 +44,14 @@ DEFAULT_MAX_CONSECUTIVE_PARSE_FAILURES = 3
 # Consecutive transport failures (401, timeout, DNS) before auto-pause: a broken API key returns
 # 401 every call and must not spend every turn on an unreachable judge.
 DEFAULT_MAX_CONSECUTIVE_TRANSPORT_FAILURES = 5
+# Agent-declared goals: consecutive BLOCKED verdicts on a transient / self-resolvable blocker
+# (approval timeout, protected-file refusal, tool error, CI) that are answered with a "take a
+# different route" continuation before the goal is parked.
+DEFAULT_MAX_CONSECUTIVE_TRANSIENT_BLOCKS = 3
+BLOCKER_HUMAN_ONLY = "human_only"
+BLOCKER_TRANSIENT = "transient"
+_HUMAN_ONLY_ALIASES = {"human_only", "human-only", "human", "human_decision", "needs_human", "user_decision"}
+_TRANSIENT_ALIASES = {"transient", "self_resolvable", "self-resolvable", "retryable", "tool_error", "temporary"}
 
 # Quality gates: deterministic shell commands that must pass before the judge may declare DONE. A
 # failed gate short-circuits the judge — its output IS the continuation prompt, so the agent works
@@ -134,7 +142,19 @@ JUDGE_SYSTEM_PROMPT = (
     "fabricate a deliverable that cannot exist, OR\n"
     "- The response explains progress is blocked and the next step needs "
     "user input to proceed.\n"
-    "Return BLOCKED with the reason describing what is blocking. BLOCKED is "
+    "Return BLOCKED with the reason describing what is blocking, and ALWAYS "
+    "classify it in ``blocker``:\n"
+    "- \"human_only\" — only a human may decide: spending money, deleting or "
+    "irreversibly changing customer/production data, granting credentials, "
+    "access or secrets, legal/contract commitments, or a genuine product "
+    "choice between options. Also give ``human_decision``: the exact "
+    "question the human must answer, phrased as one concrete question.\n"
+    "- \"transient\" — the agent could get past it on its own: a tool-approval "
+    "prompt timed out or was not answered, a write to a protected file was "
+    "refused, a tool/command errored, CI or a deploy is still running, a "
+    "rate limit, a flaky network call, or the agent merely stopped to ask "
+    "permission for something it may do itself.\n"
+    "BLOCKED is "
     "a refusal, not a completion — never return BLOCKED for a goal that "
     "was achieved.\n"
     "When the block is an error the agent hit (an HTTP status, an API, "
@@ -169,7 +189,8 @@ JUDGE_SYSTEM_PROMPT = (
     "take right now. This is the default when in doubt.\n\n"
     "Reply ONLY with a single JSON object on one line. Shapes:\n"
     '{"verdict": "done", "reason": "<one sentence>"}\n'
-    '{"verdict": "blocked", "reason": "<one sentence>"}\n'
+    '{"verdict": "blocked", "blocker": "transient", "reason": "<one sentence>"}\n'
+    '{"verdict": "blocked", "blocker": "human_only", "human_decision": "<exact question>", "reason": "<one sentence>"}\n'
     '{"verdict": "continue", "reason": "<one sentence>"}\n'
     '{"verdict": "wait", "wait_on_session": "<id>", "reason": "<one sentence>"}\n'
     '{"verdict": "wait", "wait_on_pid": <int>, "reason": "<one sentence>"}\n'
@@ -433,6 +454,8 @@ class GoalState:
     # Tracked separately from parse failures: a broken API key returns 401 every call and must
     # auto-pause instead of burning the budget on an unreachable judge.
     consecutive_transport_failures: int = 0   # judge API/transport errors in a row
+    # Agent goals: consecutive BLOCKED verdicts answered with a reroute continuation.
+    consecutive_blocked: int = 0
     # User-added criteria (/subgoal). Both the judge and continuation prompts include them.
     subgoals: List[str] = field(default_factory=list)
     # Wait barrier (judge ``wait`` verdict or ``/goal wait``): parks the loop instead of re-poking the
@@ -462,7 +485,7 @@ class GoalState:
     def from_json(cls, raw: str) -> "GoalState":
         data = json.loads(raw)
         raw_subgoals = data.get("subgoals") or []
-        ints = {k: int(data.get(k) or 0) for k in ("turns_used", "consecutive_parse_failures", "consecutive_transport_failures", "waiting_on_delegations")}
+        ints = {k: int(data.get(k) or 0) for k in ("turns_used", "consecutive_parse_failures", "consecutive_transport_failures", "waiting_on_delegations", "consecutive_blocked")}
         floats = {k: float(data.get(k) or 0.0) for k in ("created_at", "last_turn_at", "waiting_until", "waiting_since")}
         return cls(
             goal=data.get("goal", ""),
@@ -823,6 +846,10 @@ def _parse_judge_response(raw: str) -> Tuple[str, str, bool, Optional[Dict[str, 
         verdict = "done" if done else "continue"
     if verdict not in {"done", "blocked", "continue", "wait"}:
         verdict = "continue"
+    if verdict == "blocked":
+        # The 4th slot carries the blocker classification for BLOCKED (it is the wait directive
+        # only for WAIT); unknown/missing categories fall back to transient (bounded by budget).
+        return "blocked", reason, False, _parse_blocker(data)
     if verdict != "wait":
         return verdict, reason, False, None
 
@@ -847,6 +874,18 @@ def _parse_judge_response(raw: str) -> Tuple[str, str, bool, Optional[Dict[str, 
     if seconds is not None:
         return "wait", reason, False, {"seconds": seconds}
     return "continue", f"{reason} (wait verdict had no target — continuing)", False, None
+
+
+def _parse_blocker(data: Dict[str, Any]) -> Dict[str, Any]:
+    raw = str(data.get("blocker") or data.get("blocker_category") or data.get("category") or "").strip().lower()
+    if raw in _HUMAN_ONLY_ALIASES:
+        category = BLOCKER_HUMAN_ONLY
+    elif raw in _TRANSIENT_ALIASES:
+        category = BLOCKER_TRANSIENT
+    else:
+        category = "unknown"
+    question = str(data.get("human_decision") or data.get("question") or "").strip()
+    return {"blocker": category, "human_decision": question}
 
 
 def _render_background_block(background_processes: Optional[List[Dict[str, Any]]]) -> str:
@@ -1545,15 +1584,35 @@ class GoalManager:
             # obsolete work, so the goal is parked, not discarded: /goal resume keeps it, and the
             # agent may declare a new goal over it.
             if state.source == "agent":
+                info = wait_directive if isinstance(wait_directive, dict) and "blocker" in wait_directive else {}
+                category = info.get("blocker") or "unknown"
+                if category != BLOCKER_HUMAN_ONLY:
+                    state.consecutive_blocked += 1
+                    if (state.consecutive_blocked <= DEFAULT_MAX_CONSECUTIVE_TRANSIENT_BLOCKS
+                            and state.turns_used < state.max_turns):
+                        self._save()
+                        n = state.consecutive_blocked
+                        return _decision(
+                            "active", True, self._reroute_prompt(state, reason), "blocked_transient", reason,
+                            f"↻ Blocker looks self-resolvable ({category}, {n}/{DEFAULT_MAX_CONSECUTIVE_TRANSIENT_BLOCKS}) "
+                            f"— rerouting instead of parking: {reason}",
+                        )
+                    question = (f"The agent could not get past this after {state.consecutive_blocked - 1} "
+                                f"alternative attempt(s): {reason} — how should it proceed?")
+                else:
+                    question = info.get("human_decision") or f"{reason} — approve or decide how to proceed?"
+                state.consecutive_blocked = 0
                 return self._pause_decision(
-                    f"agent goal parked: {reason}", "blocked", reason,
-                    f"⊙ Goal parked: {reason} (/goal resume to keep it; the agent may set a new one)",
+                    f"agent goal parked ({category}): {reason}", "blocked", reason,
+                    f"⊙ Goal parked — human decision needed: {question} "
+                    "(answer, then /goal resume; the agent may set a new goal)",
                 )
             return self._pause_decision(
                 f"judged unachievable: {reason}", "blocked", reason,
                 f"🚫 Goal judged unachievable — paused: {reason} Re-scope with /goal set, or override with /goal resume.",
             )
 
+        state.consecutive_blocked = 0
         if verdict == "done":
             state.status = "done"
             self._save()
@@ -1584,6 +1643,19 @@ class GoalManager:
         return _decision(
             "active", True, self.next_continuation_prompt(), "continue", reason,
             f"↻ Continuing toward goal ({state.turns_used}/{state.max_turns}): {reason}",
+        )
+
+    def _reroute_prompt(self, state: "GoalState", reason: str) -> str:
+        body = self.next_continuation_prompt() or ""
+        return (
+            body + "\n\n[Blocker is self-resolvable — do NOT stop or ask the user to retry]\n"
+            f"Last turn ended blocked: {reason}\n"
+            "Take a different route this turn, for example: put the change in a non-protected file "
+            "(a skill, profile notes, or a new doc) instead of the protected one; re-request a timed-out "
+            "approval once; retry a failed tool with a different command or tool; while CI runs, move to "
+            "the next unmet acceptance criterion. Only stop if the remaining step truly needs a human to "
+            "spend money, delete/alter customer data irreversibly, or grant credentials/access — and then "
+            "state the exact question."
         )
 
     def next_continuation_prompt(self) -> Optional[str]:

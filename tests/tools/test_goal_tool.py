@@ -69,10 +69,12 @@ def test_complete_without_evidence_or_goal_errors():
 
 def test_blocked_agent_goal_parks_not_nags(monkeypatch):
     _call(action="create", objective="Tag v1.2.14 after the owner approves the release")
-    monkeypatch.setattr(goals_mod, "judge_goal", lambda *a, **kw: ("blocked", "needs owner approval", False, None, False))
+    monkeypatch.setattr(goals_mod, "judge_goal", lambda *a, **kw: ("blocked", "needs owner approval", False,
+                        {"blocker": "human_only", "human_decision": "Approve tagging v1.2.14?"}, False))
     mgr = goals_mod.GoalManager(session_id="s1")
     d = mgr.evaluate_after_turn("Waiting on your approval to tag.")
     assert d["status"] == "paused" and "Re-scope" not in d["message"]
+    assert "Approve tagging v1.2.14?" in d["message"]
     # a parked self-set goal can be replaced by a new declaration
     assert _call(action="create", objective="Verify the canary rollout of v1.2.14 is green")["created"]
 
