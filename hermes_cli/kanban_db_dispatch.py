@@ -3181,6 +3181,19 @@ def _design_phase_guard(conn: sqlite3.Connection, task_id: str, assignee: str) -
                 ok = True
                 break
     if not ok:
+        # The design phase can run ON this card: the architect writes the design,
+        # then hands the same card to the implementer. A finished architect run
+        # on the card is that proof. Without it t_f3e9efe4 bounced architect ->
+        # engineer -> architect three times (2026-10-08) because its design was a
+        # child page of DESIGN, not one of the configured design_pages.
+        marks = ",".join("?" * len(cfg["architects"]))
+        row = conn.execute(
+            f"SELECT 1 FROM task_runs WHERE task_id = ? AND profile IN ({marks}) "
+            "AND outcome IN ('completed', 'blocked') LIMIT 1",
+            (task_id, *sorted(cfg["architects"])),
+        ).fetchone()
+        ok = row is not None
+    if not ok:
         # Any DESIGN: line may carry the link (body, or an EM/architect comment);
         # the guard's own park note also contains "DESIGN:" and must not mask it.
         # A link to any Notion page (e.g. the readiness-gaps page) is not a design:

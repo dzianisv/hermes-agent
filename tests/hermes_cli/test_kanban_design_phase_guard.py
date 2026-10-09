@@ -61,3 +61,22 @@ def test_card_past_design_entry_is_not_rerouted(conn, stage):
     conn.execute("UPDATE tasks SET current_step_key=? WHERE id=?", (stage, tid)); conn.commit()
     assert disp._design_phase_guard(conn, tid, "software-engineer") is None
     assert kb.get_task(conn, tid).assignee == "software-engineer"
+
+
+def test_design_done_on_same_card_passes(conn):
+    """Regression t_f3e9efe4: architect finished the design ON the card and handed it
+    to the engineer; the guard parked it again (3 bounces) because the design was a
+    child page, not one of design_pages."""
+    tid = _card(conn, "DESIGN: card comment #10638")
+    conn.execute(
+        "INSERT INTO task_runs (task_id, profile, status, outcome, started_at, ended_at) "
+        "VALUES (?, 'architect-critic-fable', 'blocked', 'blocked', 1, 2)", (tid,))
+    assert disp._design_phase_guard(conn, tid, "software-engineer") is None
+
+
+def test_unfinished_architect_run_does_not_count(conn):
+    tid = _card(conn, "DESIGN: card comment")
+    conn.execute(
+        "INSERT INTO task_runs (task_id, profile, status, outcome, started_at) "
+        "VALUES (?, 'architect-critic-fable', 'crashed', 'crashed', 1)", (tid,))
+    assert disp._design_phase_guard(conn, tid, "software-engineer") == "design_phase_missing"
