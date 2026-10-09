@@ -267,6 +267,16 @@ KANBAN_REQUEST_CHANGES_SCHEMA = _schema(
                 "Specific, actionable changes the implementer must make "
                 "before requesting another review."
         )),
+        "metadata": {
+            "type": "object",
+            "description": (
+                "Required when the card has R<n>/ACCEPTANCE lines: "
+                "{findings: [{id: 'R1'|'ACCEPTANCE'|'ACCEPTANCE-2', verdict: 'PASS'|'FAIL', "
+                "evidence: '...'}, ...] covering EVERY such line, reviewed_sha: '<head reviewed>'}. "
+                "The call is refused with the list of missing ids otherwise."
+            ),
+            "additionalProperties": True,
+        },
     },
     ["reason"],
 )
