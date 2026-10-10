@@ -25,7 +25,7 @@ from gateway.config import Platform
 from gateway.media_repair import repair_explicit_computer_use_media_paths
 from gateway.platforms.base import BasePlatformAdapter, ProcessingOutcome
 from gateway.platforms.event import MessageEvent
-from gateway.response_filters import display_kind_for_event, is_machinery_display_kind
+from gateway.response_filters import SILENT_REPLY_TOKEN, display_kind_for_event, is_machinery_display_kind
 from gateway.warning_notifications import diagnostic_metadata, diagnostic_turn_muted, diagnostic_wake_muted
 from gateway.session import (
     SessionSource, _session_key_namespace, build_channel_continuity_note,
@@ -1936,6 +1936,11 @@ class GatewayTurnMixin:
         # Intentional silence is a delivery decision: the [SILENT] turn stays persisted (alternation).
         if _intentional_silence:
             logger.info("Suppressing intentional silence marker for session %s", session_entry.session_id)
+            # The turn is still a completed turn for the /goal and /loop hooks: a goal continuation
+            # answered with a bare NO_REPLY returned None here with nothing stashed, so the judge
+            # never ran and the goal sat `active` with no continuation until a human kicked it.
+            with suppress(Exception):
+                event._streamed_final_response = SILENT_REPLY_TOKEN
             response = ""
 
         adapter = self._delivery_adapter_for(source)
