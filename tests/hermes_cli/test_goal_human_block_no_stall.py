@@ -85,14 +85,22 @@ def test_human_only_block_keeps_the_goal_active_and_records_the_question(goals_m
     assert "human_only" in seen[0]
 
 
-def test_same_question_is_recorded_once_and_never_parks(goals_mod, monkeypatch):
+def test_same_question_is_recorded_once_and_never_pauses(goals_mod, monkeypatch):
+    """The same human-only question again = nothing else left to do. The goal stays ACTIVE (never
+    paused) but waits with a doubling backoff instead of re-poking at once — re-poking re-asked the
+    Touch ID question ~6x/min for an hour (82 notices in the user's chat, 2026-10-10)."""
     _judge(goals_mod, monkeypatch, _human_block())
     mgr = _release_goal(goals_mod)
-    for i in range(8):
+    d = mgr.evaluate_after_turn("still needs Touch ID 0")
+    assert d["status"] == "active" and d["should_continue"] is True and MUSE_KICK in d["continuation_prompt"]
+    for i in range(1, 8):
+        mgr.stop_waiting()
         d = mgr.evaluate_after_turn(f"still needs Touch ID {i}")
-        assert d["status"] == "active" and d["should_continue"] is True, d
-        assert MUSE_KICK in d["continuation_prompt"]
-    assert goals_mod.load_goal("rel").pending_human_decisions == [TOUCH_ID]
+        assert d["status"] == "active" and d["should_continue"] is False and d["message"] == "", d
+        assert goals_mod.load_goal("rel").status == "active"
+    s = goals_mod.load_goal("rel")
+    assert s.pending_human_decisions == [TOUCH_ID]
+    assert s.consecutive_human_pending == 7 and s.waiting_until > 0
 
 
 def test_distinct_human_questions_accumulate(goals_mod, monkeypatch):

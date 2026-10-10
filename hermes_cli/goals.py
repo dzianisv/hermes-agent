@@ -1947,24 +1947,30 @@ class GoalManager:
                     is_new = state.record_pending_human_decision(question)
                     state.consecutive_blocked = 0
                     n_pending = len(state.pending_human_decisions)
-                    # A human-only step is a WAIT, not a reason to spin. Re-poking at once made
-                    # the agent re-ask the same Touch ID question ~6x/min for an hour (82 notices
-                    # in the user's chat, 2026-10-10). Announce a NEW question once, then back off
-                    # exactly like a silent turn (60s doubling to the cap); the user's reply or
-                    # the barrier-wake chore resumes it. Rewordings of the same ask are not new.
+                    if is_new:
+                        # A NEW human-only question: announce it once and keep working the
+                        # other requirements (Muse semantics — a human step never parks by itself).
+                        state.consecutive_human_pending = 0
+                        self._save()
+                        return _decision(
+                            "active", True, self._human_pending_prompt(question, n_pending),
+                            "blocked_human_pending", reason,
+                            f"⊙ Step needs the human ({n_pending} waiting on you): {question} "
+                            f"— recorded; continuing on the other requirements: {reason}",
+                        )
+                    # The SAME question again means nothing else is left to do: re-poking at once
+                    # re-asked the Touch ID question ~6x/min for an hour (82 notices in the user's
+                    # chat, 2026-10-10). Back off like a silent turn (60s doubling to the cap),
+                    # quietly; the user's answer or the barrier-wake chore resumes the goal.
                     state.consecutive_human_pending += 1
                     n = state.consecutive_human_pending
                     backoff = min(SILENT_TURN_BACKOFF_BASE_S * (2 ** (n - 1)), SILENT_TURN_BACKOFF_MAX_S)
                     self._park(f"{_HUMAN_PARK_PREFIX} ({n}x); backing off {backoff}s",
                                waiting_until=time.time() + backoff)
                     self._save()
-                    logger.info("goal %s: human-only step %dx, backing off %ss: %s",
+                    logger.info("goal %s: human-only step repeated %dx, backing off %ss: %s",
                                 self.session_id, n, backoff, question[:120])
-                    message = (
-                        f"⊙ Step needs the human ({n_pending} waiting on you): {question} "
-                        f"— recorded; continuing on the other requirements: {reason}"
-                    ) if is_new else ""
-                    return _decision("active", False, None, "blocked_human_pending", reason, message)
+                    return _decision("active", False, None, "blocked_human_pending", reason, "")
                 state.consecutive_blocked += 1
                 self._save()
                 n = state.consecutive_blocked

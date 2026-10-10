@@ -139,14 +139,18 @@ def test_human_only_block_backs_off_and_dedupes_rewordings(hermes_home):
     wd = {"blocker": goals.BLOCKER_HUMAN_ONLY, "human_decision": q1}
     with patch("hermes_cli.goals.judge_goal", return_value=("blocked", "needs Touch ID", False, wd, False)):
         d1 = mgr.evaluate_after_turn("did other work")
-        assert d1["should_continue"] is False and "Step needs the human" in d1["message"]
-        s = goals.GoalManager("sid-human-1").state
-        assert s.waiting_until > 0 and s.consecutive_human_pending == 1
-        mgr.stop_waiting()
-        wd["human_decision"] = q2
+        # new question: announced once, keep working the other requirements
+        assert d1["should_continue"] is True and "Step needs the human" in d1["message"]
+        assert goals.GoalManager("sid-human-1").state.waiting_until == 0
+        wd["human_decision"] = q2  # the judge's rewording of the same ask
         d2 = mgr.evaluate_after_turn("did more work")
         assert d2["message"] == "" and d2["should_continue"] is False
         s2 = goals.GoalManager("sid-human-1").state
         assert s2.pending_human_decisions == [q1]
-        assert s2.consecutive_human_pending == 2
-        assert round(s2.waiting_until - s2.waiting_since) >= 2 * goals.SILENT_TURN_BACKOFF_BASE_S - 2
+        assert s2.consecutive_human_pending == 1 and s2.waiting_until > 0
+        mgr.stop_waiting()
+        d3 = mgr.evaluate_after_turn("still nothing else")
+        assert d3["message"] == "" and d3["should_continue"] is False
+        s3 = goals.GoalManager("sid-human-1").state
+        assert s3.consecutive_human_pending == 2
+        assert round(s3.waiting_until - s3.waiting_since) >= 2 * goals.SILENT_TURN_BACKOFF_BASE_S - 2
