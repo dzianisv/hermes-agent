@@ -108,3 +108,14 @@ def test_silent_park_emits_no_user_message(hermes_home):
         d = mgr.evaluate_after_turn("[SILENT]", user_initiated=True)
         assert d["verdict"] == "silent"
         assert d["message"] == ""
+
+
+def test_turn_inside_silence_backoff_emits_no_user_message(hermes_home):
+    """A reply landing while the silence park is still running must stay quiet too (second leak
+    path: _waiting_decision re-announced the park as '⏳ Goal parked — waiting on 17s remaining')."""
+    mgr = _goal("silent-quiet-2")
+    d1 = mgr.evaluate_after_turn("[SILENT]", user_initiated=True)
+    assert d1["verdict"] == "silent" and d1["message"] == ""
+    d2 = mgr.evaluate_after_turn("some real text", user_initiated=True)   # still inside the 60s park
+    assert d2["verdict"] == "waiting"
+    assert d2["message"] == ""

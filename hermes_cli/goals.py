@@ -1344,6 +1344,14 @@ def draft_contract(objective: str, *, timeout: Optional[float] = None) -> Option
 
 # ── GoalManager — the orchestration surface CLI + gateway talk to ──────
 
+_SILENCE_PARK_PREFIX = "agent replied with a silence marker"
+
+
+def _is_silence_park_reason(reason: Optional[str]) -> bool:
+    """True for the waiting_reason written by the silent-turn backoff park."""
+    return bool(reason) and reason.startswith(_SILENCE_PARK_PREFIX)
+
+
 def _decision(status, should_continue: bool, prompt: Optional[str], verdict: str, reason: str, message: str) -> Dict[str, Any]:
     return {"status": status, "should_continue": should_continue, "continuation_prompt": prompt,
             "verdict": verdict, "reason": reason, "message": message}
@@ -1799,6 +1807,11 @@ class GoalManager:
         else:
             tgt = f"{max(0, int(state.waiting_until - time.time()))}s remaining"
         reason = state.waiting_reason or tgt
+        if _is_silence_park_reason(reason):
+            # A turn landing inside a silence backoff is machinery, not news: no user notice
+            # (same rule as the park itself; it leaked "waiting on 17s remaining: … silence
+            # marker (1x)" to the user's chat on 2026-10-10).
+            return _decision("active", False, None, "waiting", reason, "")
         return _decision("active", False, None, "waiting", reason, f"⏳ Goal parked — waiting on {tgt}: {reason}")
 
     def _apply_wait_directive(self, wait_directive: Dict[str, Any], reason: str, *, active_delegations: int = 0) -> Optional[Dict[str, Any]]:
@@ -1868,7 +1881,7 @@ class GoalManager:
             # un-park, which restarts the spam. Back off exponentially and hold at the cap; any
             # real reply (user turn, heartbeat answer with content) resets the counter.
             backoff = min(SILENT_TURN_BACKOFF_BASE_S * (2 ** (n - 1)), SILENT_TURN_BACKOFF_MAX_S)
-            self._park(f"agent replied with a silence marker ({n}x); backing off {backoff}s",
+            self._park(f"{_SILENCE_PARK_PREFIX} ({n}x); backing off {backoff}s",
                        waiting_until=time.time() + backoff)
             state.last_verdict, state.last_reason = "silent", "no reply"
             self._save()
