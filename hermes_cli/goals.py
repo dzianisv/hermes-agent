@@ -46,8 +46,9 @@ DEFAULT_MAX_CONSECUTIVE_PARSE_FAILURES = 3
 # [SILENT]) or nothing at all. Each one parks the loop with growing backoff (60 s, 120 s, ...)
 # instead of re-poking immediately; after this many in a row the goal pauses. One run fired
 # 300 continuations in 30 minutes against a model that kept answering NO_REPLY.
-DEFAULT_MAX_CONSECUTIVE_SILENT_TURNS = 5
+DEFAULT_MAX_CONSECUTIVE_SILENT_TURNS = 5  # after this many, stop doubling and hold at the max backoff
 SILENT_TURN_BACKOFF_BASE_S = 60
+SILENT_TURN_BACKOFF_MAX_S = 1800  # ceiling before goals.max_wait_seconds (300 s default) also clamps it; never paused for silence
 _SILENCE_MARKERS = frozenset({"NO_REPLY", "NO REPLY", "[SILENT]", "SILENT"})
 
 
@@ -1784,20 +1785,17 @@ class GoalManager:
         if is_silent_turn_response(last_response):
             state.consecutive_silent += 1
             n = state.consecutive_silent
-            if n >= DEFAULT_MAX_CONSECUTIVE_SILENT_TURNS:
-                return self._pause_decision(
-                    f"agent answered {n} continuations in a row with only a silence marker",
-                    "silent", "no reply",
-                    f"⏸ Goal paused — the agent replied with only a silence marker {n} turns in a row. "
-                    "Check the session, then /goal resume.",
-                )
-            backoff = SILENT_TURN_BACKOFF_BASE_S * (2 ** (n - 1))
+            # Silence is not a blocker and never pauses the goal: the agent may be busy on other
+            # work, or have nothing new to say. Pausing just creates a park a supervisor has to
+            # un-park, which restarts the spam. Back off exponentially and hold at the cap; any
+            # real reply (user turn, heartbeat answer with content) resets the counter.
+            backoff = min(SILENT_TURN_BACKOFF_BASE_S * (2 ** (n - 1)), SILENT_TURN_BACKOFF_MAX_S)
             self._park(f"agent replied with a silence marker ({n}x); backing off {backoff}s",
                        waiting_until=time.time() + backoff)
             state.last_verdict, state.last_reason = "silent", "no reply"
             self._save()
             return _decision("active", False, None, "silent", "no reply",
-                             f"⏳ Goal parked {backoff}s — agent replied with only a silence marker ({n}/{DEFAULT_MAX_CONSECUTIVE_SILENT_TURNS})")
+                             f"⏳ Goal parked {backoff}s — agent replied with only a silence marker ({n}x)")
         state.consecutive_silent = 0
 
         # Gates run BEFORE the judge: a failing gate is deterministic evidence the goal is not done,

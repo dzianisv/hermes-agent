@@ -10,6 +10,8 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import patch
 
+import time
+
 import pytest
 
 from hermes_cli import goals
@@ -79,12 +81,18 @@ def test_real_reply_resets_silent_counter(hermes_home):
         assert goals.GoalManager("sid-silent-2").state.consecutive_silent == 0
 
 
-def test_repeated_silence_pauses_goal(hermes_home):
+def test_repeated_silence_never_pauses_goal_and_caps_backoff(hermes_home):
+    """Silence is not a blocker. A paused goal just becomes a park a supervisor un-parks,
+    which restarts the continuation spam (live 2026-10-09: parked twice in two hours)."""
     mgr = _goal("sid-silent-3")
     with patch("hermes_cli.goals.judge_goal") as judge:
-        for _ in range(goals.DEFAULT_MAX_CONSECUTIVE_SILENT_TURNS):
+        for _ in range(goals.DEFAULT_MAX_CONSECUTIVE_SILENT_TURNS + 4):
             mgr.stop_waiting()
             d = mgr.evaluate_after_turn("NO_REPLY")
-        assert d["status"] == "paused"
+        assert d["status"] == "active"
         assert judge.call_count == 0
-        assert goals.GoalManager("sid-silent-3").state.status == "paused"
+        st = goals.GoalManager("sid-silent-3").state
+        assert st.status == "active"
+        remaining = st.waiting_until - time.time()
+        cap = min(goals.SILENT_TURN_BACKOFF_MAX_S, goals.max_wait_seconds())
+        assert cap - 5 < remaining <= cap
