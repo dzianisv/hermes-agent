@@ -470,13 +470,38 @@ class SessionSessionsMixin:
             (time.time(), end_reason, session_id), session_id, end_reason,
         ))
 
+    # A goal survives automatic ends (agent_close, compression, orphan reaps — the conversation
+    # continues under another row); a USER boundary ends the conversation, so its goal is orphaned
+    # and must be closed with it. Otherwise the row stays ``active`` forever and every goal scan
+    # (idle wake, supervisor, dashboards) chases a session nobody will ever talk to again
+    # (5 such rows found 2026-10-09, 6h–3d old, all ``session_switch``/``agent_close``).
+    _GOAL_ORPHANING_END_REASONS = frozenset(_RESET_END_REASONS) | {"user_exit", "new_session"}
+
     def _end_and_bump(self, conn, sql: str, params: tuple, session_id: str, reason: str) -> int:
         """Run an end-stamp UPDATE; only a boundary this call actually wrote advances the
         conversation generation (a no-op must not rotate the peer). Returns rowcount."""
         changed = conn.execute(sql, params).rowcount
         if changed:
             self._bump_conversation_generation(conn, session_id, reason)
+            if reason in self._GOAL_ORPHANING_END_REASONS:
+                self._close_orphaned_goal(conn, session_id, reason)
         return changed
+
+    @staticmethod
+    def _close_orphaned_goal(conn, session_id: str, reason: str) -> None:
+        """Mark ``goal:<session_id>`` cleared (same connection/transaction as the end stamp)."""
+        try:
+            row = conn.execute("SELECT value FROM state_meta WHERE key = ?", (f"goal:{session_id}",)).fetchone()
+            if not row or not row[0]:
+                return
+            data = json.loads(row[0])
+            if data.get("status") not in ("active", "paused"):
+                return
+            data["status"] = "cleared"
+            data["paused_reason"] = f"session ended ({reason})"
+            conn.execute("UPDATE state_meta SET value = ? WHERE key = ?", (json.dumps(data), f"goal:{session_id}"))
+        except Exception as exc:  # never let goal bookkeeping block the end stamp
+            logger.debug("close orphaned goal for %s failed: %s", session_id, exc)
 
     def reopen_session(self, session_id: str) -> None:
         """Clear ended_at/end_reason so a session can be resumed; first freeze markerless legacy reset
