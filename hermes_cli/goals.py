@@ -42,6 +42,24 @@ _JUDGE_RESPONSE_SNIPPET_CHARS = 4000
 # the goal_judge config. API/transport errors do NOT count — those are tracked separately below.
 # Guards against small models that cannot follow the strict JSON contract burning the whole budget.
 DEFAULT_MAX_CONSECUTIVE_PARSE_FAILURES = 3
+# Turns where the agent answered a goal continuation with only a silence marker (NO_REPLY /
+# [SILENT]) or nothing at all. Each one parks the loop with growing backoff (60 s, 120 s, ...)
+# instead of re-poking immediately; after this many in a row the goal pauses. One run fired
+# 300 continuations in 30 minutes against a model that kept answering NO_REPLY.
+DEFAULT_MAX_CONSECUTIVE_SILENT_TURNS = 5
+SILENT_TURN_BACKOFF_BASE_S = 60
+_SILENCE_MARKERS = frozenset({"NO_REPLY", "NO REPLY", "[SILENT]", "SILENT"})
+
+
+def is_silent_turn_response(text: Optional[str]) -> bool:
+    """True when the agent's reply to a continuation was empty or exactly a silence marker."""
+    raw = (text or "").strip()
+    # The gateway's stand-in when a non-internal turn produced only a marker (see
+    # gateway/run_turn.py _UNEXPECTED_SILENCE_REPLY) carries no evidence either.
+    if raw.startswith("⚠️ The model returned only a silence marker"):
+        return True
+    s = raw.strip("*_`.[] ").upper()
+    return not s or s in _SILENCE_MARKERS or s.replace("[", "").replace("]", "") in _SILENCE_MARKERS
 # Consecutive transport failures (401, timeout, DNS) before auto-pause: a broken API key returns
 # 401 every call and must not spend every turn on an unreachable judge.
 DEFAULT_MAX_CONSECUTIVE_TRANSPORT_FAILURES = 5
@@ -492,6 +510,8 @@ class GoalState:
     consecutive_transport_failures: int = 0   # judge API/transport errors in a row
     # Agent goals: consecutive BLOCKED verdicts answered with a reroute continuation.
     consecutive_blocked: int = 0
+    # Continuations answered with nothing / a bare silence marker in a row (backoff + pause).
+    consecutive_silent: int = 0
     # User-added criteria (/subgoal). Both the judge and continuation prompts include them.
     subgoals: List[str] = field(default_factory=list)
     # Wait barrier (judge ``wait`` verdict or ``/goal wait``): parks the loop instead of re-poking the
@@ -532,7 +552,7 @@ class GoalState:
     def from_json(cls, raw: str) -> "GoalState":
         data = json.loads(raw)
         raw_subgoals = data.get("subgoals") or []
-        ints = {k: int(data.get(k) or 0) for k in ("turns_used", "consecutive_parse_failures", "consecutive_transport_failures", "waiting_on_delegations", "consecutive_blocked")}
+        ints = {k: int(data.get(k) or 0) for k in ("turns_used", "consecutive_parse_failures", "consecutive_transport_failures", "waiting_on_delegations", "consecutive_blocked", "consecutive_silent")}
         floats = {k: float(data.get(k) or 0.0) for k in ("created_at", "last_turn_at", "waiting_until", "waiting_since", "paused_at")}
         raw_pending = data.get("pending_human_decisions") or []
         return cls(
@@ -1758,6 +1778,27 @@ class GoalManager:
 
         state.turns_used += 1
         state.last_turn_at = time.time()
+
+        # The agent said nothing (bare NO_REPLY / empty): there is no evidence to judge. Do not call
+        # the judge and do not re-poke at once — park with growing backoff, pause after repeats.
+        if is_silent_turn_response(last_response):
+            state.consecutive_silent += 1
+            n = state.consecutive_silent
+            if n >= DEFAULT_MAX_CONSECUTIVE_SILENT_TURNS:
+                return self._pause_decision(
+                    f"agent answered {n} continuations in a row with only a silence marker",
+                    "silent", "no reply",
+                    f"⏸ Goal paused — the agent replied with only a silence marker {n} turns in a row. "
+                    "Check the session, then /goal resume.",
+                )
+            backoff = SILENT_TURN_BACKOFF_BASE_S * (2 ** (n - 1))
+            self._park(f"agent replied with a silence marker ({n}x); backing off {backoff}s",
+                       waiting_until=time.time() + backoff)
+            state.last_verdict, state.last_reason = "silent", "no reply"
+            self._save()
+            return _decision("active", False, None, "silent", "no reply",
+                             f"⏳ Goal parked {backoff}s — agent replied with only a silence marker ({n}/{DEFAULT_MAX_CONSECUTIVE_SILENT_TURNS})")
+        state.consecutive_silent = 0
 
         # Gates run BEFORE the judge: a failing gate is deterministic evidence the goal is not done,
         # so the judge is skipped and the gate's output drives the next turn (same turn budget).
