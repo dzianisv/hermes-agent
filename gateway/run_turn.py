@@ -2210,7 +2210,10 @@ class GatewayTurnMixin:
                 persist_user_display_metadata={
                     "gateway_input_owner": prepared.persistence_owner, **diagnostic_metadata(event)},
                 message_type=event.message_type,
-                scheduled_heartbeat=bool(getattr(event, "_heartbeat_session_id", None)),
+                # Goal continuation / wake prompts are self-injected like a scheduled heartbeat:
+                # no "⏳ Working — N min" progress bubbles for a turn the user did not start.
+                scheduled_heartbeat=bool(getattr(event, "_heartbeat_session_id", None)
+                                         or getattr(event, "_goal_prompt", False)),
             )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 

@@ -96,3 +96,15 @@ def test_repeated_silence_never_pauses_goal_and_caps_backoff(hermes_home):
         remaining = st.waiting_until - time.time()
         cap = min(goals.SILENT_TURN_BACKOFF_MAX_S, goals.max_wait_seconds())
         assert cap - 5 < remaining <= cap
+
+
+def test_silent_park_emits_no_user_message(hermes_home):
+    """A silent turn on a continuation is internal: no '⏳ Goal parked …' notice (it spammed the
+    user's chat every 30 min on 2026-10-10)."""
+    mgr = _goal("silent-quiet")
+    for _ in range(3):
+        mgr.state.waiting_until = 0.0
+        mgr._save()
+        d = mgr.evaluate_after_turn("[SILENT]", user_initiated=True)
+        assert d["verdict"] == "silent"
+        assert d["message"] == ""

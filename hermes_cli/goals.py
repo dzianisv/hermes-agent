@@ -1872,8 +1872,11 @@ class GoalManager:
                        waiting_until=time.time() + backoff)
             state.last_verdict, state.last_reason = "silent", "no reply"
             self._save()
-            return _decision("active", False, None, "silent", "no reply",
-                             f"⏳ Goal parked {backoff}s — agent replied with only a silence marker ({n}x)")
+            # No user-facing message: a silent turn on a self-injected continuation is internal
+            # bookkeeping. Surfacing it produced "⏳ Goal parked 1800s … (26x)" spam in the
+            # user's chat every 30 min (2026-10-10). The park is visible in logs / `/goal`.
+            logger.info("goal %s: silent turn %dx, backing off %ss", self.session_id, n, backoff)
+            return _decision("active", False, None, "silent", "no reply", "")
         state.consecutive_silent = 0
 
         # Gates run BEFORE the judge: a failing gate is deterministic evidence the goal is not done,
