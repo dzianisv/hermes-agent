@@ -483,9 +483,22 @@ class SessionSessionsMixin:
         changed = conn.execute(sql, params).rowcount
         if changed:
             self._bump_conversation_generation(conn, session_id, reason)
-            if reason in self._GOAL_ORPHANING_END_REASONS:
+            if reason in self._GOAL_ORPHANING_END_REASONS or self._is_terminal_for_subagent(conn, session_id, reason):
                 self._close_orphaned_goal(conn, session_id, reason)
         return changed
+
+    @staticmethod
+    def _is_terminal_for_subagent(conn, session_id: str, reason: str) -> bool:
+        """``agent_close`` is recoverable for a gateway/CLI session (its conversation resumes under
+        another row) but final for a ``delegate_task`` child: nobody ever talks to it again, so
+        its goal is orphaned too (6 such rows on 2026-10-09, all source='subagent')."""
+        if reason != "agent_close":
+            return False
+        try:
+            row = conn.execute("SELECT source FROM sessions WHERE id = ?", (session_id,)).fetchone()
+        except Exception:
+            return False
+        return bool(row) and row[0] == "subagent"
 
     @staticmethod
     def _close_orphaned_goal(conn, session_id: str, reason: str) -> None:

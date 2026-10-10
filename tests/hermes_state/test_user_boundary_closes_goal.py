@@ -48,6 +48,14 @@ def test_automatic_end_keeps_the_goal(db, reason):
     assert _status(db, "s2") == "active"
 
 
+def test_subagent_agent_close_clears_the_goal(db):
+    db.create_session(session_id="parent", source="telegram")
+    db.create_session(session_id="sub", source="subagent", parent_session_id="parent")
+    db.set_meta("goal:sub", json.dumps({"goal": "child task", "status": "active", "source": "agent"}))
+    db.end_session("sub", "agent_close")
+    assert _status(db, "sub") == "cleared"
+
+
 def test_already_done_goal_is_untouched(db):
     _goal(db, "s3", status="done")
     db.end_session("s3", "session_switch")
