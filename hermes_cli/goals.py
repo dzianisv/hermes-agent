@@ -80,6 +80,11 @@ DEFAULT_PARKED_RELEASE_HOURS = 24.0
 # (poll it, review the diff, prepare the next requirement), so an agent goal sleeps briefly and
 # wakes with a "check what you were waiting on" kick. User-typed goals keep the judge's full wait.
 DEFAULT_MAX_WAIT_SECONDS = 300
+# An ACTIVE goal with no barrier and no turn for this long is idle-stalled (the agent's last turn
+# ended without a continuation being injected — e.g. a judge "wait" that set no barrier, a
+# gateway restart mid-turn, a dropped FIFO). The barrier-wake chore re-pokes it like a lifted
+# barrier (``goals.idle_wake_seconds``; 0 disables).
+DEFAULT_IDLE_WAKE_SECONDS = 900
 _USER_PAUSED_REASON = "user-paused"
 # Cap on remembered waiting-on-user questions per goal (status line / tool view stay readable).
 _MAX_PENDING_HUMAN_DECISIONS = 8
@@ -915,6 +920,54 @@ def max_wait_seconds() -> int:
     return DEFAULT_MAX_WAIT_SECONDS
 
 
+def idle_wake_seconds() -> int:
+    """``goals.idle_wake_seconds``: idle time after which an active, barrier-less goal is re-poked.
+    0 / negative disables; garbage → default."""
+    try:
+        from hermes_cli.config import load_config
+
+        raw = (load_config().get("goals") or {}).get("idle_wake_seconds", DEFAULT_IDLE_WAKE_SECONDS)
+        return max(0, int(raw))
+    except Exception:
+        return DEFAULT_IDLE_WAKE_SECONDS
+
+
+def list_idle_active_goals(now: Optional[float] = None) -> List[Tuple[str, GoalState]]:
+    """``[(session_id, GoalState), ...]`` for every ACTIVE goal with NO barrier whose last turn (or
+    creation) is older than ``idle_wake_seconds()``. The barrier-wake chore treats these like a
+    lifted barrier — without this an active goal whose turn ended with no continuation sits
+    forever (8 such rows, 6h–1d idle, found on 2026-10-09)."""
+    limit = idle_wake_seconds()
+    if limit <= 0:
+        return []
+    db = _get_session_db()
+    if db is None:
+        return []
+    now = now or time.time()
+    out: List[Tuple[str, GoalState]] = []
+    try:
+        rows = db.list_meta_prefix("goal:")
+    except Exception as exc:
+        logger.debug("list_idle_active_goals: list_meta_prefix failed: %s", exc)
+        return []
+    for key, raw in rows:
+        session_id = key[len("goal:"):]
+        if not session_id or not raw:
+            continue
+        try:
+            state = GoalState.from_json(raw)
+        except Exception:
+            continue
+        if state.status != "active":
+            continue
+        if state.waiting_on_pid is not None or state.waiting_on_session is not None or state.waiting_until:
+            continue
+        last = state.last_turn_at or state.created_at
+        if last and now - last >= limit:
+            out.append((session_id, state))
+    return out
+
+
 def list_parked_goals() -> List[Tuple[str, GoalState]]:
     """``[(session_id, GoalState), ...]`` for every ACTIVE goal that carries a wait barrier (pid,
     session or deadline); ``[]`` on any DB error. Used by the gateway's barrier-lift wake, which
@@ -1683,6 +1736,23 @@ class GoalManager:
         s.clear_wait()
         self._save()
         return True
+
+    def state_is_idle_stalled(self, now: Optional[float] = None) -> bool:
+        """Active, no barrier, and no turn for ``idle_wake_seconds()`` (see list_idle_active_goals)."""
+        s = self.state
+        limit = idle_wake_seconds()
+        if s is None or limit <= 0 or s.status != "active":
+            return False
+        if s.waiting_on_pid is not None or s.waiting_on_session is not None or s.waiting_until:
+            return False
+        last = s.last_turn_at or s.created_at
+        return bool(last) and (now or time.time()) - last >= limit
+
+    def touch_last_turn(self) -> None:
+        """Stamp ``last_turn_at`` now (idle-wake throttle) and persist."""
+        if self.state is not None:
+            self.state.last_turn_at = time.time()
+            self._save()
 
     def is_waiting(self) -> bool:
         """True iff a barrier is set AND not yet satisfied. A satisfied barrier is cleared here

@@ -49,9 +49,9 @@ def _session_is_busy(runner, session_key: str, adapter: Any) -> bool:
         return False
 
 
-async def _wake_one(runner, session_id: str, entry: Any, profile_name: Optional[str]) -> bool:
-    """Lift one parked goal if its barrier is gone and the session is idle. True when a continuation
-    was injected."""
+async def _wake_one(runner, session_id: str, entry: Any, profile_name: Optional[str], *, idle: bool = False) -> bool:
+    """Lift one parked goal if its barrier is gone and the session is idle, or re-poke an idle-stalled
+    active goal (``idle=True``). True when a continuation was injected."""
     from hermes_cli.goals import GoalManager
 
     source = runner._restored_source(entry)
@@ -76,6 +76,12 @@ async def _wake_one(runner, session_id: str, entry: Any, profile_name: Optional[
             mgr = GoalManager(session_id)
             if mgr.is_waiting():
                 return None
+            if idle and not mgr.state_is_idle_stalled():
+                return None  # a turn landed since the scan
+            if idle:
+                # Throttle: an idle wake counts as a turn boundary so the next one waits a full
+                # idle_wake_seconds again even if the agent answers with nothing.
+                mgr.touch_last_turn()
             return mgr.next_continuation_prompt()
 
         prompt = await runner._run_in_executor_with_context(_lift)
@@ -84,8 +90,8 @@ async def _wake_one(runner, session_id: str, entry: Any, profile_name: Optional[
         event = runner._synthetic_prompt_event(source, prompt)
         event.metadata["gateway_session_key"] = session_key
         logger.info(
-            "%s: barrier lifted for session %s — injecting continuation (%s chat=%s thread=%s)",
-            _LABEL, session_id, getattr(source, "platform", None), getattr(source, "chat_id", None),
+            "%s: %s for session %s — injecting continuation (%s chat=%s thread=%s)",
+            _LABEL, "idle-active goal re-poked" if idle else "barrier lifted", session_id, getattr(source, "platform", None), getattr(source, "chat_id", None),
             getattr(source, "thread_id", None),
         )
         # handle_message, not the FIFO: the FIFO alone never wakes an idle session.
@@ -94,11 +100,12 @@ async def _wake_one(runner, session_id: str, entry: Any, profile_name: Optional[
 
 
 async def _scan_one_store(runner, profile_name: Optional[str]) -> int:
-    from hermes_cli.goals import list_parked_goals
+    from hermes_cli.goals import list_idle_active_goals, list_parked_goals
 
     await runner._warm_goals_session_db(_LABEL)
     parked = await runner._run_in_executor_with_context(list_parked_goals)
-    if not parked:
+    idle_rows = await runner._run_in_executor_with_context(list_idle_active_goals)
+    if not parked and not idle_rows:
         return 0
     store = getattr(runner, "session_store", None)
     entries_by_sid: dict = {}
@@ -107,15 +114,16 @@ async def _scan_one_store(runner, profile_name: Optional[str]) -> int:
             if entry.session_id and entry.origin is not None and not getattr(entry, "suspended", False):
                 entries_by_sid.setdefault(entry.session_id, entry)
     woken = 0
-    for session_id, _state in parked:
-        entry = entries_by_sid.get(session_id)
-        if entry is None:
-            continue  # CLI / TUI-owned goal: its own idle hook drives it
-        try:
-            if await _wake_one(runner, session_id, entry, profile_name):
-                woken += 1
-        except Exception as exc:
-            logger.warning("%s: resume for session %s failed: %s", _LABEL, session_id, exc)
+    for rows, idle in ((parked, False), (idle_rows, True)):
+        for session_id, _state in rows:
+            entry = entries_by_sid.get(session_id)
+            if entry is None:
+                continue  # CLI / TUI-owned goal: its own idle hook drives it
+            try:
+                if await _wake_one(runner, session_id, entry, profile_name, idle=idle):
+                    woken += 1
+            except Exception as exc:
+                logger.warning("%s: resume for session %s failed: %s", _LABEL, session_id, exc)
     return woken
 
 

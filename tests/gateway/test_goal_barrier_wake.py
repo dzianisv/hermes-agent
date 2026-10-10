@@ -233,3 +233,49 @@ def test_housekeeping_tick_registers_the_wake_chore():
     assert "Goal barrier wake" in captured
     captured["Goal barrier wake"]()
     assert wake.call_count == 1
+
+
+class TestIdleActiveWake:
+    """An ACTIVE goal with no barrier whose last turn is older than goals.idle_wake_seconds is
+    re-poked exactly once per idle window (live 2026-10-09: 8 such rows sat 6h–1d, invisible to
+    the barrier scan because they carried no barrier)."""
+
+    @staticmethod
+    def _idle_goal(sid: str, idle_s: int) -> goals.GoalManager:
+        mgr = goals.GoalManager(sid)
+        assert mgr.set_agent_goal("ship the PR") is not None
+        mgr.state.last_turn_at = time.time() - idle_s
+        mgr._save()
+        return mgr
+
+    def test_idle_active_goal_is_re_poked_once(self, hermes_home):
+        self._idle_goal("gw-idle-1", goals.DEFAULT_IDLE_WAKE_SECONDS + 5)
+        runner = _Runner([_entry("gw-idle-1")])
+        assert _run(runner) == 1
+        assert "ship the PR" in runner.adapter.handled[0].text
+        # Second pass inside the same idle window: throttled by the last_turn_at stamp.
+        assert _run(runner) == 0
+        assert len(runner.adapter.handled) == 1
+
+    def test_recent_turn_is_not_poked(self, hermes_home):
+        self._idle_goal("gw-idle-2", 30)
+        runner = _Runner([_entry("gw-idle-2")])
+        assert _run(runner) == 0
+
+    def test_busy_session_defers(self, hermes_home):
+        self._idle_goal("gw-idle-3", goals.DEFAULT_IDLE_WAKE_SECONDS + 5)
+        runner = _Runner([_entry("gw-idle-3")])
+        runner.running.add("agent:main:telegram:c1")
+        assert _run(runner) == 0
+
+    def test_paused_goal_is_not_poked(self, hermes_home):
+        mgr = self._idle_goal("gw-idle-4", goals.DEFAULT_IDLE_WAKE_SECONDS + 5)
+        mgr.pause()
+        runner = _Runner([_entry("gw-idle-4")])
+        assert _run(runner) == 0
+
+    def test_disabled_by_config(self, hermes_home, monkeypatch):
+        self._idle_goal("gw-idle-5", goals.DEFAULT_IDLE_WAKE_SECONDS + 5)
+        monkeypatch.setattr(goals, "idle_wake_seconds", lambda: 0)
+        runner = _Runner([_entry("gw-idle-5")])
+        assert _run(runner) == 0
