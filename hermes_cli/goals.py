@@ -518,6 +518,7 @@ class GoalState:
     consecutive_blocked: int = 0
     # Continuations answered with nothing / a bare silence marker in a row (backoff + pause).
     consecutive_silent: int = 0
+    consecutive_human_pending: int = 0
     # User-added criteria (/subgoal). Both the judge and continuation prompts include them.
     subgoals: List[str] = field(default_factory=list)
     # Wait barrier (judge ``wait`` verdict or ``/goal wait``): parks the loop instead of re-poking the
@@ -558,7 +559,7 @@ class GoalState:
     def from_json(cls, raw: str) -> "GoalState":
         data = json.loads(raw)
         raw_subgoals = data.get("subgoals") or []
-        ints = {k: int(data.get(k) or 0) for k in ("turns_used", "consecutive_parse_failures", "consecutive_transport_failures", "waiting_on_delegations", "consecutive_blocked", "consecutive_silent")}
+        ints = {k: int(data.get(k) or 0) for k in ("turns_used", "consecutive_parse_failures", "consecutive_transport_failures", "waiting_on_delegations", "consecutive_blocked", "consecutive_silent", "consecutive_human_pending")}
         floats = {k: float(data.get(k) or 0.0) for k in ("created_at", "last_turn_at", "waiting_until", "waiting_since", "paused_at")}
         raw_pending = data.get("pending_human_decisions") or []
         return cls(
@@ -610,6 +611,17 @@ class GoalState:
         question = (question or "").strip()
         if not question or question in self.pending_human_decisions:
             return False
+        # The judge rewords the same ask every turn ("Will you…" / "Can you…" / "…the extension…").
+        # Questions whose significant words overlap >= 60% are the same pending decision.
+        def _sig(q: str) -> frozenset:
+            stop = {"will","can","could","would","you","please","the","to","a","an","of","for","on","in","and","or",
+                    "do","is","it","this","that","approve","provide","approval","using","with","via","release","extension"}
+            return frozenset(w for w in re.findall(r"[a-z0-9]+", q.lower()) if w not in stop and len(w) > 2)
+        sig = _sig(question)
+        for q in self.pending_human_decisions:
+            other = _sig(q)
+            if sig and other and len(sig & other) / len(sig | other) >= 0.6:
+                return False
         self.pending_human_decisions.append(question)
         del self.pending_human_decisions[:-_MAX_PENDING_HUMAN_DECISIONS]
         return True
@@ -1345,6 +1357,7 @@ def draft_contract(objective: str, *, timeout: Optional[float] = None) -> Option
 # ── GoalManager — the orchestration surface CLI + gateway talk to ──────
 
 _SILENCE_PARK_PREFIX = "agent replied with a silence marker"
+_HUMAN_PARK_PREFIX = "waiting on a human-only step"
 
 
 def _is_silence_park_reason(reason: Optional[str]) -> bool:
@@ -1931,16 +1944,27 @@ class GoalManager:
                     return self._budget_pause(state, "blocked", reason, note=" (last turn ended blocked)")
                 if category == BLOCKER_HUMAN_ONLY:
                     question = info.get("human_decision") or f"{reason} — approve or decide how to proceed?"
-                    state.record_pending_human_decision(question)
+                    is_new = state.record_pending_human_decision(question)
                     state.consecutive_blocked = 0
-                    self._save()
                     n_pending = len(state.pending_human_decisions)
-                    return _decision(
-                        "active", True, self._human_pending_prompt(question, n_pending),
-                        "blocked_human_pending", reason,
+                    # A human-only step is a WAIT, not a reason to spin. Re-poking at once made
+                    # the agent re-ask the same Touch ID question ~6x/min for an hour (82 notices
+                    # in the user's chat, 2026-10-10). Announce a NEW question once, then back off
+                    # exactly like a silent turn (60s doubling to the cap); the user's reply or
+                    # the barrier-wake chore resumes it. Rewordings of the same ask are not new.
+                    state.consecutive_human_pending += 1
+                    n = state.consecutive_human_pending
+                    backoff = min(SILENT_TURN_BACKOFF_BASE_S * (2 ** (n - 1)), SILENT_TURN_BACKOFF_MAX_S)
+                    self._park(f"{_HUMAN_PARK_PREFIX} ({n}x); backing off {backoff}s",
+                               waiting_until=time.time() + backoff)
+                    self._save()
+                    logger.info("goal %s: human-only step %dx, backing off %ss: %s",
+                                self.session_id, n, backoff, question[:120])
+                    message = (
                         f"⊙ Step needs the human ({n_pending} waiting on you): {question} "
-                        f"— recorded; continuing on the other requirements: {reason}",
-                    )
+                        f"— recorded; continuing on the other requirements: {reason}"
+                    ) if is_new else ""
+                    return _decision("active", False, None, "blocked_human_pending", reason, message)
                 state.consecutive_blocked += 1
                 self._save()
                 n = state.consecutive_blocked
@@ -1954,6 +1978,7 @@ class GoalManager:
             )
 
         state.consecutive_blocked = 0
+        state.consecutive_human_pending = 0
         if verdict == "done":
             state.status = "done"
             self._save()
