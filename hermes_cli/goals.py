@@ -1754,6 +1754,14 @@ class GoalManager:
             tgt = f"{max(0, math.ceil(parked_state.waiting_until - time.time()))}s"
         return _decision("active", False, None, "wait", reason, f"⏳ Goal parked (judge) — waiting on {tgt}: {reason}")
 
+    @staticmethod
+    def _budget_exhausted(state: GoalState) -> bool:
+        """Only a USER-set goal (/goal) has a turn budget. An agent-declared goal runs until its
+        acceptance criteria are met or a human-only blocker pauses it — a budget just produced
+        '23/20 turns used' parks that no one but the user could lift, while the agent still had
+        work it could do. Silence, blockers and judge waits are handled by their own paths."""
+        return state.source != "agent" and state.turns_used >= state.max_turns
+
     def _budget_pause(self, state: GoalState, verdict: str, reason: str, note: str = "") -> Dict[str, Any]:
         return self._pause_decision(
             f"turn budget exhausted ({state.turns_used}/{state.max_turns})", verdict, reason,
@@ -1802,7 +1810,7 @@ class GoalManager:
         # so the judge is skipped and the gate's output drives the next turn (same turn budget).
         gate_decision = self._check_gates()
         if gate_decision is not None:
-            if gate_decision.get("should_continue") and state.turns_used >= state.max_turns:
+            if gate_decision.get("should_continue") and self._budget_exhausted(state):
                 return self._budget_pause(state, "gate_failed", gate_decision.get("reason", ""), note=" (a quality gate is still failing)")
             return gate_decision
 
@@ -1834,7 +1842,7 @@ class GoalManager:
             if state.source == "agent":
                 info = wait_directive if isinstance(wait_directive, dict) and "blocker" in wait_directive else {}
                 category = info.get("blocker") or "unknown"
-                if state.turns_used >= state.max_turns:
+                if self._budget_exhausted(state):
                     return self._budget_pause(state, "blocked", reason, note=" (last turn ended blocked)")
                 if category == BLOCKER_HUMAN_ONLY:
                     question = info.get("human_decision") or f"{reason} — approve or decide how to proceed?"
@@ -1884,7 +1892,7 @@ class GoalManager:
                 + _JUDGE_CONFIG_HINT.format(provider="openrouter", model="google/gemini-3-flash-preview"),
             )
 
-        if state.turns_used >= state.max_turns:
+        if self._budget_exhausted(state):
             return self._budget_pause(state, "continue", reason)
 
         self._save()

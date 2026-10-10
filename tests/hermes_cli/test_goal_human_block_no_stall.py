@@ -142,7 +142,7 @@ def test_idle_turn_with_continue_verdict_fires_the_muse_kick(goals_mod, monkeypa
     assert MUSE_KICK in d["continuation_prompt"]
 
 
-# ── only complete / user pause / max_turns end an active agent goal ────────────────────────────
+# ── only complete / user pause end an active agent goal (no turn budget) ───────────────────────
 
 
 def test_user_pause_still_pauses_an_agent_goal(goals_mod, monkeypatch):
@@ -153,14 +153,25 @@ def test_user_pause_still_pauses_an_agent_goal(goals_mod, monkeypatch):
     assert mgr.evaluate_after_turn("anything")["should_continue"] is False
 
 
-def test_max_turns_still_stops_even_when_blocked(goals_mod, monkeypatch):
+def test_agent_goal_has_no_turn_budget(goals_mod, monkeypatch):
+    """Live 2026-10-09: '⏸ Goal paused — 23/20 turns used' on an agent goal that still had work.
+    Muse has no budget on agent goals; only acceptance criteria or a human-only blocker end them."""
     mgr = goals_mod.GoalManager(session_id="mt")
     assert mgr.set_agent_goal(RELEASE_GOAL, max_turns=2) is not None
-    _judge(goals_mod, monkeypatch, _human_block())
+    _judge(goals_mod, monkeypatch, {"verdict": "continue", "reason": "PR still open"})
+    for i in range(5):
+        d = mgr.evaluate_after_turn(f"t{i}")
+        assert d["status"] == "active" and d["should_continue"] is True
+    assert goals_mod.load_goal("mt").turns_used == 5
+
+
+def test_user_goal_keeps_turn_budget(goals_mod, monkeypatch):
+    mgr = goals_mod.GoalManager(session_id="ub")
+    mgr.set("user goal", max_turns=2)
+    _judge(goals_mod, monkeypatch, {"verdict": "continue", "reason": "more"})
     assert mgr.evaluate_after_turn("t1")["status"] == "active"
     d = mgr.evaluate_after_turn("t2")
-    assert d["status"] == "paused" and d["should_continue"] is False
-    assert "budget" in goals_mod.load_goal("mt").paused_reason
+    assert d["status"] == "paused" and "budget" in goals_mod.load_goal("ub").paused_reason
 
 
 def test_complete_still_closes_the_goal(goals_mod, monkeypatch):
