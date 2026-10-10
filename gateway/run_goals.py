@@ -107,7 +107,13 @@ class GatewayGoalsMixin:
         would quote that stale message (Telegram DM topics route anchorless via the topic id).
         """
         source = dataclasses.replace(source, message_id=None) if getattr(source, "message_id", None) else source
-        return MessageEvent(text=text, message_type=MessageType.TEXT, source=source, internal=internal)
+        event = MessageEvent(text=text, message_type=MessageType.TEXT, source=source, internal=internal)
+        # Self-injected like a scheduled heartbeat: the agent may answer it with a silence marker
+        # and nothing is delivered. Without this stamp a bare [SILENT] to "Continue working toward
+        # the active goal" is treated as silence on a HUMAN turn and the user gets the
+        # "model returned only a silence marker" fallback for every continuation.
+        event._goal_prompt = True
+        return event
 
     def _register_heartbeat_watch(self, quick_key: str, source: Any, session_id: str) -> None:
         """Track the canonical route and start the restart-recoverable poller."""

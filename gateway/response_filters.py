@@ -108,7 +108,8 @@ def display_kind_for_event(event: Any) -> str | None:
     by the gateway poller, never inferred from inbound text), but it deliberately stays
     non-internal so authorization and the emergency stop still apply to it.
     """
-    if getattr(event, "internal", False) or getattr(event, "_heartbeat_session_id", None):
+    if (getattr(event, "internal", False) or getattr(event, "_heartbeat_session_id", None)
+            or getattr(event, "_goal_prompt", False)):
         return INTERNAL_NOTIFICATION_DISPLAY_KIND
     return None
 
