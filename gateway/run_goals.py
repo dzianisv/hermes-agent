@@ -228,6 +228,10 @@ class GatewayGoalsMixin:
         metadata = None
         with suppress(Exception):
             metadata = self._thread_metadata_for_source(source)
+        # Audit line: every goal status notice that reaches a human chat is greppable
+        # ("goal status notice sent"), so machinery chatter leaking to users is detectable.
+        logger.info("goal status notice sent: chat=%s thread=%s text=%r",
+                    source.chat_id, getattr(source, "thread_id", None), message[:120])
         result = await adapter.send(source.chat_id, message, metadata=metadata)
         if result is not None and not getattr(result, "success", True):
             logger.warning(
