@@ -420,7 +420,8 @@ class TestWaitBarrier:
             assert decision["should_continue"] is False
             assert decision["continuation_prompt"] is None
             assert mgr.state.turns_used == 0  # no turn consumed while parked
-            assert "CI green" in decision["message"]
+            assert "CI green" in decision["reason"]
+            assert decision["message"] == ""  # park announced once by wait_on; later turns stay quiet
             assert mgr.state.status == "active"  # still active, just parked
         finally:
             proc.terminate()

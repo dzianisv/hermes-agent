@@ -1807,12 +1807,11 @@ class GoalManager:
         else:
             tgt = f"{max(0, int(state.waiting_until - time.time()))}s remaining"
         reason = state.waiting_reason or tgt
-        if _is_silence_park_reason(reason):
-            # A turn landing inside a silence backoff is machinery, not news: no user notice
-            # (same rule as the park itself; it leaked "waiting on 17s remaining: … silence
-            # marker (1x)" to the user's chat on 2026-10-10).
-            return _decision("active", False, None, "waiting", reason, "")
-        return _decision("active", False, None, "waiting", reason, f"⏳ Goal parked — waiting on {tgt}: {reason}")
+        # A park is announced ONCE, by whoever parked it (judge wait / agent wait / silence
+        # backoff). Turns that land while it is still running (subagent completions, kanban
+        # events, user pings) are quiesced silently — re-announcing "waiting on 280s remaining"
+        # on every event spammed the user's chat on 2026-10-10. Muse announces a wait once.
+        return _decision("active", False, None, "waiting", reason, "")
 
     def _apply_wait_directive(self, wait_directive: Dict[str, Any], reason: str, *, active_delegations: int = 0) -> Optional[Dict[str, Any]]:
         """Judge said WAIT: set the barrier and park. The counted turn stands (the judge ran) but no

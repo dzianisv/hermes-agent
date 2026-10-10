@@ -119,3 +119,12 @@ def test_turn_inside_silence_backoff_emits_no_user_message(hermes_home):
     d2 = mgr.evaluate_after_turn("some real text", user_initiated=True)   # still inside the 60s park
     assert d2["verdict"] == "waiting"
     assert d2["message"] == ""
+
+
+def test_turn_inside_any_park_emits_no_user_message(hermes_home):
+    """A judge/agent wait is announced once by the parker; later turns inside it stay quiet."""
+    mgr = _goal("wait-quiet")
+    mgr.wait_for_seconds(300, reason="Waiting for the delegated live-test subagent")
+    d = mgr.evaluate_after_turn("subagent finished, here is the output", user_initiated=False)
+    assert d["verdict"] == "waiting"
+    assert d["message"] == ""
