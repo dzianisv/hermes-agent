@@ -129,6 +129,13 @@ def _all_checks_fallback(receipt: dict, repo: str, number: int, sha: str, branch
     runs = [run for page in pages for run in page["check_runs"]]
     if len({r["id"] for r in runs}) != pages[0]["total_count"]:
         raise ValueError("Incomplete check-run pagination")
+    # Re-runs land in new check suites; like GitHub's merge box, only the newest run per name counts.
+    newest: dict = {}
+    for r in runs:
+        key = (r["name"], (r.get("app") or {}).get("id"))
+        if key not in newest or (r.get("started_at") or "", r["id"]) > (newest[key].get("started_at") or "", newest[key]["id"]):
+            newest[key] = r
+    runs = list(newest.values())
     latest: dict = {}
     for s in (s for page in _api(f"repos/{repo}/commits/{sha}/statuses?per_page=100", paginate=True) for s in page):
         if s["context"] not in latest or s["id"] > latest[s["context"]]["id"]:

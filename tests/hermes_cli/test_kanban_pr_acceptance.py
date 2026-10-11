@@ -38,6 +38,9 @@ def github(tmp_path, monkeypatch):
                 if state.get("stale"):
                     run["head_sha"] = "b" * 40
                 runs = [] if state.get("missing") else [run]
+                if state.get("superseded"):  # older failed run of the same check in another suite
+                    runs.append({**run, "id": 41, "conclusion": "failure", "started_at": "2026-01-01T00:00:00Z"})
+                    run["started_at"] = "2026-01-02T00:00:00Z"
                 value = [{"total_count": 100 + len(runs), "check_runs": [
                     {**run, "id": 1000 + i, "name": "optional", "conclusion": "skipped"}
                     for i in range(100)]}, {"total_count": 100 + len(runs), "check_runs": runs}]
@@ -160,4 +163,7 @@ def test_plan_gated_rules_fall_back_to_all_exact_head_checks(github):
                 assert receipt["classification"] == conclusion
             if status == 500:
                 assert receipt["classification"] == "infra"
-        github.update(rules_status=None, merged=False)
+        github.update(rules_status=403, merged=True, conclusion="success", superseded=True)
+        tid = kb.create_task(conn, title="superseded rerun", completion_contract="acme/repo")
+        assert kb.complete_task(conn, tid, result="done", metadata=pr)
+        github.update(rules_status=None, merged=False, superseded=False)
