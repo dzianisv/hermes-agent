@@ -61,7 +61,13 @@ def collect_acceptance(contract: str, published_pr: str | None) -> dict:
             raise ValueError("PR is closed or current head is unavailable")
         protection = (pr.get("baseRef") or {}).get("branchProtectionRule") or {}
         required = {(r["context"], (r.get("app") or {}).get("databaseId")) for r in protection.get("requiredStatusChecks", [])}
-        rules = _api(f"repos/{repo}/rules/branches/{quote(branch, safe='')}?per_page=100", paginate=True)
+        try:
+            rules = _api(f"repos/{repo}/rules/branches/{quote(branch, safe='')}?per_page=100", paginate=True)
+        except subprocess.CalledProcessError as exc:
+            # Private free-plan repos answer 403 "Upgrade to GitHub Pro"; 404 = no rules API.
+            if required or not re.search(r"\(HTTP 40[34]\)", exc.stderr or ""):
+                raise
+            return _all_checks_fallback(receipt, repo, number, sha, branch, pr["state"])
         for page in rules:
             for rule in page:
                 if rule["type"] == "required_status_checks":
@@ -107,6 +113,46 @@ def collect_acceptance(contract: str, published_pr: str | None) -> dict:
         # Never persist gh stderr (credentials/host details); the failed phase is actionable.
         receipt.update(classification="infra", detail="GitHub acceptance evidence unavailable or incomplete; check gh authentication/API access and retry.")
         return receipt
+
+
+_PASSING = {"success", "skipped", "neutral"}
+
+
+def _all_checks_fallback(receipt: dict, repo: str, number: int, sha: str, branch: str, state: str) -> dict:
+    """Required checks are unreadable (plan-gated): accept only a merged PR whose
+    every exact-head check-run and latest commit status passed, with at least one success."""
+    receipt["required_source"] = "fallback:all-head-checks (branch rules API returned 403/404)"
+    if state != "MERGED":
+        receipt["detail"] = "Required checks are unreadable on this plan; the fallback accepts only a merged PR."
+        return receipt
+    pages = _api(f"repos/{repo}/commits/{sha}/check-runs?per_page=100&filter=latest", paginate=True)
+    runs = [run for page in pages for run in page["check_runs"]]
+    if len({r["id"] for r in runs}) != pages[0]["total_count"]:
+        raise ValueError("Incomplete check-run pagination")
+    latest: dict = {}
+    for s in (s for page in _api(f"repos/{repo}/commits/{sha}/statuses?per_page=100", paginate=True) for s in page):
+        if s["context"] not in latest or s["id"] > latest[s["context"]]["id"]:
+            latest[s["context"]] = {**s, "sha": sha}
+    outcomes = []
+    for check in runs + list(latest.values()):
+        is_run = "conclusion" in check
+        outcome = check.get("conclusion") if is_run else check["state"]
+        classification = _classify(check, sha, outcome, is_run)
+        if classification == "infra" and outcome in _PASSING:
+            classification = "success" if outcome == "success" else "skipped"
+        outcomes.append(classification)
+        receipt["checks"].append({"name": check.get("name") or check.get("context"), "id": check["id"],
+            "url": check.get("html_url") or check.get("target_url"),
+            "head_sha": check.get("head_sha", check.get("sha")),
+            "classification": classification, "conclusion": outcome})
+    current = _api(f"repos/{repo}/pulls/{number}")
+    if current["head"]["sha"] != sha or current["base"]["ref"] != branch or not current.get("merged"):
+        receipt.update(classification="stale", detail="PR head/base/merge state changed while collecting evidence; retry.")
+        return receipt
+    bad = next((x for x in outcomes if x not in ("success", "skipped")), None)
+    receipt["classification"] = bad or ("success" if "success" in outcomes else "missing")
+    receipt["ok"] = receipt["classification"] == "success"
+    return receipt
 
 
 def _classify(check: dict, sha: str, outcome: str | None, is_run: bool) -> str:

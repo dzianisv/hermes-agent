@@ -20,10 +20,15 @@ def github(tmp_path, monkeypatch):
             state["requests"].append(self.path)
             sha = state["head"]
             if self.path == "/graphql":
+                rule = None if state.get("rules_status") else {"requiredStatusChecks": [
+                    {"context": "required", "app": {"databaseId": 1}}]}
                 value = {"data": {"repository": {"pullRequest": {
-                    "headRefOid": sha, "baseRefName": "main", "state": "OPEN",
-                    "baseRef": {"branchProtectionRule": {"requiredStatusChecks": [
-                        {"context": "required", "app": {"databaseId": 1}}]}}}}}}
+                    "headRefOid": sha, "baseRefName": "main",
+                    "state": "MERGED" if state.get("merged") else "OPEN",
+                    "baseRef": {"branchProtectionRule": rule}}}}}
+            elif "/rules/branches/" in self.path and state.get("rules_status"):
+                self.send_error(state["rules_status"])
+                return
             elif "/rules/branches/" in self.path:
                 value = [[]]
             elif "/check-runs" in self.path:
@@ -43,7 +48,8 @@ def github(tmp_path, monkeypatch):
             elif "/statuses" in self.path:
                 value = [[]]
             elif "/pulls/" in self.path:
-                value = {"head": {"sha": sha}, "base": {"ref": "main"}, "state": "open"}
+                value = {"head": {"sha": sha}, "base": {"ref": "main"},
+                         "state": "closed" if state.get("merged") else "open", "merged": bool(state.get("merged"))}
             else:
                 self.send_error(404)
                 return
@@ -62,7 +68,8 @@ def github(tmp_path, monkeypatch):
     gh = shim / "gh"
     gh.write_text(f"#!{sys.executable}\nimport sys,urllib.request\n"
                   f"u='http://127.0.0.1:{server.server_port}/'+sys.argv[2]\n"
-                  "print(urllib.request.urlopen(u).read().decode())\n")
+                  "try: print(urllib.request.urlopen(u).read().decode())\n"
+                  "except urllib.error.HTTPError as e: sys.exit(f'gh: Upgrade to GitHub Pro (HTTP {e.code})')\n")
     gh.chmod(0o755)
     monkeypatch.setenv("PATH", str(shim) + os.pathsep + os.environ["PATH"])
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
@@ -129,3 +136,28 @@ def test_acceptance_receipts_and_terminal_write_share_run_ownership(github):
             assert kb.get_task(conn, tid).status != "done"
             assert conn.execute("SELECT count(*) FROM task_events WHERE task_id=? AND kind='pr_acceptance'", (tid,)).fetchone()[0] == 0
             github.pop("race")
+
+
+@pytest.mark.platforms("linux")
+def test_plan_gated_rules_fall_back_to_all_exact_head_checks(github):
+    """Private free-plan repo: rules API 403/404 -> every head check must pass and the PR be merged."""
+    pr = {"published_pr": "https://github.com/acme/repo/pull/7"}
+    with connect() as conn:
+        cases = [(403, True, "success", True), (404, True, "success", True),
+                 (403, True, "failure", False), (403, True, "pending", False),
+                 (403, False, "success", False), (500, True, "success", False)]
+        for status, merged, conclusion, expected in cases:
+            github.update(rules_status=status, merged=merged, conclusion=conclusion, head="a" * 40)
+            tid = kb.create_task(conn, title=f"fallback {status} {conclusion}", completion_contract="acme/repo")
+            assert kb.complete_task(conn, tid, result="done", metadata=pr) is expected, (status, merged, conclusion)
+            receipt = json.loads(conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance' "
+                                              "ORDER BY id DESC LIMIT 1", (tid,)).fetchone()[0])
+            assert receipt["head_sha"] == "a" * 40
+            if expected:
+                assert receipt["required_source"].startswith("fallback")
+                assert {c["classification"] for c in receipt["checks"]} >= {"skipped"}
+            if conclusion in ("failure", "pending"):
+                assert receipt["classification"] == conclusion
+            if status == 500:
+                assert receipt["classification"] == "infra"
+        github.update(rules_status=None, merged=False)
