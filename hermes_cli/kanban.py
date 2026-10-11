@@ -10,6 +10,7 @@ import argparse
 import contextlib
 import json
 import os
+import re
 import shlex
 import sys
 import time
@@ -1007,6 +1008,42 @@ def _cmd_complete(args: argparse.Namespace) -> int:
         return _bulk_apply(ids, op, lambda tid: f"Completed {tid}", fail_msg.__getitem__)
 
 
+def _repo_from_git_remote(path: str | None) -> str | None:
+    """OWNER/REPO of a workspace's ``origin`` remote on github.com, else None."""
+    import subprocess
+    if not path:
+        return None
+    try:
+        url = subprocess.run(["git", "-C", path, "remote", "get-url", "origin"],
+                             capture_output=True, text=True, timeout=10, check=True).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
+    m = re.search(r"github\.com[:/]([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?)(?:\.git)?/?$", url)
+    return m.group(1) if m else None
+
+
+def _edit_completion_contract(args: argparse.Namespace, contract: str) -> int:
+    with kbc.connect_closing() as conn:
+        if contract == "workspace":
+            task = kb.get_task(conn, args.task_id)
+            if not task:
+                return _err(f"no such task: {args.task_id}")
+            contract = _repo_from_git_remote(task.workspace_path)
+            if not contract:
+                return _err(f"kanban edit: cannot derive OWNER/REPO from workspace of {args.task_id}", 2)
+        try:
+            res = kb.set_completion_contract(conn, args.task_id, contract,
+                                             author=_profile_author(),
+                                             reason=getattr(args, "reason", None))
+        except ValueError as exc:
+            return _err(f"kanban edit: {exc}", 2)
+    if res is None:
+        return _err(f"cannot edit {args.task_id} (unknown id, or task is done/archived)")
+    print(f"Edited {args.task_id}: completion_contract {res['old']} -> {res['new']}"
+          + ("" if res["changed"] else " (unchanged)"))
+    return 0
+
+
 def _cmd_edit(args: argparse.Namespace) -> int:
     result = getattr(args, "result", None)
     raw_metadata = getattr(args, "metadata", None)
@@ -1017,8 +1054,14 @@ def _cmd_edit(args: argparse.Namespace) -> int:
     if result is None and (summary is not None or raw_metadata is not None):
         return _err("kanban edit: --summary and --metadata require --result", 2)
     step = getattr(args, "step", None)
+    contract = getattr(args, "completion_contract", None)
+    if contract is not None:
+        if any(v is not None for v in (title, body, priority, result, step)):
+            return _err("kanban edit: --completion-contract cannot be combined with other edits", 2)
+        return _edit_completion_contract(args, contract)
     if all(value is None for value in (title, body, priority, result, step)):
-        return _err("kanban edit: provide --title, --body, --priority, --result, or --step", 2)
+        return _err("kanban edit: provide --title, --body, --priority, --result, --step, "
+                    "or --completion-contract", 2)
     metadata, rc = _parse_metadata_flag(raw_metadata)
     if rc:
         return rc

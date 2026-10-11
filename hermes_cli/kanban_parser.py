@@ -348,6 +348,11 @@ _SPECS = [
         _arg("--result", help="Backfilled task result text for a done task"),
         _arg("--step", dest="step", metavar="KEY",
              help="Set current stage key (kanban.stages); 'none' clears. No handoff."),
+        _arg("--completion-contract", dest="completion_contract", metavar="CONTRACT",
+             help="Re-point the completion contract: local-only, OWNER/REPO, an exact "
+                  "GitHub PR URL, or 'workspace' to derive OWNER/REPO from the task "
+                  "workspace's git origin (e.g. after a repo rename). Audited."),
+        _arg("--reason", help="Reason recorded with --completion-contract"),
         *_STEP_HANDOFF,
     ], help="Edit task fields or recovery fields on an already-completed task"),
     _cmd("step", [

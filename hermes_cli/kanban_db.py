@@ -3757,6 +3757,37 @@ def edit_task(
     return True
 
 
+def set_completion_contract(
+    conn: sqlite3.Connection, task_id: str, contract: str, *,
+    author: str, reason: Optional[str] = None, board: Optional[str] = None,
+) -> Optional[dict]:
+    """Re-point a task's completion contract (e.g. after a GitHub repo rename).
+
+    The contract is validated like at create time. Done/archived tasks are
+    refused: their acceptance is already final. Records a
+    ``completion_contract_changed`` event plus an audit comment. Returns
+    ``{"old": ..., "new": ...}`` or None when the task is unknown/terminal.
+    """
+    from hermes_cli.kanban_pr_acceptance import validate_contract
+    contract = validate_contract(contract)
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, completion_contract FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        if row is None or row["status"] in {"done", "archived"}:
+            return None
+        old = row["completion_contract"] or "local-only"
+        if old == contract:
+            return {"old": old, "new": contract, "changed": False}
+        conn.execute("UPDATE tasks SET completion_contract = ? WHERE id = ?", (contract, task_id))
+        _append_event(conn, task_id, "completion_contract_changed",
+                      {"old": old, "new": contract, "author": author, "reason": reason})
+    note = f"completion_contract re-pointed: {old} -> {contract}" + (f" ({reason})" if reason else "")
+    add_comment(conn, task_id, author, note)
+    notify_task_updated(conn, task_id, ["completion_contract"], board=board)
+    return {"old": old, "new": contract, "changed": True}
+
+
 def block_task(
     conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None,
     kind: Optional[str] = None, expected_run_id: Optional[int] = None,
