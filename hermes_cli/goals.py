@@ -519,6 +519,8 @@ class GoalState:
     # Continuations answered with nothing / a bare silence marker in a row (backoff + pause).
     consecutive_silent: int = 0
     consecutive_human_pending: int = 0
+    # Judge ``wait`` verdicts in a row: each capped re-wake that only re-parks doubles the cap.
+    consecutive_wait: int = 0
     # User-added criteria (/subgoal). Both the judge and continuation prompts include them.
     subgoals: List[str] = field(default_factory=list)
     # Wait barrier (judge ``wait`` verdict or ``/goal wait``): parks the loop instead of re-poking the
@@ -559,7 +561,7 @@ class GoalState:
     def from_json(cls, raw: str) -> "GoalState":
         data = json.loads(raw)
         raw_subgoals = data.get("subgoals") or []
-        ints = {k: int(data.get(k) or 0) for k in ("turns_used", "consecutive_parse_failures", "consecutive_transport_failures", "waiting_on_delegations", "consecutive_blocked", "consecutive_silent", "consecutive_human_pending")}
+        ints = {k: int(data.get(k) or 0) for k in ("turns_used", "consecutive_parse_failures", "consecutive_transport_failures", "waiting_on_delegations", "consecutive_blocked", "consecutive_silent", "consecutive_human_pending", "consecutive_wait")}
         floats = {k: float(data.get(k) or 0.0) for k in ("created_at", "last_turn_at", "waiting_until", "waiting_since", "paused_at")}
         raw_pending = data.get("pending_human_decisions") or []
         return cls(
@@ -1707,7 +1709,12 @@ class GoalManager:
             # Backoff parks (``uncapped``) are exempt: they exist because re-running produced
             # nothing (silence / the same human-only question); clamping them to the cap turned
             # a 1800 s backoff into a 300 s wake storm (132 wakes in one day, 2026-10-11).
-            cap = time.time() + max_wait_seconds()
+            # A judge that re-issues the same far deadline on every capped wake (e.g. "wait until
+            # 6:33 PM" clamped to 300 s -> 18 full agent turns in 90 min, 2026-10-12) gets the
+            # same exponential backoff as silence: the cap doubles per consecutive wait verdict.
+            n = max(1, int(state.consecutive_wait or 1))
+            cap_s = min(max(max_wait_seconds(), max_wait_seconds() * (2 ** (n - 1))), SILENT_TURN_BACKOFF_MAX_S)
+            cap = time.time() + cap_s
             barrier["waiting_until"] = min(float(barrier["waiting_until"]), cap)
         for k, v in barrier.items():
             setattr(state, k, v)
@@ -1928,9 +1935,11 @@ class GoalManager:
         state.consecutive_transport_failures = state.consecutive_transport_failures + 1 if transport_failed else 0
 
         if verdict == "wait" and wait_directive:
+            state.consecutive_wait += 1
             parked = self._apply_wait_directive(wait_directive, reason, active_delegations=active_delegations)
             if parked is not None:
                 return parked
+        state.consecutive_wait = 0
 
         # BLOCKED is NOT done. For a USER goal: pause so the user sees the judge's reason and can
         # re-scope or override (#100954). For an AGENT goal: never pause — see below.
