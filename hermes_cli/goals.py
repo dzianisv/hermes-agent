@@ -48,7 +48,7 @@ DEFAULT_MAX_CONSECUTIVE_PARSE_FAILURES = 3
 # 300 continuations in 30 minutes against a model that kept answering NO_REPLY.
 DEFAULT_MAX_CONSECUTIVE_SILENT_TURNS = 5  # after this many, stop doubling and hold at the max backoff
 SILENT_TURN_BACKOFF_BASE_S = 60
-SILENT_TURN_BACKOFF_MAX_S = 1800  # ceiling before goals.max_wait_seconds (300 s default) also clamps it; never paused for silence
+SILENT_TURN_BACKOFF_MAX_S = 1800  # ceiling for backoff parks (exempt from goals.max_wait_seconds); never paused for silence
 _SILENCE_MARKERS = frozenset({"NO_REPLY", "NO REPLY", "[SILENT]", "SILENT"})
 
 
@@ -1698,12 +1698,15 @@ class GoalManager:
 
     # --- /goal wait barrier -------------------------------------------
 
-    def _park(self, reason: str, **barrier) -> GoalState:
+    def _park(self, reason: str, *, uncapped: bool = False, **barrier) -> GoalState:
         state = self._require_active()
         state.clear_wait()
-        if state.source == "agent" and barrier.get("waiting_until"):
+        if state.source == "agent" and barrier.get("waiting_until") and not uncapped:
             # Agent goal: a timed wait sleeps at most ``goals.max_wait_seconds`` — the wake then
             # tells the agent to check what it waited on (poll, review) and keep going.
+            # Backoff parks (``uncapped``) are exempt: they exist because re-running produced
+            # nothing (silence / the same human-only question); clamping them to the cap turned
+            # a 1800 s backoff into a 300 s wake storm (132 wakes in one day, 2026-10-11).
             cap = time.time() + max_wait_seconds()
             barrier["waiting_until"] = min(float(barrier["waiting_until"]), cap)
         for k, v in barrier.items():
@@ -1894,7 +1897,7 @@ class GoalManager:
             # real reply (user turn, heartbeat answer with content) resets the counter.
             backoff = min(SILENT_TURN_BACKOFF_BASE_S * (2 ** (n - 1)), SILENT_TURN_BACKOFF_MAX_S)
             self._park(f"{_SILENCE_PARK_PREFIX} ({n}x); backing off {backoff}s",
-                       waiting_until=time.time() + backoff)
+                       uncapped=True, waiting_until=time.time() + backoff)
             state.last_verdict, state.last_reason = "silent", "no reply"
             self._save()
             # No user-facing message: a silent turn on a self-injected continuation is internal
@@ -1966,7 +1969,7 @@ class GoalManager:
                     n = state.consecutive_human_pending
                     backoff = min(SILENT_TURN_BACKOFF_BASE_S * (2 ** (n - 1)), SILENT_TURN_BACKOFF_MAX_S)
                     self._park(f"{_HUMAN_PARK_PREFIX} ({n}x); backing off {backoff}s",
-                               waiting_until=time.time() + backoff)
+                               uncapped=True, waiting_until=time.time() + backoff)
                     self._save()
                     logger.info("goal %s: human-only step repeated %dx, backing off %ss: %s",
                                 self.session_id, n, backoff, question[:120])

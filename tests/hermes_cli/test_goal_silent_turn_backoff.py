@@ -94,7 +94,10 @@ def test_repeated_silence_never_pauses_goal_and_caps_backoff(hermes_home):
         st = goals.GoalManager("sid-silent-3").state
         assert st.status == "active"
         remaining = st.waiting_until - time.time()
-        cap = min(goals.SILENT_TURN_BACKOFF_MAX_S, goals.max_wait_seconds())
+        # Backoff parks are exempt from goals.max_wait_seconds: clamping them to 300 s turned
+        # a quiet 1800 s backoff into a 6-minute wake storm (132 wakes/day, 2026-10-11).
+        cap = goals.SILENT_TURN_BACKOFF_MAX_S
+        assert cap > goals.max_wait_seconds()
         assert cap - 5 < remaining <= cap
 
 
