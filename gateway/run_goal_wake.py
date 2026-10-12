@@ -93,7 +93,12 @@ async def _wake_one(runner, session_id: str, entry: Any, profile_name: Optional[
         prompt = await runner._run_in_executor_with_context(_lift)
         if not prompt:
             return False
-        event = runner._synthetic_prompt_event(source, prompt)
+        # A handed-off lane's origin carries the gateway's own ``system:handoff`` principal (the
+        # handoff turn itself ran ``internal=True`` on it); the human allowlist can never match it,
+        # so a wake on that lane is internal too — otherwise it dies at authz ("Unauthorized user:
+        # system:handoff") and the goal is stranded on its destination channel.
+        internal = str(getattr(source, "user_id", "") or "").startswith("system:")
+        event = runner._synthetic_prompt_event(source, prompt, internal=internal)
         event.metadata["gateway_session_key"] = session_key
         logger.info(
             "%s: %s for session %s — injecting continuation (%s chat=%s thread=%s)",

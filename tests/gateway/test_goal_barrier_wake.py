@@ -297,7 +297,8 @@ class TestHandedOffSessionWakesOnDestination:
         db.complete_handoff(sid)
 
         telegram = _entry(sid)
-        slack_source = SessionSource(platform="slack", chat_id="C1", user_id="u1", chat_type="group", thread_id="t1")
+        slack_source = SessionSource(platform="slack", chat_id="C1", user_id="system:handoff", chat_type="group",
+                                     thread_id="t1", user_name="Handoff")
         slack = SimpleNamespace(session_id=sid, session_key="agent:main:slack:C1:t1", origin=slack_source,
                                 suspended=False, transport_profile=None)
         runner = _Runner([telegram, slack])  # telegram first == newest in a real store
@@ -306,6 +307,15 @@ class TestHandedOffSessionWakesOnDestination:
         event = runner.adapter.handled[0]
         assert str(getattr(event.source.platform, "value", event.source.platform)) == "slack"
         assert event.source.chat_id == "C1"
+        assert event.internal is True  # system:handoff principal cannot pass the human allowlist
+
+    def test_human_origin_wake_stays_non_internal(self, hermes_home):
+        sid = "gw-wake-human"
+        mgr = _parked_agent_goal(sid)
+        _elapse(mgr)
+        runner = _Runner([_entry(sid)])
+        assert _run(runner) == 1
+        assert runner.adapter.handled[0].internal is False  # authz + emergency stop still apply
 
     def test_source_lane_entry_still_wakes_when_destination_has_no_entry(self, hermes_home):
         sid = "gw-wake-handoff-orphan"
