@@ -101,7 +101,10 @@ CONTINUATION_PROMPT_HUMAN_PENDING_SUFFIX = (
 # goal still active (idle, stopped, blocked). The goal is never parked by the judge.
 MUSE_CONTINUATION_PROMPT = (
     "Continue working toward the active goal, verify requirement by requirement.\n"
-    "Goal: {goal}"
+    "Goal: {goal}\n"
+    "This is a self-wake, not a user message: if nothing changed and there is no new step you can "
+    "take right now, reply with exactly [SILENT] — silence means \"no news\"; never post a "
+    "nothing-changed status."
 )
 
 # Prepended to the continuation that resumes a goal after a wait barrier lifted (timer elapsed, pid
@@ -1857,7 +1860,11 @@ class GoalManager:
             parked_state = self.wait_for_seconds(int(wait_directive["seconds"]), reason=reason, on_delegations=active_delegations)
             # Agent goals are capped (goals.max_wait_seconds): report the real sleep, not the ask.
             tgt = f"{max(0, math.ceil(parked_state.waiting_until - time.time()))}s"
-        return _decision("active", False, None, "wait", reason, f"⏳ Goal parked (judge) — waiting on {tgt}: {reason}")
+        # Wait verdicts are loop bookkeeping, not news: the park shows in logs / ``/goal``. Surfacing them
+        # on every self-wake ("⏳ Goal parked (judge) — waiting on 300s" every few minutes) is the chat
+        # spam Muse never produces; only done/paused/needs-human verdicts speak.
+        logger.info("goal %s: judge parked %s: %s", self.session_id, tgt, reason)
+        return _decision("active", False, None, "wait", reason, "")
 
     @staticmethod
     def _budget_exhausted(state: GoalState) -> bool:

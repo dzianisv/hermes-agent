@@ -53,10 +53,9 @@ class TestAgentGoalWaitCap:
         assert decision["should_continue"] is False          # parked, but only briefly
         remaining = mgr.state.waiting_until - before
         assert 0 < remaining <= goals.DEFAULT_MAX_WAIT_SECONDS + 1
-        # The notice reports the real sleep, not the judge's 900s ask.
-        assert "waiting on 900s" not in decision["message"]
-        assert "⏳ Goal parked (judge) — waiting on " in decision["message"]
-        assert decision["message"].endswith(": waiting on CI")
+        # A wait verdict is loop bookkeeping, never a chat notice (the park is visible in /goal).
+        assert decision["message"] == ""
+        assert decision["reason"] == "waiting on CI"
 
     def test_cap_reads_goals_max_wait_seconds(self, hermes_home):
         mgr = _agent_goal("agent-wait-cfg")
@@ -89,7 +88,7 @@ class TestAgentGoalWaitCap:
         with _judge_wait(900, "waiting on CI"):
             decision = mgr.evaluate_after_turn("pushed; CI running")
         assert mgr.state.waiting_until - before > 890
-        assert "waiting on 900s: waiting on CI" in decision["message"]
+        assert decision["message"] == ""  # wait verdicts never speak, user goals included
 
 
 class TestWaitElapsedContinuation:
