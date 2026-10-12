@@ -2031,10 +2031,9 @@ class GoalManager:
             return self._budget_pause(state, "continue", reason)
 
         self._save()
-        return _decision(
-            "active", True, self.next_continuation_prompt(), "continue", reason,
-            f"↻ Continuing toward goal ({state.turns_used}/{state.max_turns}): {reason}",
-        )
+        # Progress is visible in the log / `/goal status`, never as a chat bubble: a "↻ Continuing
+        # toward goal (9/20)" line after every turn is machinery text (97/day on Doc Brown's thread).
+        return _decision("active", True, self.next_continuation_prompt(), "continue", reason, "")
 
     def _human_pending_prompt(self, question: str, count: int) -> str:
         body = self.next_continuation_prompt() or ""

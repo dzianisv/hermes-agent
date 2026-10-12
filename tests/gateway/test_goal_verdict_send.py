@@ -136,11 +136,10 @@ async def test_goal_verdict_continue_enqueues_continuation(hermes_home):
             source=src,
             final_response="here's a partial edit",
         )
-        await _drain_until(lambda: adapter.sends and adapter._pending_messages)
+        await _drain_until(lambda: adapter._pending_messages)
 
-    # Status line sent back
-    assert len(adapter.sends) == 1
-    assert "Continuing toward goal" in adapter.sends[0]["content"]
+    # No status bubble: progress lives in the log / `/goal status`, never in chat
+    assert not any("Continuing toward goal" in s["content"] for s in adapter.sends)
     # Continuation prompt enqueued for next turn
     assert adapter._pending_messages, "continuation prompt must be enqueued in pending_messages"
 
