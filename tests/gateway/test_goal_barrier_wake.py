@@ -99,7 +99,9 @@ class _Runner:
 
     @staticmethod
     def _synthetic_prompt_event(source, text, *, internal=False):
-        return MessageEvent(text=text, message_type=MessageType.TEXT, source=source, internal=internal)
+        # Real builder (not a stub): the system:* -> internal rule lives there and is what we test.
+        from gateway.run_goals import GatewayGoalsMixin as GoalsMixin
+        return GoalsMixin._synthetic_prompt_event(source, text, internal=internal)
 
 
 def _entry(sid: str, chat: str = "c1"):
@@ -338,3 +340,13 @@ class TestHandedOffSessionWakesOnDestination:
 
         assert _run(runner) == 1
         assert runner.adapter.handled[0].source.chat_id == "newest"
+
+
+def test_synthetic_prompt_event_marks_system_principal_internal():
+    """Every self-injected prompt (wake, continuation, heartbeat) on a handed-off lane must be
+    internal: system:handoff can never pass the human allowlist (agentpod 03:34 continuation died)."""
+    from gateway.run_goals import GatewayGoalsMixin as GoalsMixin
+    handoff = SessionSource(platform="slack", chat_id="C1", user_id="system:handoff", chat_type="group", thread_id="t")
+    human = SessionSource(platform="slack", chat_id="C1", user_id="U1", chat_type="group", thread_id="t")
+    assert GoalsMixin._synthetic_prompt_event(handoff, "go").internal is True
+    assert GoalsMixin._synthetic_prompt_event(human, "go").internal is False

@@ -107,6 +107,11 @@ class GatewayGoalsMixin:
         would quote that stale message (Telegram DM topics route anchorless via the topic id).
         """
         source = dataclasses.replace(source, message_id=None) if getattr(source, "message_id", None) else source
+        # A handed-off lane's origin carries the gateway's own ``system:handoff`` principal; the human
+        # allowlist can never match it, so every self-injected prompt on such a lane is internal or it
+        # dies at authz ("Unauthorized user: system:handoff") and the goal/heartbeat stalls there.
+        if str(getattr(source, "user_id", "") or "").startswith("system:"):
+            internal = True
         event = MessageEvent(text=text, message_type=MessageType.TEXT, source=source, internal=internal)
         # Self-injected like a scheduled heartbeat: the agent may answer it with a silence marker
         # and nothing is delivered. Without this stamp a bare [SILENT] to "Continue working toward
