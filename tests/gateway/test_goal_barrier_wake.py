@@ -279,3 +279,52 @@ class TestIdleActiveWake:
         monkeypatch.setattr(goals, "idle_wake_seconds", lambda: 0)
         runner = _Runner([_entry("gw-idle-5")])
         assert _run(runner) == 0
+
+
+class TestHandedOffSessionWakesOnDestination:
+    """A handed-off session keeps its old routing entry (store entries are never deleted), and the
+    source lane's entry stays the most-recently-updated one for hours because the wakes themselves
+    touch it. Without consulting ``handoff_platform`` a Telegram-born goal moved to Slack kept
+    waking — and posting judge notices — into Telegram."""
+
+    def test_wake_picks_the_handoff_destination_entry_not_the_newest(self, hermes_home):
+        sid = "gw-wake-handoff"
+        mgr = _parked_agent_goal(sid)
+        _elapse(mgr)
+        db = goals._get_session_db()
+        db.create_session(sid, "telegram")
+        assert db.request_handoff(sid, "slack")
+        db.complete_handoff(sid)
+
+        telegram = _entry(sid)
+        slack_source = SessionSource(platform="slack", chat_id="C1", user_id="u1", chat_type="group", thread_id="t1")
+        slack = SimpleNamespace(session_id=sid, session_key="agent:main:slack:C1:t1", origin=slack_source,
+                                suspended=False, transport_profile=None)
+        runner = _Runner([telegram, slack])  # telegram first == newest in a real store
+
+        assert _run(runner) == 1
+        event = runner.adapter.handled[0]
+        assert str(getattr(event.source.platform, "value", event.source.platform)) == "slack"
+        assert event.source.chat_id == "C1"
+
+    def test_source_lane_entry_still_wakes_when_destination_has_no_entry(self, hermes_home):
+        sid = "gw-wake-handoff-orphan"
+        mgr = _parked_agent_goal(sid)
+        _elapse(mgr)
+        db = goals._get_session_db()
+        db.create_session(sid, "telegram")
+        assert db.request_handoff(sid, "slack")
+        db.complete_handoff(sid)
+        runner = _Runner([_entry(sid)])
+
+        assert _run(runner) == 1  # degrade to the lane we have rather than strand the goal
+
+    def test_no_handoff_keeps_the_newest_entry(self, hermes_home):
+        sid = "gw-wake-nohandoff"
+        mgr = _parked_agent_goal(sid)
+        _elapse(mgr)
+        goals._get_session_db().create_session(sid, "telegram")
+        runner = _Runner([_entry(sid, "newest"), _entry(sid, "older")])
+
+        assert _run(runner) == 1
+        assert runner.adapter.handled[0].source.chat_id == "newest"

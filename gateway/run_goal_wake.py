@@ -18,11 +18,17 @@ scope (``_handoff_watch_scopes`` shape) and each hit is delivered through that p
 from __future__ import annotations
 
 import logging
+from contextlib import suppress
 from typing import Any, Optional
 
 logger = logging.getLogger("gateway.run")
 
 _LABEL = "goal barrier wake"
+
+
+def _origin_platform(origin: Any) -> str:
+    plat = getattr(origin, "platform", "")
+    return str(getattr(plat, "value", plat) or "").lower()
 
 
 def _scope_for(profile_home):
@@ -113,6 +119,30 @@ async def _scan_one_store(runner, profile_name: Optional[str]) -> int:
         for entry in store.list_sessions():
             if entry.session_id and entry.origin is not None and not getattr(entry, "suspended", False):
                 entries_by_sid.setdefault(entry.session_id, entry)
+        # A handed-off session keeps its old routing key (store entries are never deleted on handoff),
+        # so "most recently updated" can still be the *source* channel for hours — a Telegram-born goal
+        # moved to Slack kept waking into Telegram. The session row names the destination platform.
+        session_db = getattr(runner, "_goal_session_db", None)
+        if session_db is None:
+            with suppress(Exception):
+                from hermes_cli.goals import _get_session_db
+                session_db = _get_session_db()
+        if session_db is not None:
+            for sid, entry in list(entries_by_sid.items()):
+                with suppress(Exception):
+                    row = session_db.get_session(sid) or {}
+                    if row.get("handoff_state") != "completed":
+                        continue
+                    # The row's chat/thread get re-stamped by whichever lane last ran a turn (including
+                    # these wakes), so only ``handoff_platform`` is trustworthy: newest entry on it wins.
+                    want = str(row.get("handoff_platform") or "").lower()
+                    if not want or _origin_platform(entry.origin) == want:
+                        continue
+                    for other in store.list_sessions():  # newest first
+                        if other.session_id == sid and other.origin is not None \
+                                and not getattr(other, "suspended", False) and _origin_platform(other.origin) == want:
+                            entries_by_sid[sid] = other
+                            break
     woken = 0
     for rows, idle in ((parked, False), (idle_rows, True)):
         for session_id, _state in rows:
