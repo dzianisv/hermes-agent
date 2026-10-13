@@ -554,7 +554,10 @@ DEFAULT_CLAIM_TTL_SECONDS = 15 * 60
 # gap 3). This catches the logic-loop case where the process is technically running but not making
 # observable progress. ``_touch_activity`` bridges chunk-level liveness into ``last_heartbeat_at`` via
 # #31752, so any genuinely active worker keeps its heartbeat fresh as a side effect of normal API traffic.
-DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS = 60 * 60
+# Bounded at 2x the claim TTL (harness gap #25): at 1h a wedged worker kept its card 60-110 min past its
+# last sign of life, each pass re-extending the claim by one TTL. Override with
+# ``HERMES_KANBAN_CLAIM_HEARTBEAT_MAX_STALE_SECONDS``.
+DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS = 2 * DEFAULT_CLAIM_TTL_SECONDS
 
 # Grace when a host-local worker survived termination (e.g. parked in D state
 # under memory.high, SIGKILL pending): releasing now would spawn a duplicate.
@@ -567,6 +570,12 @@ def _resolve_claim_ttl_seconds(ttl_seconds: Optional[int] = None) -> int:
         return max(1, int(ttl_seconds))
 
     return _env_int("HERMES_KANBAN_CLAIM_TTL_SECONDS", DEFAULT_CLAIM_TTL_SECONDS, minimum=1)
+
+
+def _resolve_heartbeat_max_stale_seconds() -> int:
+    """``HERMES_KANBAN_CLAIM_HEARTBEAT_MAX_STALE_SECONDS`` else 2x the effective claim TTL."""
+    default = max(DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS, 2 * _resolve_claim_ttl_seconds())
+    return _env_int("HERMES_KANBAN_CLAIM_HEARTBEAT_MAX_STALE_SECONDS", default, minimum=1)
 
 
 # ``detect_crashed_workers`` skips ``_pid_alive`` this long after start: the
@@ -2930,6 +2939,10 @@ def release_stale_claims(
     so any genuinely active worker keeps its heartbeat fresh as a side effect of normal API traffic.
     ``enforce_max_runtime`` and ``detect_crashed_workers`` remain the upper bounds for genuinely wedged or
     dead workers.
+
+    Harness gap #25: the window is ``_resolve_heartbeat_max_stale_seconds`` (2x TTL = 30 min by default,
+    was a fixed 1h), and a host-local worker whose PID is gone is reclaimed on this pass with
+    ``exit_reason.reason = "pid_dead"`` — the extend branch requires a live PID.
     """
     now = int(time.time())
     reclaimed = 0
@@ -2941,15 +2954,17 @@ def release_stale_claims(
         "WHERE status = 'running' AND claim_expires IS NOT NULL "
         "  AND claim_expires < ?", (now,),
     ).fetchall()
+    max_stale = _resolve_heartbeat_max_stale_seconds()
     for row in stale:
         host_local = (row["claim_lock"] or "").startswith(host_prefix)
         hb = row["last_heartbeat_at"]
-        # Backstop: a heartbeat older than the max-stale threshold means no
+        # Backstop: no heartbeat for ``max_stale`` (2x TTL by default) means no
         # observable progress — reclaim even if the PID is alive (logic loop).
-        heartbeat_stale = hb is not None and (now - int(hb)) > DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS
+        heartbeat_stale = hb is not None and (now - int(hb)) > max_stale
         started_at = _row_get(row, "worker_started_at")
-        if (host_local and row["worker_pid"] and _worker_alive(row["worker_pid"], started_at)
-                and not heartbeat_stale):
+        pid_dead = bool(host_local and row["worker_pid"]
+                        and not _worker_alive(row["worker_pid"], started_at))
+        if (host_local and row["worker_pid"] and not pid_dead and not heartbeat_stale):
             _extend_live_stale_claim(conn, row, now)
             continue
 
@@ -2977,6 +2992,7 @@ def release_stale_claims(
             run_id = _record_reclaim(
                 conn, row["id"], termination,
                 error=f"stale_lock={row['claim_lock']}",
+                reason=_stale_reclaim_reason(pid_dead, heartbeat_stale),
                 payload={
                     "stale_lock": row["claim_lock"],
                     "worker_pid": _opt_int(row["worker_pid"]),
@@ -2985,6 +3001,7 @@ def release_stale_claims(
                     "now": now,
                     "host_local": host_local,
                     "heartbeat_stale": bool(heartbeat_stale),
+                    "pid_dead": pid_dead,
                     "retry_status": retry_status,
                 },
             )
@@ -3008,15 +3025,27 @@ def release_stale_claims(
     return reclaimed
 
 
+def _stale_reclaim_reason(pid_dead: bool, heartbeat_stale: bool) -> str:
+    """``exit_reason.reason`` for a TTL reclaim: why the claim was not extended."""
+    from hermes_cli import kanban_worker_exit as kwe
+
+    if pid_dead:
+        return kwe.PID_DEAD
+    if heartbeat_stale:
+        return kwe.HEARTBEAT_STALE
+    return kwe.RECLAIMED
+
+
 def _record_reclaim(
     conn: sqlite3.Connection, task_id: str, termination: dict, *, error: str, payload: dict,
+    reason: Optional[str] = None,
 ) -> Optional[int]:
     """Close the active run as ``reclaimed`` and emit the ``reclaimed`` event
     (payload merged with the termination report). Caller holds the txn."""
     from hermes_cli import kanban_worker_exit as kwe
 
     exit_reason = kwe.build_exit_reason(
-        conn, task_id, reason=kwe.RECLAIMED, run_id=_current_run_id(conn, task_id),
+        conn, task_id, reason=reason or kwe.RECLAIMED, run_id=_current_run_id(conn, task_id),
     )
     run_id = _end_run(
         conn, task_id, outcome="reclaimed", status="reclaimed", error=error,

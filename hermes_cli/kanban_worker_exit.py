@@ -30,6 +30,10 @@ RC_NONZERO = "rc_nonzero"
 RC0_NO_HANDOFF = "rc0_no_handoff"
 TIMEOUT = "timeout"
 RECLAIMED = "reclaimed"
+# TTL reclaim of a host-local worker whose PID is gone (or recycled).
+PID_DEAD = "pid_dead"
+# TTL reclaim of a live worker with no heartbeat for the max-stale window.
+HEARTBEAT_STALE = "heartbeat_stale"
 
 TRANSIENT_REASONS = frozenset({SIGNAL_KILLED, GATEWAY_SHUTDOWN})
 HARNESS_REASONS = frozenset({RC0_NO_HANDOFF, RC_NONZERO})
