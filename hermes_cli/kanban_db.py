@@ -4153,7 +4153,27 @@ def request_changes(
         ).fetchone()[0])
         rounds = prior_rounds + 1
         round_limit = review_round_limit()
-        if round_limit and rounds >= round_limit:
+        # Gap #22: parking in triage kept the implementer as assignee, so the
+        # card was promoted straight back to the same engineer and every later
+        # round re-tripped the cap (t_e00cedf8: 13 rounds, 10 loop events).
+        # Rounds now count since the last architect escalation, and a change
+        # request past the cap hands the card to the architect with the full
+        # findings history instead of another implementer run.
+        last_esc = conn.execute(
+            "SELECT MAX(id) FROM task_events WHERE task_id = ? AND kind = 'review_escalated'",
+            (task_id,),
+        ).fetchone()[0]
+        window_rounds = int(conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id = ? AND kind = 'changes_requested' AND id > ?",
+            (task_id, last_esc or 0),
+        ).fetchone()[0]) + 1
+        architect: Optional[str] = None
+        if round_limit and window_rounds > round_limit:
+            from hermes_cli.kanban_wait_on import respec_assignee
+            architect = _nonblank_str(respec_assignee())
+            if not architect:
+                new_status = "triage"
+        elif round_limit and window_rounds >= round_limit:
             new_status = "triage"
         # consecutive_failures deliberately PRESERVED: a review transition is
         # not evidence the pathology cleared; only complete_task resets it.
@@ -4171,7 +4191,7 @@ def request_changes(
                    last_failure_error = NULL
              WHERE id = ? AND status = 'running' AND current_run_id = ?
             """,
-            (new_status, implementer, task_id, int(current_run_id)),
+            (new_status, architect or implementer, task_id, int(current_run_id)),
         )
         if cur.rowcount != 1:
             return False, "task changed during review handoff"
@@ -4195,6 +4215,30 @@ def request_changes(
             },
             run_id=run_id,
         )
+        if architect:
+            history = [
+                {"round": i + 1, **{k: v for k, v in _json_dict(r[0]).items()
+                                    if k in ("reason", "findings", "reviewer", "reviewed_sha")}}
+                for i, r in enumerate(conn.execute(
+                    "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'changes_requested' "
+                    "ORDER BY id", (task_id,)))
+            ]
+            _append_event(
+                conn, task_id, "review_escalated",
+                {"rounds": window_rounds, "limit": round_limit, "architect": architect,
+                 "implementer": implementer, "history": history},
+                run_id=run_id,
+            )
+            lines = [f"REVIEW LOOP ESCALATION: {window_rounds} change-request rounds exceeded "
+                     f"kanban.review_round_limit={round_limit}. Architect {architect}: re-spec the "
+                     f"card (SCOPE/ACCEPTANCE/PROOF) so one pass can close every finding, then "
+                     f"reassign to {implementer}. Findings history:"]
+            lines += [f"- round {h['round']}: {h.get('reason', '')}" for h in history]
+            conn.execute(
+                "INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?, ?, ?, ?)",
+                (task_id, "kanban-harness", "\n".join(lines), int(time.time())),
+            )
+            return True, architect
         if new_status == "triage":
             _append_event(
                 conn, task_id, "review_loop_detected",

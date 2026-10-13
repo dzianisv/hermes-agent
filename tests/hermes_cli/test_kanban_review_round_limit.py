@@ -103,3 +103,53 @@ def test_active_limit_zero_disables(kanban_home):
         tid = kb.create_task(conn, title="x", assignee="software-engineer")
         _add_closed_run(conn, tid, 10 * 86400)
         assert kb.claim_task(conn, tid) is not None
+
+
+ARCH_CFG = ("kanban:\n  review_round_limit: 3\n  design_phase:\n    architects: [architect-critic-fable]\n"
+            "    architect: architect-critic-fable\n")
+
+
+def _rereview(conn, tid, reason):
+    if kb.get_task(conn, tid).status == "triage":
+        kb.specify_triage_task(conn, tid, body="PROOF: live check X")
+    claimed = kb.claim_task(conn, tid)
+    assert claimed is not None
+    assert kb.request_review(conn, tid, summary="PR ready", reviewer="reviewer",
+                             expected_run_id=claimed.current_run_id)
+    kb.claim_review_task(conn, tid)
+    ok, who = kb.request_changes(conn, tid, reason=reason)
+    assert ok, who
+    return who, kb.get_task(conn, tid)
+
+
+def test_fourth_change_request_routes_to_architect_with_history(kanban_home):
+    """Gap #22: t_e00cedf8 took 13 change requests because triage re-promoted
+    the card to the same implementer; round 4 must go to the architect."""
+    import json
+    (kanban_home / "config.yaml").write_text(ARCH_CFG)
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="ship it", assignee="software-engineer")
+        _round(conn, tid, first=True)
+        for i in (2, 3):
+            _rereview(conn, tid, f"finding {i}")
+        who, t = _rereview(conn, tid, "finding 4")
+        assert who == "architect-critic-fable"
+        assert t.assignee == "architect-critic-fable"
+        esc = _events(conn, tid, "review_escalated")
+        assert len(esc) == 1
+        hist = json.loads(esc[0][0])["history"]
+        assert [h["reason"] for h in hist] == ["proof missing", "finding 2", "finding 3", "finding 4"]
+        body = conn.execute("SELECT body FROM task_comments WHERE task_id=? AND author='kanban-harness'",
+                            (tid,)).fetchone()[0]
+        assert "REVIEW LOOP ESCALATION" in body and "finding 3" in body
+
+
+def test_under_cap_returns_to_implementer(kanban_home):
+    (kanban_home / "config.yaml").write_text(ARCH_CFG)
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="ship it", assignee="software-engineer")
+        t = _round(conn, tid, first=True)
+        assert (t.status, t.assignee) == ("ready", "software-engineer")
+        who, t = _rereview(conn, tid, "finding 2")
+        assert (who, t.status, t.assignee) == ("software-engineer", "ready", "software-engineer")
+        assert not _events(conn, tid, "review_escalated")
