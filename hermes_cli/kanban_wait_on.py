@@ -6,9 +6,6 @@ every tick to re-discover the same red CI:
     gh-run:<owner/repo>:<run_id>        a GitHub Actions run
     pr:<owner/repo>#<number>[@<sha>]    a PR (head sha + check conclusions)
     card:<task_id>                      another kanban card
-    card_body:<task_id>                 a card's own brief (title, body, and
-                                        comments by anyone but the worker) —
-                                        the design-phase brief-gate park
 
 ``wait_on_task`` records the handle and its current fingerprint and parks the
 card in ``scheduled`` (never dispatched). ``poll_wait_on`` runs on every
@@ -54,13 +51,13 @@ PROGRESS_OUTCOMES = frozenset({"completed", "review_requested", "approved", "cha
 
 @dataclass(frozen=True)
 class Handle:
-    kind: str           # gh-run | pr | card | card_body
+    kind: str           # gh-run | pr | card
     repo: Optional[str]
     ident: str          # run id, PR number, or task id
     sha: Optional[str] = None
 
     def __str__(self) -> str:
-        if self.kind in ("card", "card_body"):
+        if self.kind == "card":
             return f"{self.kind}:{self.ident}"
         if self.kind == "gh-run":
             return f"gh-run:{self.repo}:{self.ident}"
@@ -69,7 +66,7 @@ class Handle:
 
 _RX_RUN = re.compile(r"^gh-run:([\w.-]+/[\w.-]+):(\d+)$")
 _RX_PR = re.compile(r"^pr:([\w.-]+/[\w.-]+)#(\d+)(?:@([0-9a-fA-F]{7,40}))?$")
-_RX_CARD = re.compile(r"^(card|card_body):(t_[0-9a-zA-Z]+)$")
+_RX_CARD = re.compile(r"^(card):(t_[0-9a-zA-Z]+)$")
 
 
 def parse_handle(text: str) -> Handle:
@@ -82,7 +79,7 @@ def parse_handle(text: str) -> Handle:
         return Handle(m.group(1), None, m.group(2))
     raise ValueError(
         f"bad wait_on handle {text!r}; use gh-run:<owner/repo>:<run_id>, "
-        "pr:<owner/repo>#<n>[@<sha>], card:<task_id> or card_body:<task_id>")
+        "pr:<owner/repo>#<n>[@<sha>] or card:<task_id>")
 
 
 def _cfg_int(key: str, default: int) -> int:
@@ -122,37 +119,8 @@ def fingerprint_pr(data: dict) -> str:
                      ",".join(sorted(checks))])
 
 
-BRIEF_COMMENT_EXCLUDED_AUTHORS = frozenset({"kanban-dispatcher"})
-
-
-def brief_comment_bodies(conn: sqlite3.Connection, task_id: str) -> list[str]:
-    """The comments the design-phase brief gate reads AND the ``card_body`` wake
-    hash covers -- one selection so they cannot drift (#29: the gate read every
-    comment while the hash skipped the assignee's, so a brief completed in an
-    assignee comment passed the gate but never woke the card). Every comment
-    except the dispatcher's own park notes, which quote marker text."""
-    return [c["body"] or "" for c in conn.execute(
-        "SELECT author, body FROM task_comments WHERE task_id = ? ORDER BY id", (task_id,))
-        if (c["author"] or "") not in BRIEF_COMMENT_EXCLUDED_AUTHORS]
-
-
-def brief_fingerprint(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
-    """Hash of exactly what the design-phase brief gate reads: title, body and
-    :func:`brief_comment_bodies`. ``None`` when the card is gone."""
-    import hashlib
-    row = conn.execute("SELECT title, body FROM tasks WHERE id = ?", (task_id,)).fetchone()
-    if row is None:
-        return None
-    h = hashlib.sha256()
-    for part in (row["title"] or "", row["body"] or "", *brief_comment_bodies(conn, task_id)):
-        h.update(part.encode()); h.update(b"\0")
-    return h.hexdigest()
-
-
 def default_status(handle: Handle, conn: sqlite3.Connection) -> Optional[str]:
     """Current fingerprint of *handle*; ``None`` = could not observe (stay parked)."""
-    if handle.kind == "card_body":
-        return brief_fingerprint(conn, handle.ident)
     if handle.kind == "card":
         row = conn.execute("SELECT status, completed_at FROM tasks WHERE id = ?",
                            (handle.ident,)).fetchone()

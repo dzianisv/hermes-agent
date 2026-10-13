@@ -2319,48 +2319,26 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
             (task_id,),
         )
 
-_PROFILE_RATE_LIMIT_BACKOFF_CAP_SECONDS = 7200  # 2h cap on escalating profile walls
-
-
 def _profile_rate_limit_cooldown(
     conn: sqlite3.Connection, task_id: str, base: int, now: int,
 ) -> bool:
-    """True when the task's assignee profile hit a quota wall recently.
+    """True when the task's assignee profile hit a quota wall within ``base`` seconds.
 
     A quota wall is a property of the profile/provider, not the card: without
-    this, other cards on the same profile spawned straight into the same wall
-    (live board: 10/27 walls followed by a sibling spawn within 5 min). The
-    window is ``base * 2**(n-1)`` for ``n`` consecutive ``rate_limited`` runs
-    on the profile (capped), reset by any ``completed`` run on that profile.
+    this, other cards on the same profile spawned straight into the same wall.
+    Only quota reasons count (or no recorded reason, which predates the trailer);
+    an rc-75 timeout/network exit says nothing about the profile's quota.
     """
     if base <= 0:
         return False
     row = conn.execute("SELECT assignee FROM tasks WHERE id = ?", (task_id,)).fetchone()
-    assignee = row["assignee"] if row is not None else None
-    if not assignee:
+    if row is None or not row["assignee"]:
         return False
-    runs = conn.execute(
-        "SELECT r.outcome, r.ended_at, r.metadata FROM task_runs r JOIN tasks t ON t.id = r.task_id "
-        "WHERE t.assignee = ? AND r.ended_at IS NOT NULL "
-        "AND r.outcome IN ('rate_limited', 'completed') "
-        "ORDER BY r.ended_at DESC, r.id DESC LIMIT 32",
-        (assignee,),
-    ).fetchall()
-    # Only a QUOTA wall is a property of the profile. A run that exited rc 75 for a
-    # timeout / stale provider / network loss names its reason; skip it (live board: 50 of
-    # 52 "rate_limited" runs were pi-acp stale-call aborts, not 429s). Runs without a
-    # recorded reason predate the reason trailer and keep the old quota reading.
-    runs = [r for r in runs if r["outcome"] != "rate_limited"
-            or _kb._json_dict(r["metadata"]).get("provider_reason") in (None, *_QUOTA_WALL_REASONS)]
-    if not runs or runs[0]["outcome"] != "rate_limited":
-        return False
-    streak = 0
-    for r in runs:
-        if r["outcome"] != "rate_limited":
-            break
-        streak += 1
-    window = min(base * (2 ** (streak - 1)), max(base, _PROFILE_RATE_LIMIT_BACKOFF_CAP_SECONDS))
-    return (now - int(runs[0]["ended_at"])) < window
+    return any(_kb._json_dict(r["metadata"]).get("provider_reason") in (None, *_QUOTA_WALL_REASONS)
+               for r in conn.execute(
+                   "SELECT r.metadata FROM task_runs r JOIN tasks t ON t.id = r.task_id "
+                   "WHERE t.assignee = ? AND r.outcome = 'rate_limited' AND r.ended_at > ?",
+                   (row["assignee"], now - base)))
 
 
 def check_respawn_guard(
@@ -3233,7 +3211,6 @@ def _design_phase_cfg() -> Optional[dict]:
         "impl_assignees": set(cfg.get("impl_assignees") or ["software-engineer"]),
         "architects": set(cfg.get("architects") or []),
         "architect": cfg.get("architect") or next(iter(cfg.get("architects") or []), None),
-        "required": list(cfg.get("required") or []),
         # Notion page ids that hold designs; empty = any Notion link (legacy).
         "design_pages": {str(p).replace("-", "").lower() for p in (cfg.get("design_pages") or [])},
         # Verify the cited page + section heading exist via the Notion API at dispatch.
@@ -3420,8 +3397,8 @@ def _design_phase_guard(conn: sqlite3.Connection, task_id: str, assignee: str) -
 
     Came through the design phase means ONE of: created by an architect profile;
     child of a DONE card assigned to an architect; its DESIGN: line names a Notion
-    page/block. Then the brief must carry every ``required`` marker. Parked cards
-    go to ``scheduled`` (reversible) and are reassigned to the architect, who writes
+    page/block. A worker that finds the brief incomplete blocks itself with
+    ``kanban_block(needs_input)``. Parked cards go to ``scheduled`` (reversible) and are reassigned to the architect, who writes
     the design and splits the work. Config: ``kanban.design_phase``.
     """
     cfg = _design_phase_cfg()
@@ -3436,11 +3413,9 @@ def _design_phase_guard(conn: sqlite3.Connection, task_id: str, assignee: str) -
     if (task.current_step_key or "") in _POST_DESIGN_STAGES:
         return None
     parts = [task.title or "", task.body or ""]
-    try:
-        from hermes_cli import kanban_wait_on as _wo_sel
-        parts += _wo_sel.brief_comment_bodies(conn, task_id)  # same selection as the wake hash
-    except Exception:
-        pass
+    parts += [c["body"] or "" for c in conn.execute(
+        "SELECT body FROM task_comments WHERE task_id = ? AND author != 'kanban-dispatcher' ORDER BY id",
+        (task_id,))]
     text = "\n".join(parts)
     ok = (task.created_by or "") in cfg["architects"]
     if not ok:
@@ -3500,46 +3475,17 @@ def _design_phase_guard(conn: sqlite3.Connection, task_id: str, assignee: str) -
                     import logging as _lg
                     _lg.getLogger(__name__).warning("design-phase park failed for %s: %s", task_id, exc)
                 return reason
-    low = text.lower()
-    missing = [r for r in cfg["required"] if r.lower() not in low]
-    if ok and not missing:
+    if ok:
         return None
-    if not ok:
-        reason = "design_phase_missing"
-        note = (f"BLOCKER:DEP architect — [design-phase] implementation card did not come through the "
-                f"design phase (not created by an architect, no finished architect parent, DESIGN: names no "
-                f"Notion section). Reassigned to {cfg['architect']}: write or point to the DESIGN section, "
-                "add a DESIGN: line and " + "/".join(cfg["required"]) + " to THIS card, then reassign THIS "
-                "card to the implementer. Do NOT create review/deploy/implementation child cards: "
-                "one card carries design, build, review, deploy and live proof (Den 2026-10-07).")
-    else:
-        reason = "brief_incomplete"
-        note = (f"BLOCKER:DEP EM — [design-phase] brief incomplete: missing {', '.join(missing)}. "
-                "Complete the brief, then `hermes kanban unblock <id>`.")
+    reason = "design_phase_missing"
+    note = (f"BLOCKER:DEP architect — [design-phase] implementation card did not come through the "
+            f"design phase (not created by an architect, no finished architect parent, DESIGN: names no "
+            f"Notion section). Reassigned to {cfg['architect']}: write or point to the DESIGN section, "
+            "add a DESIGN: line to THIS card, then reassign THIS "
+            "card to the implementer. Do NOT create review/deploy/implementation child cards: "
+            "one card carries design, build, review, deploy and live proof (Den 2026-10-07).")
     try:
-        if ok:
-            # Brief gate: park on the card's own content. A plain schedule_task
-            # left nothing to wake on but a manual unblock / re-spec, and every
-            # such wake with the brief still incomplete re-parked it with a new
-            # zero-minute 'scheduled' run (t_ec089e4b, t_86aac7df: 4 each).
-            # Now poll_wait_on wakes it only when title/body/non-worker
-            # comments change, and a re-park on an unchanged brief records no run.
-            from hermes_cli import kanban_wait_on as _wo
-            fp = _wo.brief_fingerprint(conn, task_id)
-            prev = conn.execute(
-                "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'respawn_guarded' "
-                "ORDER BY id DESC LIMIT 1", (task_id,)).fetchone()
-            prev = _kb._json_dict(prev["payload"]) if prev else {}
-            # Unchanged gap = no new run, even if an unrelated comment woke it.
-            same = prev.get("reason") == reason and prev.get("missing") == missing
-            if _kb.schedule_task(conn, task_id, reason=None if same else note):
-                with _kb.write_txn(conn):
-                    conn.execute(
-                        "UPDATE tasks SET wait_on = ?, wait_on_fingerprint = ?, wait_on_checked_at = ? "
-                        "WHERE id = ?", (f"card_body:{task_id}", fp, 0, task_id))
-                    _kb._append_event(conn, task_id, "respawn_guarded", {"reason": reason, "brief": fp, "missing": missing})
-            return reason
-        if _kb.schedule_task(conn, task_id, reason=note) and not ok and cfg["architect"]:
+        if _kb.schedule_task(conn, task_id, reason=note) and cfg["architect"]:
             _kb.assign_task(conn, task_id, cfg["architect"])
             # 'scheduled' is never dispatched: re-gate so the architect is
             # spawned next tick (ready, or todo while a parent is undone).

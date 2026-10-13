@@ -2,7 +2,7 @@
 
 Live board: cards bounced 4-6 change-request rounds because the brief never
 named the proof. The Nth change request (kanban.review_round_limit, default 3)
-parks the card in triage for re-spec instead of respawning the implementer.
+blocks the card needs_input with a comment instead of respawning the implementer.
 """
 
 from __future__ import annotations
@@ -48,19 +48,20 @@ def _events(conn, tid, kind):
         "SELECT payload FROM task_events WHERE task_id = ? AND kind = ?", (tid, kind)).fetchall()
 
 
-def test_third_change_request_parks_in_triage(kanban_home):
+def test_third_change_request_blocks_with_comment(kanban_home):
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="ship it", assignee="software-engineer")
         assert _round(conn, tid, first=True).status == "ready"
         assert _round(conn, tid).status == "ready"
         t = _round(conn, tid)
-        assert t.status == "triage"
-        assert t.assignee == "software-engineer"
+        assert (t.status, t.block_kind, t.assignee) == ("blocked", "needs_input", "software-engineer")
         assert len(_events(conn, tid, "review_loop_detected")) == 1
-        # The dispatcher never claims triage: no fourth implementer spawn.
+        body = conn.execute("SELECT body FROM task_comments WHERE task_id=? AND author='kanban-harness'",
+                            (tid,)).fetchone()[0]
+        assert "review loop: 3" in body
+        # No fourth implementer spawn until someone unblocks it.
         assert kb.claim_task(conn, tid) is None
-        # Re-spec returns it to the pool with a fresh brief.
-        assert kb.specify_triage_task(conn, tid, body="PROOF: live check X")
+        assert kb.unblock_task(conn, tid)
         assert kb.get_task(conn, tid).status in ("todo", "ready")
 
 
@@ -105,13 +106,10 @@ def test_active_limit_zero_disables(kanban_home):
         assert kb.claim_task(conn, tid) is not None
 
 
-ARCH_CFG = ("kanban:\n  review_round_limit: 3\n  design_phase:\n    architects: [architect-critic-fable]\n"
-            "    architect: architect-critic-fable\n")
+CFG = "kanban:\n  review_round_limit: 3\n"
 
 
 def _rereview(conn, tid, reason):
-    if kb.get_task(conn, tid).status == "triage":
-        kb.specify_triage_task(conn, tid, body="PROOF: live check X")
     claimed = kb.claim_task(conn, tid)
     assert claimed is not None
     assert kb.request_review(conn, tid, summary="PR ready", reviewer="reviewer",
@@ -122,34 +120,12 @@ def _rereview(conn, tid, reason):
     return who, kb.get_task(conn, tid)
 
 
-def test_fourth_change_request_routes_to_architect_with_history(kanban_home):
-    """Gap #22: t_e00cedf8 took 13 change requests because triage re-promoted
-    the card to the same implementer; round 4 must go to the architect."""
-    import json
-    (kanban_home / "config.yaml").write_text(ARCH_CFG)
-    with kb.connect() as conn:
-        tid = kb.create_task(conn, title="ship it", assignee="software-engineer")
-        _round(conn, tid, first=True)
-        for i in (2, 3):
-            _rereview(conn, tid, f"finding {i}")
-        who, t = _rereview(conn, tid, "finding 4")
-        assert who == "architect-critic-fable"
-        assert t.assignee == "architect-critic-fable"
-        esc = _events(conn, tid, "review_escalated")
-        assert len(esc) == 1
-        hist = json.loads(esc[0][0])["history"]
-        assert [h["reason"] for h in hist] == ["proof missing", "finding 2", "finding 3", "finding 4"]
-        body = conn.execute("SELECT body FROM task_comments WHERE task_id=? AND author='kanban-harness'",
-                            (tid,)).fetchone()[0]
-        assert "REVIEW LOOP ESCALATION" in body and "finding 3" in body
-
-
 def test_under_cap_returns_to_implementer(kanban_home):
-    (kanban_home / "config.yaml").write_text(ARCH_CFG)
+    (kanban_home / "config.yaml").write_text(CFG)
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="ship it", assignee="software-engineer")
         t = _round(conn, tid, first=True)
         assert (t.status, t.assignee) == ("ready", "software-engineer")
         who, t = _rereview(conn, tid, "finding 2")
         assert (who, t.status, t.assignee) == ("software-engineer", "ready", "software-engineer")
-        assert not _events(conn, tid, "review_escalated")
+        assert not _events(conn, tid, "review_loop_detected")

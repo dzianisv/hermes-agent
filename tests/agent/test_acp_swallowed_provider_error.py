@@ -54,12 +54,12 @@ def test_retry_chatter_only_turn_raises_connection_error(monkeypatch):
 
 
 def test_failed_turn_is_classified_as_network_error(monkeypatch):
-    from agent import network_wait
+    from agent.error_classifier import FailoverReason, classify_api_error
     client = _client()
     monkeypatch.setattr(client, "_session", _FakeSession(FAILED_TURN))
     with pytest.raises(ConnectionError) as ei:
         client._run_prompt("hi", timeout_seconds=5)
-    assert network_wait.is_network_error(ei.value)
+    assert classify_api_error(ei.value).reason is FailoverReason.timeout
 
 
 def test_recovered_retry_keeps_real_text_and_drops_status_chatter(monkeypatch):

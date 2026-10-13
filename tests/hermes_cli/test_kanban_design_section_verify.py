@@ -62,7 +62,6 @@ def conn(tmp_path, monkeypatch, notion):
     (root / "config.yaml").write_text(
         "kanban:\n  design_phase:\n    enabled: true\n    impl_assignees: [software-engineer]\n"
         "    architects: [architect-critic-fable]\n    architect: architect-critic-fable\n"
-        "    required: ['DESIGN:', 'SCOPE:', 'ACCEPTANCE:', 'PROOF:']\n"
         f"    design_pages: ['{PAGE}']\n    notion_api_base: '{notion[1]}'\n    notion_timeout: 3\n")
     monkeypatch.setenv("HERMES_ROOT_HOME", str(root))
     home = tmp_path / "home"; home.mkdir()

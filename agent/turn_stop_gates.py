@@ -92,23 +92,8 @@ def _kanban_stop_nudge(agent, messages) -> Optional[str]:
     kanban_request_review / kanban_request_changes); a narrated stop is recorded
     as protocol_violation, so nudge once or twice first."""
     try:
-        from agent.kanban_stop import build_kanban_stop_nudge, kanban_stop_nudge_enabled, session_called_kanban_terminal
+        from agent.kanban_stop import build_kanban_stop_nudge
 
-        # Harness #32: a stop with no handoff while the host is OFFLINE is not the model
-        # narrating — it is the provider (e.g. pi-acp) swallowing connection errors into an
-        # empty reply. Wait for connectivity before spending a nudge; a nudge budget burned
-        # offline is refunded once the network is back. Budget spent → no nudge → the exit
-        # guard records an explicit network_unavailable block.
-        if kanban_stop_nudge_enabled() and not session_called_kanban_terminal(messages):
-            from agent import network_wait as _nw
-            if not _nw.network_available():
-                if not _nw.wait_for_network(
-                    should_abort=lambda: bool(getattr(agent, "_interrupt_requested", False)),
-                    on_wait=getattr(agent, "_emit_diagnostic_status", lambda s: None),
-                ):
-                    agent._kanban_offline_giveup = True
-                    return None
-                agent._kanban_stop_nudges = 0
         return build_kanban_stop_nudge(
             messages=messages, attempts=getattr(agent, "_kanban_stop_nudges", 0)
         )

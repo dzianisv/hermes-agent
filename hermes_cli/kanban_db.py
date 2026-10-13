@@ -578,50 +578,6 @@ def _resolve_heartbeat_max_stale_seconds() -> int:
     return _env_int("HERMES_KANBAN_CLAIM_HEARTBEAT_MAX_STALE_SECONDS", default, minimum=1)
 
 
-def _host_suspended_seconds_total() -> Optional[float]:
-    """Seconds this host has spent suspended (laptop sleep) since boot; ``None`` if unknowable.
-
-    macOS: ``CLOCK_MONOTONIC`` (mach_continuous_time) counts sleep, ``CLOCK_UPTIME_RAW`` does not.
-    Linux: ``CLOCK_BOOTTIME`` counts suspend, ``CLOCK_MONOTONIC`` does not.
-    """
-    try:
-        if sys.platform == "darwin":
-            return max(0.0, time.clock_gettime(time.CLOCK_MONOTONIC) - time.clock_gettime(time.CLOCK_UPTIME_RAW))
-        if hasattr(time, "CLOCK_BOOTTIME"):
-            return max(0.0, time.clock_gettime(time.CLOCK_BOOTTIME) - time.clock_gettime(time.CLOCK_MONOTONIC))
-    except (OSError, AttributeError):
-        pass
-    return None
-
-
-# (wall_ts, suspended_total) samples taken on each ``release_stale_claims`` pass; lets the
-# staleness check subtract host sleep from a worker's silence (harness gap #30b).
-_SUSPEND_SAMPLES: list[tuple[int, float]] = []
-_SUSPEND_SAMPLES_MAX = 512
-
-
-def _record_suspend_sample(now: int) -> Optional[float]:
-    total = _host_suspended_seconds_total()
-    if total is None:
-        return None
-    _SUSPEND_SAMPLES.append((int(now), float(total)))
-    del _SUSPEND_SAMPLES[:-_SUSPEND_SAMPLES_MAX]
-    return total
-
-
-def _host_suspended_seconds_since(ts: int, current_total: Optional[float]) -> float:
-    """Host sleep between wall time ``ts`` and now. Uses the newest sample at or before ``ts``
-    (else the oldest one — under-counts sleep, i.e. the pre-fix behaviour, never over-counts)."""
-    if current_total is None or not _SUSPEND_SAMPLES:
-        return 0.0
-    base = _SUSPEND_SAMPLES[0][1]
-    for wall, total in _SUSPEND_SAMPLES:
-        if wall > ts:
-            break
-        base = total
-    return max(0.0, current_total - base)
-
-
 # ``detect_crashed_workers`` skips ``_pid_alive`` this long after start: the
 # fork -> /proc window can report a fresh worker dead.
 DEFAULT_CRASH_GRACE_SECONDS = 30
@@ -2997,7 +2953,6 @@ def release_stale_claims(
         "  AND claim_expires < ?", (now,),
     ).fetchall()
     max_stale = _resolve_heartbeat_max_stale_seconds()
-    suspended_total = _record_suspend_sample(now)
     for row in stale:
         host_local = (row["claim_lock"] or "").startswith(host_prefix)
         hb = row["last_heartbeat_at"]
@@ -3005,14 +2960,11 @@ def release_stale_claims(
         # observable progress — reclaim even if the PID is alive (logic loop).
         # Silence is counted from the last heartbeat, or from claim/start time for a
         # worker that never heartbeated (gap #30b: it used to be extended until
-        # max-runtime). Host sleep is subtracted: a suspended laptop freezes the worker
-        # too, so wall-clock silence across a sleep is not a wedge (gap #30b root cause).
+        # max-runtime).
         silent_since = hb if hb is not None else _row_get(row, "started_at")
         heartbeat_stale = False
         if silent_since is not None:
-            silence = (now - int(silent_since)) - _host_suspended_seconds_since(
-                int(silent_since), suspended_total)
-            heartbeat_stale = silence > max_stale
+            heartbeat_stale = (now - int(silent_since)) > max_stale
         started_at = _row_get(row, "worker_started_at")
         pid_dead = bool(host_local and row["worker_pid"]
                         and not _worker_alive(row["worker_pid"], started_at))
@@ -4195,37 +4147,16 @@ def request_changes(
 
         new_status = _landing_status_after_parents(conn, task_id)
         # Review-loop budget: the Nth change request (N = review_round_limit)
-        # parks the card in triage for re-spec instead of respawning the
-        # implementer — live board showed cards bouncing 4-6 rounds on a
-        # brief that never named the proof.
-        prior_rounds = int(conn.execute(
+        # blocks the card needs_input with a comment instead of respawning the
+        # implementer; who re-specs it is board policy, not the kernel's.
+        rounds = int(conn.execute(
             "SELECT COUNT(*) FROM task_events WHERE task_id = ? AND kind = 'changes_requested'",
             (task_id,),
-        ).fetchone()[0])
-        rounds = prior_rounds + 1
-        round_limit = review_round_limit()
-        # Gap #22: parking in triage kept the implementer as assignee, so the
-        # card was promoted straight back to the same engineer and every later
-        # round re-tripped the cap (t_e00cedf8: 13 rounds, 10 loop events).
-        # Rounds now count since the last architect escalation, and a change
-        # request past the cap hands the card to the architect with the full
-        # findings history instead of another implementer run.
-        last_esc = conn.execute(
-            "SELECT MAX(id) FROM task_events WHERE task_id = ? AND kind = 'review_escalated'",
-            (task_id,),
-        ).fetchone()[0]
-        window_rounds = int(conn.execute(
-            "SELECT COUNT(*) FROM task_events WHERE task_id = ? AND kind = 'changes_requested' AND id > ?",
-            (task_id, last_esc or 0),
         ).fetchone()[0]) + 1
-        architect: Optional[str] = None
-        if round_limit and window_rounds > round_limit:
-            from hermes_cli.kanban_wait_on import respec_assignee
-            architect = _nonblank_str(respec_assignee())
-            if not architect:
-                new_status = "triage"
-        elif round_limit and window_rounds >= round_limit:
-            new_status = "triage"
+        round_limit = review_round_limit()
+        loop_capped = bool(round_limit and rounds >= round_limit)
+        if loop_capped:
+            new_status = "blocked"
         # consecutive_failures deliberately PRESERVED: a review transition is
         # not evidence the pathology cleared; only complete_task resets it.
         # last_failure_error IS cleared: it is task-scoped text from an earlier
@@ -4242,7 +4173,7 @@ def request_changes(
                    last_failure_error = NULL
              WHERE id = ? AND status = 'running' AND current_run_id = ?
             """,
-            (new_status, architect or implementer, task_id, int(current_run_id)),
+            (new_status, implementer, task_id, int(current_run_id)),
         )
         if cur.rowcount != 1:
             return False, "task changed during review handoff"
@@ -4262,31 +4193,15 @@ def request_changes(
             },
             run_id=run_id,
         )
-        if architect:
-            history = [
-                {"round": i + 1, **{k: v for k, v in _json_dict(r[0]).items()
-                                    if k in ("reason", "reviewer")}}
-                for i, r in enumerate(conn.execute(
-                    "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'changes_requested' "
-                    "ORDER BY id", (task_id,)))
-            ]
-            _append_event(
-                conn, task_id, "review_escalated",
-                {"rounds": window_rounds, "limit": round_limit, "architect": architect,
-                 "implementer": implementer, "history": history},
-                run_id=run_id,
-            )
-            lines = [f"REVIEW LOOP ESCALATION: {window_rounds} change-request rounds exceeded "
-                     f"kanban.review_round_limit={round_limit}. Architect {architect}: re-spec the "
-                     f"card (SCOPE/ACCEPTANCE/PROOF) so one pass can close every finding, then "
-                     f"reassign to {implementer}. Findings history:"]
-            lines += [f"- round {h['round']}: {h.get('reason', '')}" for h in history]
+        if loop_capped:
+            conn.execute("UPDATE tasks SET block_kind = 'needs_input' WHERE id = ?", (task_id,))
             conn.execute(
                 "INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?, ?, ?, ?)",
-                (task_id, "kanban-harness", "\n".join(lines), int(time.time())),
+                (task_id, "kanban-harness",
+                 f"BLOCKER: review loop: {rounds} change-request rounds "
+                 f"(kanban.review_round_limit={round_limit}). Re-spec the card, then unblock it.",
+                 int(time.time())),
             )
-            return True, architect
-        if new_status == "triage":
             _append_event(
                 conn, task_id, "review_loop_detected",
                 {"rounds": rounds, "limit": round_limit},

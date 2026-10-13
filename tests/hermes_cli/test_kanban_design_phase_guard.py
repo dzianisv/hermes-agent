@@ -21,7 +21,6 @@ def conn(tmp_path, monkeypatch):
     (root / "config.yaml").write_text(
         "kanban:\n  design_phase:\n    enabled: true\n    impl_assignees: [software-engineer]\n"
         "    architects: [architect-critic-fable]\n    architect: architect-critic-fable\n"
-        "    required: ['DESIGN:', 'SCOPE:', 'ACCEPTANCE:', 'PROOF:']\n"
         f"    design_pages: ['{DESIGN_PAGE}']\n"
         "    verify_notion: false\n")  # Notion lookup covered by test_kanban_design_section_verify
     monkeypatch.setenv("HERMES_ROOT_HOME", str(root))
