@@ -51,7 +51,10 @@ class TestEarlyRecovery:
         import pm.recovery as pm_recovery
 
         monkeypatch.setattr(pm_recovery, "repair_dependencies", _boom)
+        monkeypatch.setattr(er, "interrupted_pull_marker", _boom)
         assert er.recover_if_needed(project_root=CHECKOUT_ROOT, argv=[]) is False
+        assert er.restore_interrupted_pull(project_root=CHECKOUT_ROOT) is False
+        assert er.restore_interrupted_pull() is False
 
     def test_sandboxed_root_still_recovers(self, tmp_path, monkeypatch):
         # The guard must not disable recovery for sandboxed roots: with a
