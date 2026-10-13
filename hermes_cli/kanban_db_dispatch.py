@@ -2292,6 +2292,43 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
             (task_id,),
         )
 
+_PROFILE_RATE_LIMIT_BACKOFF_CAP_SECONDS = 7200  # 2h cap on escalating profile walls
+
+
+def _profile_rate_limit_cooldown(
+    conn: sqlite3.Connection, task_id: str, base: int, now: int,
+) -> bool:
+    """True when the task's assignee profile hit a quota wall recently.
+
+    A quota wall is a property of the profile/provider, not the card: without
+    this, other cards on the same profile spawned straight into the same wall
+    (live board: 10/27 walls followed by a sibling spawn within 5 min). The
+    window is ``base * 2**(n-1)`` for ``n`` consecutive ``rate_limited`` runs
+    on the profile (capped), reset by any ``completed`` run on that profile.
+    """
+    if base <= 0:
+        return False
+    row = conn.execute("SELECT assignee FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    assignee = row["assignee"] if row is not None else None
+    if not assignee:
+        return False
+    runs = conn.execute(
+        "SELECT r.outcome, r.ended_at FROM task_runs r JOIN tasks t ON t.id = r.task_id "
+        "WHERE t.assignee = ? AND r.ended_at IS NOT NULL "
+        "AND r.outcome IN ('rate_limited', 'completed') "
+        "ORDER BY r.ended_at DESC, r.id DESC LIMIT 32",
+        (assignee,),
+    ).fetchall()
+    if not runs or runs[0]["outcome"] != "rate_limited":
+        return False
+    streak = 0
+    for r in runs:
+        if r["outcome"] != "rate_limited":
+            break
+        streak += 1
+    window = min(base * (2 ** (streak - 1)), max(base, _PROFILE_RATE_LIMIT_BACKOFF_CAP_SECONDS))
+    return (now - int(runs[0]["ended_at"])) < window
+
 
 def check_respawn_guard(
     conn: sqlite3.Connection, task_id: str, *, lane: str = "ready",
@@ -2352,10 +2389,17 @@ def check_respawn_guard(
         ended_at = latest_run["ended_at"]
         if ended_at is not None and (now - int(ended_at)) < rl_cooldown:
             return "rate_limit_cooldown"
+        if _profile_rate_limit_cooldown(conn, task_id, rl_cooldown, now):
+            return "profile_rate_limit_cooldown"
         # Cooldown elapsed — return early so blocker_auth doesn't catch the
         # stamped rate-limit text; this path intentionally retries forever
         # (spaced by the cooldown) until quota returns or a real run supersedes it.
         return None
+
+    # 1b. Profile-level quota wall: a sibling card on the same assignee hit the
+    #     wall recently (escalating on consecutive walls) — park this one too.
+    if _profile_rate_limit_cooldown(conn, task_id, rl_cooldown, now):
+        return "profile_rate_limit_cooldown"
 
     # 2. Quota / auth blocker: retrying immediately will not help.  Scoped to
     # a latest run that stamped a diagnosis: a crash's persisted error is the
