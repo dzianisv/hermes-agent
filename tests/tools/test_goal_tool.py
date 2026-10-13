@@ -147,3 +147,11 @@ def test_link_without_goal_or_ids_errors():
     assert "error" in _call(action="link", task_ids=["t_aaaaaa"])
     _call(action="create", objective="Ship the release once the signup test passes")
     assert "error" in _call(action="link")
+
+
+def test_create_refused_on_cron_session():
+    from tools.goal_tool import goal_tool
+    import json
+    out = json.loads(goal_tool("create", objective="Deliver a stock screen with verified numbers for ten tickers",
+                               session_id="cron_abc_20261012_174824"))
+    assert "error" in out and "one-shot" in out["error"]

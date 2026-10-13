@@ -144,6 +144,11 @@ def goal_tool(action: str, *, objective: str = "", evidence: str = "", max_turns
         return _ok(**_state_view(mgr))
 
     if action == "create":
+        if mgr.session_id.startswith("cron_"):
+            # A cron run is one turn with no gateway loop behind it: its goal can never be judged
+            # or woken, so it only becomes a stale "active goal idle" row (probe I2).
+            return tool_error("cron runs are one-shot and have no goal loop; do the work in this turn "
+                              "or schedule a follow-up job instead of setting a goal")
         objective = (objective or "").strip()
         if not (_MIN_OBJECTIVE_CHARS <= len(objective) <= _MAX_OBJECTIVE_CHARS):
             return tool_error(f"objective must be {_MIN_OBJECTIVE_CHARS}–{_MAX_OBJECTIVE_CHARS} chars")
