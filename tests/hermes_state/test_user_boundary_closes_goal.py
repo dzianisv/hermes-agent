@@ -37,7 +37,7 @@ def _status(db: SessionDB, sid: str) -> str:
 def test_user_boundary_clears_the_goal(db, reason):
     _goal(db, "s1")
     db.end_session("s1", reason)
-    assert _status(db, "s1") == "cleared"
+    assert _status(db, "s1") == "cancelled"
     assert json.loads(db.get_meta("goal:s1"))["paused_reason"] == f"session ended ({reason})"
 
 
@@ -53,7 +53,7 @@ def test_subagent_agent_close_clears_the_goal(db):
     db.create_session(session_id="sub", source="subagent", parent_session_id="parent")
     db.set_meta("goal:sub", json.dumps({"goal": "child task", "status": "active", "source": "agent"}))
     db.end_session("sub", "agent_close")
-    assert _status(db, "sub") == "cleared"
+    assert _status(db, "sub") == "cancelled"
 
 
 def test_already_done_goal_is_untouched(db):
