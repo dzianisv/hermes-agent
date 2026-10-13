@@ -198,7 +198,7 @@ class TestJudgeParseFailureAutoPause:
 
             d3 = mgr.evaluate_after_turn("step 3")
             assert d3["should_continue"] is False
-            assert d3["status"] == "paused"
+            assert d3["status"] == "waiting"
             assert mgr.state.consecutive_parse_failures == 3
 
 
@@ -244,7 +244,7 @@ class TestMigrateGoalToSession:
         assert child is not None and child.goal == "ship the feature"
         # Parent row archived (cleared) so only the child is active.
         parent = load_goal("parent-sid")
-        assert parent is not None and parent.status == "cleared"
+        assert parent is not None and parent.status == "cancelled"
 
 
     def test_does_not_clobber_existing_child_goal(self, hermes_home):
@@ -422,7 +422,7 @@ class TestWaitBarrier:
             assert mgr.state.turns_used == 0  # no turn consumed while parked
             assert "CI green" in decision["reason"]
             assert decision["message"] == ""  # park announced once by wait_on; later turns stay quiet
-            assert mgr.state.status == "active"  # still active, just parked
+            assert mgr.state.status == "waiting"  # explicit observable barrier
         finally:
             proc.terminate()
             proc.wait(timeout=10)
@@ -599,8 +599,8 @@ class TestJudgeDrivenWait:
         mgr.wait_for_seconds(120, reason="backoff")
         assert mgr.is_waiting() is True
         # Force the deadline into the past → barrier auto-clears.
-        mgr.state.waiting_until = time.time() - 1
-        assert mgr.is_waiting() is False
+        with patch("hermes_cli.goals.time.time", return_value=mgr.state.waiting_until + 1):
+            assert mgr.is_waiting() is False
         assert mgr.state.waiting_until == 0.0
 
     def test_continue_verdict_still_continues_with_background(self, hermes_home):
@@ -928,11 +928,11 @@ class TestBlockedVerdict:
             )
 
         assert decision["verdict"] == "blocked"
-        assert decision["status"] == "paused"
+        assert decision["status"] == "waiting"
         assert decision["should_continue"] is False
         assert "unachievable" in decision["message"].lower()
         assert mgr.state is not None
-        assert mgr.state.status == "paused"
+        assert mgr.state.status == "waiting"
         assert "unachievable" in (mgr.state.paused_reason or "").lower()
 
 

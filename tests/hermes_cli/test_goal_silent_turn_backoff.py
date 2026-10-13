@@ -89,10 +89,10 @@ def test_repeated_silence_never_pauses_goal_and_caps_backoff(hermes_home):
         for _ in range(goals.DEFAULT_MAX_CONSECUTIVE_SILENT_TURNS + 4):
             mgr.stop_waiting()
             d = mgr.evaluate_after_turn("NO_REPLY")
-        assert d["status"] == "active"
+        assert d["status"] == "waiting"
         assert judge.call_count == 0
         st = goals.GoalManager("sid-silent-3").state
-        assert st.status == "active"
+        assert st.status == "waiting"
         remaining = st.waiting_until - time.time()
         # Backoff parks are exempt from goals.max_wait_seconds: clamping them to 300 s turned
         # a quiet 1800 s backoff into a 6-minute wake storm (132 wakes/day, 2026-10-11).
@@ -143,7 +143,7 @@ def test_human_only_block_backs_off_and_dedupes_rewordings(hermes_home):
     with patch("hermes_cli.goals.judge_goal", return_value=("blocked", "needs Touch ID", False, wd, False)):
         d1 = mgr.evaluate_after_turn("did other work")
         # new question: announced once, keep working the other requirements
-        assert d1["should_continue"] is True and "Step needs the human" in d1["message"]
+        assert d1["should_continue"] is True and d1["message"] == q1
         assert goals.GoalManager("sid-human-1").state.waiting_until == 0
         wd["human_decision"] = q2  # the judge's rewording of the same ask
         d2 = mgr.evaluate_after_turn("did more work")

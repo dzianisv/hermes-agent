@@ -221,6 +221,10 @@ class HeartbeatManager:
         double-fire the same tick. Missed ticks coalesce: the anchor resets to NOW, not the theoretical
         schedule.
         """
+        from hermes_cli.goals import load_goal
+        goal = load_goal(self.session_id)
+        if goal and goal.status in {"active", "waiting"}:
+            return None
         s = self._state
         if s is None or not s.is_due(now):
             return None

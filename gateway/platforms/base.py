@@ -4358,7 +4358,8 @@ class BasePlatformAdapter(ABC):
         """Spawn the typing-refresh task, or None when ``typing_indicator=False``.
         ``stop_event`` is passed only when the (possibly overridden) ``_keep_typing`` accepts it."""
         # A scheduled heartbeat is proactive work: no typing indicator until it has something to say.
-        if not getattr(self.config, "typing_indicator", True) or getattr(event, "_heartbeat_session_id", None):
+        if (not getattr(self.config, "typing_indicator", True) or getattr(event, "_heartbeat_session_id", None)
+                or getattr(event, "_goal_prompt", False)):
             return None
         kwargs: Dict[str, Any] = {"metadata": metadata}
         if self._accepts_kwarg(self._keep_typing, "stop_event", var_kw=False, unknown=True):
@@ -4466,6 +4467,11 @@ class BasePlatformAdapter(ABC):
         _thread_metadata = _thread_metadata_for_event(event)
         typing_task = self._start_typing_refresh(event, interrupt_event, _thread_metadata)
         try:
+            if getattr(event, "_session_wake_token", None):
+                from gateway.session_wake import current
+                with self._media_delivery_scope(event.source):
+                    if not await asyncio.to_thread(current, event):
+                        return
             await self._run_processing_hook("on_processing_start", event)
             event._turn_marker_handoff = self.gateway_runner is not None  # it can release the marker
             response = await self._message_handler(event)
@@ -4560,6 +4566,10 @@ class BasePlatformAdapter(ABC):
             if isinstance(e, (SystemExit, KeyboardInterrupt)):
                 raise
         finally:
+            if getattr(event, "_session_wake_token", None):
+                from gateway.session_wake import settle
+                with self._media_delivery_scope(event.source):
+                    await asyncio.to_thread(settle, event)
             await self._release_turn_marker(event)
             event._turn_marker_handoff = False  # a later run of this object clears its own marker
             # Stop typing BEFORE the post-delivery callback: a stuck callback must not keep it

@@ -21,6 +21,7 @@ import asyncio
 
 import pytest
 
+from gateway.run import GatewayRunner  # bootstrap before per-test home isolation
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter
 from gateway.platforms.event import MessageEvent, MessageType

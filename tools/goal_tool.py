@@ -149,7 +149,7 @@ def goal_tool(action: str, *, objective: str = "", evidence: str = "", max_turns
             return tool_error(f"objective must be {_MIN_OBJECTIVE_CHARS}–{_MAX_OBJECTIVE_CHARS} chars")
         if not mgr.accepts_agent_goal():
             s = mgr.state
-            if s is not None and s.status == "paused" and s.source == "agent":
+            if s is not None and s.status == "waiting" and s.source == "agent":
                 return tool_error("this session's goal is parked and still holds the slot; the user answers "
                                   "its pending question and runs /goal resume, or it becomes replaceable after "
                                   "goals.parked_release_hours", **_state_view(mgr))
@@ -176,17 +176,12 @@ def goal_tool(action: str, *, objective: str = "", evidence: str = "", max_turns
         evidence = (evidence or "").strip()
         if len(evidence) < _MIN_OBJECTIVE_CHARS:
             return tool_error("complete needs evidence that the outcome exists")
-        from hermes_cli.goals import judge_goal
-        s = mgr.state
-        verdict, reason, parse_failed, _wd, transport_failed = judge_goal(
-            s.goal, f"Completion claim with evidence:\n{evidence}",
-            contract=s.contract if s.has_contract() else None,
-        )
-        if parse_failed or transport_failed:
+        decision = mgr.complete_with_evidence(evidence)
+        verdict, reason = decision["verdict"], decision["reason"]
+        if verdict == "unavailable":
             return tool_error(f"completion audit unavailable ({reason}); keep working or retry")
         if verdict != "done":
             return tool_error(f"completion audit refused: {verdict} — {reason}", verdict=verdict, reason=reason)
-        mgr.mark_done(reason)
         return _ok(completed=True, reason=reason)
 
     return tool_error(f"unknown action {action!r}")

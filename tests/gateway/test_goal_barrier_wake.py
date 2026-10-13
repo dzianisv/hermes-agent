@@ -51,6 +51,7 @@ class _Adapter:
 
     async def handle_message(self, event):
         self.handled.append(event)
+        self._active_sessions.add(event.metadata["gateway_session_key"])
 
 
 class _Store:
@@ -329,7 +330,13 @@ class TestHandedOffSessionWakesOnDestination:
         db.complete_handoff(sid)
         runner = _Runner([_entry(sid)])
 
-        assert _run(runner) == 1  # degrade to the lane we have rather than strand the goal
+        assert _run(runner) == 0  # wait for the destination; never leak into the source lane
+        destination = _entry(sid, "destination")
+        destination.origin.platform = "slack"
+        destination.session_key = "agent:main:slack:destination"
+        runner.session_store._entries.append(destination)
+        assert _run(runner) == 1
+        assert runner.adapter.handled[0].source.platform == "slack"
 
     def test_no_handoff_keeps_the_newest_entry(self, hermes_home):
         sid = "gw-wake-nohandoff"

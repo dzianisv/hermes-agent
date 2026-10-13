@@ -186,6 +186,7 @@ def test_gate_retry_exhaustion_pauses_goal():
     mgr = _mgr_with_goal("gate-exhaust-sid")
     mgr.add_gate("exit 1")
     mgr.state.gates[0].max_retries = 2
+    mgr._save()  # Persist policy; reducers intentionally discard local stale snapshots.
     with patch("hermes_cli.goals.judge_goal") as mock_judge:
         d1 = mgr.evaluate_after_turn("attempt one")
         d2 = mgr.evaluate_after_turn("attempt two")
@@ -193,9 +194,9 @@ def test_gate_retry_exhaustion_pauses_goal():
     mock_judge.assert_not_called()
     assert d1["should_continue"] is True
     assert d2["should_continue"] is True
-    assert d3["status"] == "paused"
+    assert d3["status"] == "waiting"
     assert d3["should_continue"] is False
-    assert mgr.state.status == "paused"
+    assert mgr.state.status == "waiting"
     assert "gate" in (mgr.state.paused_reason or "")
 
 
@@ -228,7 +229,7 @@ def test_gate_continuation_respects_turn_budget():
     mgr.add_gate("exit 1")
     with patch("hermes_cli.goals.judge_goal"):
         decision = mgr.evaluate_after_turn("only turn")
-    assert decision["status"] == "paused"
+    assert decision["status"] == "waiting"
     assert decision["should_continue"] is False
     assert "turns used" in decision["message"]
 

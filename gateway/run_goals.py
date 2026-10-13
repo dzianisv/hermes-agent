@@ -169,10 +169,16 @@ class GatewayGoalsMixin:
         if not mgr.has_heartbeat():
             watch.pop(quick_key, None)
             return
+        from gateway.session_wake import claim, release, stamp, track
+        token = await self._run_in_executor_with_context(lambda: claim(session_id, "heartbeat"))
+        if not token:
+            return
         prompt = mgr.due_prompt()
         if not prompt:
+            release(session_id, token)
             return
         event = self._synthetic_prompt_event(source, prompt)
+        stamp(event, session_id, token)
         event.metadata["gateway_session_key"] = quick_key
         event._heartbeat_execution_started = False
         # Provenance read by display_kind_for_event / the turn's quiet surfaces; the event stays
@@ -183,6 +189,7 @@ class GatewayGoalsMixin:
         try:
             await adapter.handle_message(event)
         finally:
+            track(adapter, quick_key, event)
             task = getattr(adapter, "_session_tasks", {}).get(quick_key)
             if task is not None:
                 from gateway.run_heartbeat_acceptance import settle_heartbeat_attempt
@@ -201,6 +208,8 @@ class GatewayGoalsMixin:
         async def _poll_loop():
             while True:
                 await asyncio.sleep(POLL_SECONDS)
+                from gateway.run_goal_wake import wake_lifted_goal_barriers
+                await wake_lifted_goal_barriers(self)
                 from gateway.run_heartbeat_restore import restore_heartbeat_watches
                 await restore_heartbeat_watches(self)
                 watch = getattr(self, "_heartbeat_watch", None)
@@ -330,7 +339,19 @@ class GatewayGoalsMixin:
             adapter = self._delivery_adapter_for(source)
             _quick_key = self._session_key_for_source(source)
             if adapter and _quick_key:
-                self._enqueue_fifo(_quick_key, self._synthetic_prompt_event(source, prompt), adapter)
+                from gateway.session_wake import claim, stamp, release
+                sid = session_entry.session_id
+                token = await self._run_in_executor_with_context(
+                    lambda: claim(sid, "goal", revision=decision.get("revision")))
+                if not token:
+                    return
+                event = self._synthetic_prompt_event(source, prompt)
+                stamp(event, sid, token)
+                try:
+                    self._enqueue_fifo(_quick_key, event, adapter)
+                except Exception:
+                    release(sid, token)
+                    raise
         except Exception as exc:
             logger.debug("goal continuation: enqueue failed: %s", exc)
 
@@ -338,6 +359,8 @@ class GatewayGoalsMixin:
         self, *, agent_result: Any, source: Any, is_internal: bool, event: Any = None,
     ) -> None:
         """Run goal and loop bookkeeping after an agent turn returns."""
+        from gateway.session_wake import settle
+        settle(event)
         final_text = self._final_text_for_post_turn_hooks(agent_result, event)
         try:
             session_entry = await self.async_session_store.get_or_create_session(

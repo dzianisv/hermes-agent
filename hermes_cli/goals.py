@@ -24,6 +24,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from hermes_cli._subprocess_compat import noninteractive_git_env
 from hermes_time import safe_strftime
+from hermes_cli.goal_controller import command, effect
 
 logger = logging.getLogger(__name__)
 
@@ -505,7 +506,10 @@ def run_gate(gate: GoalGate, *, cwd: Optional[str] = None) -> Tuple[bool, int, s
 class GoalState:
     """Serializable goal state stored per session."""
     goal: str
-    status: str = "active"          # active | paused | done | cleared
+    status: str = "active"          # active | waiting(barrier) | done | cancelled
+    revision: int = 0
+    wake_pending: bool = False
+    barrier_kind: str = ""          # manual / safety, or an observable process/time barrier
     turns_used: int = 0
     max_turns: int = DEFAULT_MAX_TURNS
     created_at: float = 0.0
@@ -557,6 +561,24 @@ class GoalState:
     # fired); consumed by the next continuation prompt, which then opens with the wait-elapsed kick.
     resumed_after_wait: bool = False
 
+    def normalize(self) -> None:
+        # Legacy rows migrate on read; the next controller command persists the new shape.
+        if self.status == "cleared":
+            self.status = "cancelled"
+        elif self.status == "paused":
+            self.status = "waiting"
+            self.barrier_kind = "manual" if self.paused_reason == _USER_PAUSED_REASON else "safety"
+        if self.status in {"active", "waiting"} and not self.goal.strip():
+            self.status = "cancelled"  # old two-writer zombie; never eligible for a wake
+        if self.status in {"active", "waiting"} and (
+            self.waiting_on_pid or self.waiting_on_session or self.waiting_until
+        ):
+            self.status = "waiting"
+            self.barrier_kind = "process" if self.waiting_on_pid or self.waiting_on_session else "time"
+        if self.status in {"done", "cancelled"}:
+            self.clear_wait()
+            self.wake_pending = False
+
     def to_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False)
 
@@ -567,7 +589,10 @@ class GoalState:
         ints = {k: int(data.get(k) or 0) for k in ("turns_used", "consecutive_parse_failures", "consecutive_transport_failures", "waiting_on_delegations", "consecutive_blocked", "consecutive_silent", "consecutive_human_pending", "consecutive_wait")}
         floats = {k: float(data.get(k) or 0.0) for k in ("created_at", "last_turn_at", "waiting_until", "waiting_since", "paused_at")}
         raw_pending = data.get("pending_human_decisions") or []
-        return cls(
+        state = cls(
+            revision=int(data.get("revision") or 0),
+            wake_pending=bool(data.get("wake_pending", False)),
+            barrier_kind=str(data.get("barrier_kind") or ""),
             pending_human_decisions=[str(q).strip() for q in raw_pending if str(q).strip()] if isinstance(raw_pending, list) else [],
             goal=data.get("goal", ""),
             status=data.get("status", "active"),
@@ -589,6 +614,8 @@ class GoalState:
             ],
             **ints, **floats,
         )
+        state.normalize()
+        return state
 
     def has_contract(self) -> bool:
         return self.contract is not None and not self.contract.is_empty()
@@ -606,7 +633,7 @@ class GoalState:
     def parked_since(self) -> float:
         """Epoch when this paused goal was parked; falls back to the last turn / creation for rows
         written before ``paused_at`` existed. 0.0 when not paused."""
-        if self.status != "paused":
+        if self.status != "waiting" or self.barrier_kind not in {"manual", "safety"}:
             return 0.0
         return self.paused_at or self.last_turn_at or self.created_at
 
@@ -632,6 +659,9 @@ class GoalState:
         return True
 
     def clear_wait(self) -> None:
+        if self.status == "waiting":
+            self.status = "active"
+        self.barrier_kind = ""
         self.waiting_on_pid = None
         self.waiting_on_session = None
         self.waiting_until = 0.0
@@ -800,26 +830,16 @@ def load_goal(session_id: str) -> Optional[GoalState]:
 
 
 def save_goal(session_id: str, state: GoalState) -> None:
-    """Persist a goal to SessionDB. No-op if DB unavailable."""
-    if not session_id:
-        return
-    db = _get_session_db()
-    if db is None:
-        _warn_dropped_write("GoalManager", "goal", session_id)
-        return
-    try:
-        db.set_meta(_meta_key(session_id), state.to_json())
-    except Exception as exc:
-        logger.debug("GoalManager: set_meta failed: %s", exc)
+    """Compatibility snapshot save, guarded by the controller's revision check."""
+    from hermes_cli.goal_controller import save
+    if session_id:
+        save(session_id, state)
 
 
 def clear_goal(session_id: str) -> None:
-    """Mark a goal cleared in the DB (preserved for audit, status=cleared)."""
-    state = load_goal(session_id)
-    if state is None:
-        return
-    state.status = "cleared"
-    save_goal(session_id, state)
+    """Cancel through the same reducer used by session boundaries."""
+    from hermes_cli.goal_controller import cancel, _db
+    _db()._execute_write(lambda conn: cancel(conn, session_id))
 
 
 def migrate_goal_to_session(old_session_id: str, new_session_id: str, *, reason: str = "") -> bool:
@@ -835,17 +855,8 @@ def migrate_goal_to_session(old_session_id: str, new_session_id: str, *, reason:
     if not old_session_id or not new_session_id or old_session_id == new_session_id:
         return False
     try:
-        state = load_goal(old_session_id)
-        if state is None or state.status == "cleared":
-            return False
-        # Don't clobber a goal already set on the child (e.g. a resumed lineage).
-        if load_goal(new_session_id) is not None:
-            return False
-        save_goal(new_session_id, state)
-        # Archive the parent's row so it isn't double-counted as active.
-        clear_goal(old_session_id)
-        logger.debug("GoalManager: migrated goal %s -> %s (%s)", old_session_id, new_session_id, reason or "rotation")
-        return True
+        from hermes_cli.goal_controller import migrate
+        return migrate(old_session_id, new_session_id)
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug("GoalManager: goal migration failed: %s", exc)
         return False
@@ -1006,9 +1017,9 @@ def list_parked_goals() -> List[Tuple[str, GoalState]]:
             state = GoalState.from_json(raw)
         except Exception:
             continue
-        if state.status == "active" and (
+        if (state.status == "active" and state.wake_pending) or (state.status == "waiting" and (
             state.waiting_on_pid is not None or state.waiting_on_session is not None or state.waiting_until
-        ):
+        )):
             out.append((session_id, state))
     return out
 
@@ -1371,8 +1382,12 @@ def _is_silence_park_reason(reason: Optional[str]) -> bool:
 
 
 def _decision(status, should_continue: bool, prompt: Optional[str], verdict: str, reason: str, message: str) -> Dict[str, Any]:
+    # Only terminal/safety outcomes and a NEW human question have a chat effect.
+    kind = "result" if verdict == "done" else "attention" if status == "paused" else (
+        "question" if verdict == "blocked_human_pending" and should_continue else "machinery")
     return {"status": status, "should_continue": should_continue, "continuation_prompt": prompt,
-            "verdict": verdict, "reason": reason, "message": message}
+            "verdict": verdict, "reason": reason, "message": message if kind != "machinery" else "",
+            "notice_kind": kind}
 
 
 _JUDGE_CONFIG_HINT = (
@@ -1401,17 +1416,18 @@ class GoalManager:
         return self._state
 
     def is_active(self) -> bool:
-        return self._state is not None and self._state.status == "active"
+        return self._state is not None and (self._state.status == "active" or (
+            self._state.status == "waiting" and self._state.barrier_kind not in {"manual", "safety"}))
 
     def has_goal(self) -> bool:
-        return self._state is not None and self._state.status in {"active", "paused"}
+        return self._state is not None and self._state.status in {"active", "waiting"}
 
     def has_contract(self) -> bool:
         return self._state is not None and self._state.has_contract()
 
     def status_line(self) -> str:
         s = self._state
-        if s is None or s.status == "cleared":
+        if s is None or s.status == "cancelled":
             return "No active goal. Set one with /goal <text>."
         turns = f"{s.turns_used}/{s.max_turns} turns"
         sub = f", {len(s.subgoals)} subgoal{'s' if len(s.subgoals) != 1 else ''}" if s.subgoals else ""
@@ -1419,7 +1435,7 @@ class GoalManager:
         gat = f", {len(s.gates)} gate{'s' if len(s.gates) != 1 else ''}" if s.gates else ""
         src = ", self-set" if s.source == "agent" else ""
         meta = f"{turns}{sub}{con}{gat}{src}"
-        if s.status == "active":
+        if self.is_active():
             pend = f" — waiting on user: {'; '.join(s.pending_human_decisions)}" if s.pending_human_decisions else ""
             if s.waiting_on_session and _session_waiting(s.waiting_on_session):
                 return f"⏳ Goal (parked on {s.waiting_reason or f'session {s.waiting_on_session}'}, {meta}): {s.goal}{pend}"
@@ -1430,7 +1446,7 @@ class GoalManager:
                 wr = s.waiting_reason or f"{remaining}s"
                 return f"⏳ Goal (parked {remaining}s — {wr}, {meta}): {s.goal}{pend}"
             return f"⊙ Goal (active, {meta}): {s.goal}{pend}"
-        if s.status == "paused":
+        if s.status == "waiting":
             extra = f" — {s.paused_reason}" if s.paused_reason else ""
             pend = f" — waiting on user: {'; '.join(s.pending_human_decisions)}" if s.pending_human_decisions else ""
             return f"⏸ Goal (paused, {meta}{extra}): {s.goal}{pend}"
@@ -1441,7 +1457,11 @@ class GoalManager:
     # --- mutation -----------------------------------------------------
 
     def _save(self) -> Optional[GoalState]:
-        save_goal(self.session_id, self._state)
+        if getattr(self, "_reducing", False):
+            self._state.normalize()
+            self._pending_state = self._state
+        else:
+            save_goal(self.session_id, self._state)
         return self._state
 
     def _require_goal(self) -> GoalState:
@@ -1450,7 +1470,7 @@ class GoalManager:
         return self._state
 
     def _require_active(self) -> GoalState:
-        if self._state is None or self._state.status != "active":
+        if not self.is_active():
             raise RuntimeError("no active goal to park")
         return self._state
 
@@ -1464,6 +1484,7 @@ class GoalManager:
         self._pause_state(paused_reason)
         return _decision("paused", False, None, verdict, reason, message)
 
+    @command
     def set(self, goal: str, *, max_turns: Optional[int] = None, contract: Optional[GoalContract] = None) -> GoalState:
         goal = (goal or "").strip()
         if not goal:
@@ -1475,6 +1496,7 @@ class GoalManager:
         )
         return self._save()
 
+    @command
     def set_agent_goal(self, objective: str, *, contract: Optional[GoalContract] = None,
                        max_turns: Optional[int] = None) -> Optional[GoalState]:
         """Install a goal the agent declared on itself (``source="agent"``). Never overwrites an
@@ -1483,8 +1505,8 @@ class GoalManager:
         if not self.accepts_agent_goal():
             return None
         previous = self._state
-        if previous is not None and previous.status == "paused":
-            archive_goal(self.session_id, previous)
+        if previous is not None and previous.status == "waiting":
+            self._archives.append(previous)
         state = self.set(objective, contract=contract, max_turns=max_turns)
         state.source = "agent"
         return self._save()
@@ -1500,14 +1522,14 @@ class GoalManager:
         s = self._state
         if not self.has_goal():
             return True
-        if s.source != "agent" or s.status != "paused":
+        if s.source != "agent" or s.status != "waiting":
             return False
         return self.parked_goal_releasable(s)
 
     @staticmethod
     def parked_goal_releasable(s: GoalState, *, now: Optional[float] = None) -> bool:
         """True when a paused agent goal has been parked by the loop longer than the release window."""
-        if s.status != "paused" or s.source != "agent":
+        if s.status != "waiting" or s.source != "agent":
             return False
         if s.paused_reason == _USER_PAUSED_REASON:
             return False
@@ -1516,6 +1538,7 @@ class GoalManager:
             return True   # no timestamp at all: nothing to measure, do not pin the slot
         return ((now if now is not None else time.time()) - since) >= parked_release_hours() * 3600.0
 
+    @command
     def link_tasks(self, task_ids) -> Optional[GoalState]:
         """Tie kanban card ids to the current goal (dedup, order kept). None without a goal."""
         if not self.has_goal():
@@ -1526,6 +1549,7 @@ class GoalManager:
                 self._state.linked_task_ids.append(t)
         return self._save()
 
+    @command
     def set_contract(self, contract: GoalContract) -> Optional[GoalState]:
         """Attach or replace the completion contract on the active goal."""
         if self._state is None:
@@ -1533,8 +1557,9 @@ class GoalManager:
         self._state.contract = contract or GoalContract()
         return self._save()
 
+    @command
     def pause(self, reason: str = "user-paused") -> Optional[GoalState]:
-        if not self._state:
+        if not self.has_goal():
             return None
         self._state.status = "paused"
         self._state.paused_reason = reason
@@ -1542,8 +1567,9 @@ class GoalManager:
         self._state.clear_wait()   # a wait barrier is meaningless once paused
         return self._save()
 
+    @command
     def resume(self, *, reset_budget: bool = True) -> Optional[GoalState]:
-        if not self._state:
+        if not self.has_goal():
             return None
         self._state.status = "active"
         self._state.paused_reason = None
@@ -1555,23 +1581,44 @@ class GoalManager:
             self._state.turns_used = 0
         return self._save()
 
+    @command
     def clear(self) -> None:
         if self._state is None:
             return
-        self._state.status = "cleared"
+        self._state.status = "cancelled"
         self._save()
         self._state = None
 
+    @command
     def mark_done(self, reason: str) -> None:
-        if not self._state:
+        if not self.has_goal():
             return
         self._state.status = "done"
         self._state.last_verdict = "done"
         self._state.last_reason = reason
         self._save()
 
+    @effect
+    def complete_with_evidence(self, evidence: str) -> Dict[str, Any]:
+        if not self.has_goal():
+            return _decision(None, False, None, "inactive", "no goal to complete", "")
+        state = self._state
+        gate = self._check_gates()
+        if gate is not None:
+            return gate
+        verdict, reason, parse_failed, _wait, transport_failed = judge_goal(
+            state.goal, f"Completion claim with evidence:\n{evidence}",
+            subgoals=state.subgoals or None, contract=state.contract if state.has_contract() else None,
+        )
+        if parse_failed or transport_failed:
+            verdict = "unavailable"
+        if verdict == "done":
+            self.mark_done(reason)
+        return _decision(state.status, False, None, verdict, reason, "")
+
     # --- /subgoal user controls ---------------------------------------
 
+    @command
     def add_subgoal(self, text: str) -> str:
         """Append a user-added criterion; raises ``RuntimeError`` without ``has_goal()``."""
         state = self._require_goal()
@@ -1598,10 +1645,12 @@ class GoalManager:
         self._save()
         return prev
 
+    @command
     def remove_subgoal(self, index_1based: int) -> str:
         """Remove a subgoal by 1-based index. Returns the removed text."""
         return self._pop_item("subgoals", index_1based)
 
+    @command
     def clear_subgoals(self) -> int:
         """Wipe all subgoals. Returns the previous count."""
         return self._clear_items("subgoals")
@@ -1614,6 +1663,7 @@ class GoalManager:
 
     # --- /goal gate quality gates ---------------------------------------
 
+    @command
     def add_gate(self, command: str, *, timeout_seconds: Optional[int] = None, max_retries: Optional[int] = None) -> GoalGate:
         """Append a quality-gate command; raises ``RuntimeError`` without ``has_goal()``."""
         state = self._require_goal()
@@ -1629,10 +1679,12 @@ class GoalManager:
         self._save()
         return gate
 
+    @command
     def remove_gate(self, index_1based: int) -> str:
         """Remove a gate by 1-based index. Returns the removed command."""
         return self._pop_item("gates", index_1based).command
 
+    @command
     def clear_gates(self) -> int:
         """Remove all gates. Returns the previous count."""
         return self._clear_items("gates")
@@ -1730,6 +1782,7 @@ class GoalManager:
         wait cap for agent goals, the generous stuck-poller cap for user goals."""
         return max_wait_seconds() if state.source == "agent" else _MAX_BARRIER_WAIT_S
 
+    @command
     def wait_on(self, pid: int, reason: str = "") -> GoalState:
         """Park the goal loop until a background PID exits (no turn burned, no judge call). For a
         process with a watch/notify trigger prefer ``wait_on_session``. Requires an active goal."""
@@ -1741,6 +1794,7 @@ class GoalManager:
             raise ValueError("pid is not alive on this host")
         return self._park(reason, waiting_on_pid=pid)
 
+    @command
     def wait_on_session(self, session_id: str, reason: str = "") -> GoalState:
         """Park on a process_registry session's OWN trigger: exit OR ``watch_patterns`` match. The
         right barrier for a long-lived watcher/poller that signals mid-run and may never exit."""
@@ -1750,6 +1804,7 @@ class GoalManager:
             raise ValueError("session_id must be a non-empty string")
         return self._park(reason, waiting_on_session=session_id)
 
+    @command
     def wait_for_seconds(self, seconds: int, reason: str = "", *, on_delegations: int = 0) -> GoalState:
         """Park until ``seconds`` from now (backoff/cooldown waits with no process to track). With
         ``on_delegations`` the wait is FOR those live delegation batches: it also lifts as soon as
@@ -1762,10 +1817,11 @@ class GoalManager:
             raise ValueError("seconds must be a positive integer")
         return self._park(reason, waiting_until=time.time() + seconds, waiting_on_delegations=max(0, int(on_delegations)))
 
+    @command
     def stop_waiting(self) -> bool:
         """Clear any active wait barrier (pid / session / time). Returns True if one was cleared."""
         s = self._state
-        if s is None or (s.waiting_on_pid is None and s.waiting_on_session is None and not s.waiting_until):
+        if s is None or s.barrier_kind in {"manual", "safety"} or (s.waiting_on_pid is None and s.waiting_on_session is None and not s.waiting_until):
             return False
         s.clear_wait()
         self._save()
@@ -1782,12 +1838,14 @@ class GoalManager:
         last = s.last_turn_at or s.created_at
         return bool(last) and (now or time.time()) - last >= limit
 
+    @command
     def touch_last_turn(self) -> None:
         """Stamp ``last_turn_at`` now (idle-wake throttle) and persist."""
         if self.state is not None:
             self.state.last_turn_at = time.time()
             self._save()
 
+    @command
     def is_waiting(self) -> bool:
         """True iff a barrier is set AND not yet satisfied. A satisfied barrier is cleared here
         (lazy auto-clear) so the next evaluation resumes normal judging. A pid/session barrier
@@ -1797,6 +1855,8 @@ class GoalManager:
         s = self._state
         if s is None:
             return False
+        if s.status == "waiting" and s.barrier_kind in {"manual", "safety"}:
+            return True
         if s.waiting_on_session is not None:
             still = _session_waiting(s.waiting_on_session)
         elif s.waiting_on_pid is not None:
@@ -1820,6 +1880,7 @@ class GoalManager:
             # Lifted here (not by unwait/pause/resume): the next continuation opens with the
             # "wait has elapsed" kick so the agent checks what it waited on instead of recapping.
             s.resumed_after_wait = True
+            s.wake_pending = True
             self._save()
         return still
 
@@ -1881,6 +1942,7 @@ class GoalManager:
             "Use /goal resume to keep going, or /goal clear to stop.",
         )
 
+    @effect
     def evaluate_after_turn(
         self, last_response: str, *, user_initiated: bool = True,
         background_processes: Optional[List[Dict[str, Any]]] = None,
@@ -1890,13 +1952,14 @@ class GoalManager:
         ``continuation_prompt``, ``verdict``, ``reason``, ``message``). Both real user prompts and our
         own continuations increment ``turns_used`` — both consume model budget."""
         state = self._state
-        if state is None or state.status != "active":
+        if not self.is_active():
             return _decision(state.status if state else None, False, None, "inactive", "no active goal", "")
 
         # Parked on a live process or an unexpired deadline: quiesce without burning a turn.
         if self.is_waiting():
             return self._waiting_decision(state)
 
+        state.wake_pending = False
         state.turns_used += 1
         state.last_turn_at = time.time()
 
@@ -1974,8 +2037,7 @@ class GoalManager:
                         return _decision(
                             "active", True, self._human_pending_prompt(question, n_pending),
                             "blocked_human_pending", reason,
-                            f"⊙ Step needs the human ({n_pending} waiting on you): {question} "
-                            f"— recorded; continuing on the other requirements: {reason}",
+                            question,
                         )
                     # The SAME question again means nothing else is left to do: re-poking at once
                     # re-asked the Touch ID question ~6x/min for an hour (82 notices in the user's
@@ -2052,6 +2114,7 @@ class GoalManager:
             "record it as waiting-on-user, and keep working the other requirements."
         )
 
+    @command
     def next_continuation_prompt(self) -> Optional[str]:
         s = self._state
         if not s or s.status != "active":

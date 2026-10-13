@@ -73,7 +73,7 @@ class TestInterruptAutoPause:
         ]
         with patch("hermes_cli.goals.judge_goal"):
             cli._maybe_continue_goal_after_turn()
-        assert mgr.state.status == "paused"
+        assert mgr.state.status == "waiting"
 
         mgr.resume()
         assert mgr.state.status == "active"

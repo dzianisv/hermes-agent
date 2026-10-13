@@ -96,8 +96,8 @@ def test_same_question_is_recorded_once_and_never_pauses(goals_mod, monkeypatch)
     for i in range(1, 8):
         mgr.stop_waiting()
         d = mgr.evaluate_after_turn(f"still needs Touch ID {i}")
-        assert d["status"] == "active" and d["should_continue"] is False and d["message"] == "", d
-        assert goals_mod.load_goal("rel").status == "active"
+        assert d["status"] == "waiting" and d["should_continue"] is False and d["message"] == "", d
+        assert goals_mod.load_goal("rel").status == "waiting"
     s = goals_mod.load_goal("rel")
     assert s.pending_human_decisions == [TOUCH_ID]
     assert s.consecutive_human_pending == 7 and s.waiting_until > 0
@@ -156,7 +156,7 @@ def test_idle_turn_with_continue_verdict_fires_the_muse_kick(goals_mod, monkeypa
 def test_user_pause_still_pauses_an_agent_goal(goals_mod, monkeypatch):
     mgr = _release_goal(goals_mod)
     assert mgr.pause() is not None
-    assert goals_mod.load_goal("rel").status == "paused"
+    assert goals_mod.load_goal("rel").status == "waiting"
     _judge(goals_mod, monkeypatch, _human_block())
     assert mgr.evaluate_after_turn("anything")["should_continue"] is False
 
@@ -179,7 +179,7 @@ def test_user_goal_keeps_turn_budget(goals_mod, monkeypatch):
     _judge(goals_mod, monkeypatch, {"verdict": "continue", "reason": "more"})
     assert mgr.evaluate_after_turn("t1")["status"] == "active"
     d = mgr.evaluate_after_turn("t2")
-    assert d["status"] == "paused" and "budget" in goals_mod.load_goal("ub").paused_reason
+    assert d["status"] == "waiting" and "budget" in goals_mod.load_goal("ub").paused_reason
 
 
 def test_complete_still_closes_the_goal(goals_mod, monkeypatch):
@@ -193,7 +193,7 @@ def test_user_goal_human_block_still_pauses_for_the_user(goals_mod, monkeypatch)
     mgr = goals_mod.GoalManager(session_id="u1")
     mgr.set("user goal: publish the extension")
     d = mgr.evaluate_after_turn("needs Touch ID")
-    assert d["status"] == "paused" and d["should_continue"] is False
+    assert d["status"] == "waiting" and d["should_continue"] is False
 
 
 # ── B) a parked (legacy / budget) agent goal must not pin the slot forever ─────────────────────

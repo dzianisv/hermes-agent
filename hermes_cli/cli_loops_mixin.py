@@ -533,7 +533,7 @@ class CLILoopsMixin:
                 return
             mgr = self._get_goal_manager()
             state = getattr(mgr, "state", None) if mgr is not None else None
-            if state is None or state.status != "active":
+            if state is None or state.status != "waiting":
                 return
             if not (state.waiting_on_pid is not None or state.waiting_on_session is not None or state.waiting_until):
                 return  # not parked

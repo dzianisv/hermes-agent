@@ -10,14 +10,14 @@ from tools.registry import registry
 
 
 @pytest.fixture(autouse=True)
-def _isolated(monkeypatch):
-    store = {}
-    monkeypatch.setattr(goals_mod, "save_goal", lambda sid, st: store.__setitem__(sid, st.to_json()))
-    monkeypatch.setattr(goals_mod, "load_goal", lambda sid: goals_mod.GoalState.from_json(store[sid]) if sid in store else None)
-    monkeypatch.setattr(goals_mod, "clear_goal", lambda sid: store.pop(sid, None))
+def _isolated(monkeypatch, tmp_path):
+    from hermes_state import SessionDB
+    db = SessionDB(db_path=tmp_path / "state.db")
+    monkeypatch.setattr(goals_mod, "_get_session_db", lambda: db)
     monkeypatch.setattr(goals_mod, "draft_contract", lambda objective, **kw: None)
     monkeypatch.setattr(goals_mod, "agent_goal_tool_enabled", lambda: True)
-    yield store
+    yield db
+    db.close()
 
 
 def _call(session_id="s1", **args):

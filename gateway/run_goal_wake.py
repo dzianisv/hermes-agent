@@ -76,7 +76,7 @@ async def _wake_one(runner, session_id: str, entry: Any, profile_name: Optional[
         return False  # deferred: barrier stays on disk, the next tick retries
 
     with runner._profile_scope_for_source(source):
-        def _lift() -> Optional[str]:
+        def _lift():
             # is_waiting() evaluates deadline / pid liveness / watched-session state and CLEARS a
             # lifted barrier (persisted) — that write is the once-per-barrier throttle.
             mgr = GoalManager(session_id)
@@ -88,12 +88,20 @@ async def _wake_one(runner, session_id: str, entry: Any, profile_name: Optional[
                 # Throttle: an idle wake counts as a turn boundary so the next one waits a full
                 # idle_wake_seconds again even if the agent answers with nothing.
                 mgr.touch_last_turn()
-            return mgr.next_continuation_prompt()
+            prompt = mgr.next_continuation_prompt()
+            if not prompt:
+                return None
+            from gateway.session_wake import claim
+            token = claim(session_id, "goal", revision=mgr.state.revision)
+            return (prompt, token) if token else None
 
-        prompt = await runner._run_in_executor_with_context(_lift)
-        if not prompt:
+        admitted = await runner._run_in_executor_with_context(_lift)
+        if not admitted:
             return False
-        event = runner._synthetic_prompt_event(source, prompt)  # system:* lanes become internal inside
+        prompt, token = admitted
+        event = runner._synthetic_prompt_event(source, prompt)
+        from gateway.session_wake import stamp, track
+        stamp(event, session_id, token)  # system:* lanes become internal inside
         event.metadata["gateway_session_key"] = session_key
         logger.info(
             "%s: %s for session %s — injecting continuation (%s chat=%s thread=%s)",
@@ -101,7 +109,10 @@ async def _wake_one(runner, session_id: str, entry: Any, profile_name: Optional[
             getattr(source, "thread_id", None),
         )
         # handle_message, not the FIFO: the FIFO alone never wakes an idle session.
-        await adapter.handle_message(event)
+        try:
+            await adapter.handle_message(event)
+        finally:
+            track(adapter, session_key, event)
         return True
 
 
@@ -154,7 +165,11 @@ async def _scan_one_store(runner, profile_name: Optional[str]) -> int:
             if entry.session_id and entry.origin is not None and not getattr(entry, "suspended", False):
                 entries_by_sid.setdefault(entry.session_id, entry)
         for sid, entry in list(entries_by_sid.items()):
-            entries_by_sid[sid] = handoff_lane_ok(runner, sid, entry, store)[0]
+            lane, on_lane = handoff_lane_ok(runner, sid, entry, store)
+            if on_lane:
+                entries_by_sid[sid] = lane
+            else:
+                entries_by_sid.pop(sid, None)
     woken = 0
     for rows, idle in ((parked, False), (idle_rows, True)):
         for session_id, _state in rows:
@@ -191,8 +206,7 @@ def housekeeping_goal_barrier_wake(runner, loop) -> None:
     pass logs its own failures, so a slow adapter never wedges the housekeeping heartbeat)."""
     if runner is None or loop is None:
         return
-    from agent.async_utils import safe_schedule_threadsafe
 
-    safe_schedule_threadsafe(
-        wake_lifted_goal_barriers(runner), loop, logger=logger,
-        log_message="goal barrier wake scheduling error")
+    # Compatibility entry point: housekeeping never launches a competing scan.
+    # Startup starts this same idempotent poller even when no heartbeat exists.
+    loop.call_soon_threadsafe(runner._start_heartbeat_poller)

@@ -11,7 +11,19 @@ logger = logging.getLogger("gateway.run")
 
 async def resolve_heartbeat_owner(runner, event, entry):
     """Keep normal reset/topic resolution, then admit only the original lineage."""
+    from gateway.session_wake import current
+    if not await runner._run_in_executor_with_context(current, event):
+        return False
+    wake_sid = getattr(event, "_session_wake_id", None)
+    if wake_sid:
+        import asyncio
+        from gateway.session_wake import settle
+        task = asyncio.current_task()
+        if task is not None:
+            task.add_done_callback(lambda _: settle(event))
     expected = getattr(event, "_heartbeat_session_id", None)
+    if wake_sid and wake_sid != entry.session_id and not expected:
+        return False
     if not expected:
         return True
     resolved = entry.session_id
@@ -29,6 +41,9 @@ async def resolve_heartbeat_owner(runner, event, entry):
 
 
 def heartbeat_owner_is_current(runner, event, session_key):
+    from gateway.session_wake import current
+    if not current(event):
+        return False
     expected = getattr(event, "_heartbeat_resolved_session_id", None)
     if not expected:
         return True

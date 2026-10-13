@@ -95,4 +95,4 @@ def test_user_goal_blocked_still_pauses(goals_mod, monkeypatch):
     mgr = goals_mod.GoalManager(session_id="u1")
     mgr.set("user goal")
     d = mgr.evaluate_after_turn("blocked")
-    assert d["status"] == "paused"
+    assert d["status"] == "waiting"

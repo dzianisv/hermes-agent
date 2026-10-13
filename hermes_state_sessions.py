@@ -502,19 +502,9 @@ class SessionSessionsMixin:
 
     @staticmethod
     def _close_orphaned_goal(conn, session_id: str, reason: str) -> None:
-        """Mark ``goal:<session_id>`` cleared (same connection/transaction as the end stamp)."""
-        try:
-            row = conn.execute("SELECT value FROM state_meta WHERE key = ?", (f"goal:{session_id}",)).fetchone()
-            if not row or not row[0]:
-                return
-            data = json.loads(row[0])
-            if data.get("status") not in ("active", "paused"):
-                return
-            data["status"] = "cleared"
-            data["paused_reason"] = f"session ended ({reason})"
-            conn.execute("UPDATE state_meta SET value = ? WHERE key = ?", (json.dumps(data), f"goal:{session_id}"))
-        except Exception as exc:  # never let goal bookkeeping block the end stamp
-            logger.debug("close orphaned goal for %s failed: %s", session_id, exc)
+        """Cancellation uses the goal controller inside the session-end transaction."""
+        from hermes_cli.goal_controller import cancel
+        cancel(conn, session_id, f"session ended ({reason})")
 
     def reopen_session(self, session_id: str) -> None:
         """Clear ended_at/end_reason so a session can be resumed; first freeze markerless legacy reset

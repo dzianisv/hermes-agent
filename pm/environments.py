@@ -83,6 +83,10 @@ def record_activation_inputs(stamps: Path, mtimes: dict[str, int], project_root:
 def payload_venv(project_root: Path) -> Path | None:
     """The environment a sealed payload ships beside its tree, or ``None``."""
     root = Path(project_root).resolve()
+    # Source checkouts (including worktree .git files) cannot be sealed payloads.
+    # Do not probe unrelated manifests beside a checkout in the user's home.
+    if (root / ".git").exists():
+        return None
     manifest_path = root.parent / "manifest.json"
     if manifest_path.is_file():
         manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))

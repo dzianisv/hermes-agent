@@ -50,8 +50,15 @@ What you'll see:
 1. **Goal accepted** — `⊙ Goal set (20-turn budget): <your goal>`
 2. **Turn 1 runs** — Hermes starts working as if you'd sent the goal as a normal message.
 3. **Judge runs** — after the turn, the judge model decides `done`, `continue`, or `blocked`.
-4. **Loop fires if needed** — if `continue`, you'll see `↻ Continuing toward goal (1/20): <judge's reason>` and Hermes takes the next step automatically.
-5. **Terminates** — eventually you see either `✓ Goal achieved: <reason>` or `⏸ Goal paused — N/20 turns used`.
+4. **Continue quietly** — Hermes takes the next step automatically. Judge verdicts, retry counters, backoff and continuation machinery are not posted to chat.
+5. **Deliver results** — actual task output and new human-only questions remain visible. Use `/goal status` to inspect progress or a safety stop.
+
+The persisted lifecycle is `active → waiting(barrier) → done | cancelled`. A lifted
+barrier returns to `active`; manual pauses require `/goal resume`. Legacy paused
+rows are read as waiting barriers. Every mutation passes through one transactional
+controller. A judge result based on an older revision cannot undo a stop, replace a
+new goal, or recreate a goal after compression. Goal and heartbeat admissions share
+one session owner: ordinary heartbeats resume only when no standing goal owns it.
 
 ## Commands
 
@@ -185,7 +192,7 @@ After every turn, Hermes calls an auxiliary model with:
 - The agent's most recent final response (last ~4 KB of text)
 - A system prompt telling the judge to reply with strict one-line JSON: `{"verdict": "done" | "blocked" | "continue" | "wait", "reason": "<one-sentence rationale>"}` (wait verdicts add `wait_on_session` / `wait_on_pid` / `wait_for_seconds`; the legacy `{"done": <bool>, "reason": "..."}` shape is still accepted)
 
-The judge is deliberately conservative: it marks a goal `done` only when the response **explicitly** confirms the goal is complete, when the final deliverable is clearly produced. A goal the agent explains is **unachievable** (impossible, out of scope, needs user input) gets a `blocked` verdict instead — never `done`: the goal **pauses** with the judge's reason (`🚫 Goal judged unachievable — paused`), so you can re-scope it with `/goal <text>` or override with `/goal resume` rather than burning budget or having an impossible task waved through as complete.
+The judge is deliberately conservative: it marks a goal `done` only when the response **explicitly** confirms the goal is complete, when the final deliverable is clearly produced. A goal the agent explains is **unachievable** (impossible, out of scope, needs user input) gets a `blocked` verdict instead — never `done`: the goal enters a **waiting** barrier with the reason available in `/goal status`, so you can re-scope it with `/goal <text>` or override with `/goal resume` rather than burning budget or having an impossible task waved through as complete.
 
 ### Fail-open semantics
 
@@ -193,11 +200,9 @@ If the judge errors (network blip, malformed response, unavailable aux client), 
 
 ### Turn budget
 
-Default is 20 continuation turns (`goals.max_turns` in `config.yaml`). When the budget is hit, Hermes auto-pauses and tells you exactly how to proceed:
-
-```
-⏸ Goal paused — 20/20 turns used. Use /goal resume to keep going, or /goal clear to stop.
-```
+Default is 20 continuation turns (`goals.max_turns` in `config.yaml`). At the limit,
+Hermes enters a waiting safety barrier without posting a machinery notice. Inspect
+it with `/goal status`; use `/goal resume` to continue or `/goal clear` to cancel.
 
 `/goal resume` resets the counter to zero, so you can keep going in measured chunks.
 
@@ -211,11 +216,11 @@ While an agent is already running, `/goal status`, `/goal pause`, `/goal clear`,
 
 ### Continuation replies do not quote the goal message (gateway)
 
-A continuation prompt is not a reply to the message that set the goal, so on platforms that quote a reply target (Telegram) its progress bubbles and final reply are posted to the chat/topic without quoting that original message. Only your own messages are answered as replies.
+A continuation prompt is not a reply to the message that set the goal, so on platforms that quote a reply target (Telegram) its actual results and human-only questions are posted to the chat/topic without quoting that original message. Only your own messages are answered as replies.
 
 ### Persistence
 
-Goal state lives in `SessionDB.state_meta` keyed by `goal:<session_id>`. That means `/resume` picks up right where you left off — set a goal, close your laptop, come back tomorrow, `/resume`, and the goal is still standing exactly as you left it (active, paused, or done).
+Goal state lives in `SessionDB.state_meta` keyed by `goal:<session_id>`. That means `/resume` picks up right where you left off — set a goal, close your laptop, come back tomorrow, `/resume`, and the goal is still standing exactly as you left it (active, waiting, done, or cancelled).
 
 ### Prompt cache
 
@@ -321,7 +326,7 @@ Four turns, one `/goal` invocation, zero "keep going" prompts from you.
 
 No judge is perfect. Two failure modes to watch for:
 
-**False negative — judge says continue when the goal is actually done.** The turn budget catches this. You'll see `⏸ Goal paused` and can `/goal clear` or just send a new message.
+**False negative — judge says continue when the goal is actually done.** The turn budget catches this. can inspect the waiting barrier with `/goal status`, then `/goal clear` or send a new message.
 
 **False positive — judge says done when work remains.** You'll see `✓ Goal achieved` but you know better. Send a follow-up message to continue, or re-set the goal more precisely: `/goal <more specific text>`. The judge's system prompt is deliberately conservative to make false positives rarer than false negatives.
 
