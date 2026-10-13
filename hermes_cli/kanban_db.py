@@ -4132,6 +4132,11 @@ def request_review(
             staged = _cleaned_artifact_paths(metadata)
             if staged:
                 payload["artifacts"] = staged
+            # The commit handed in for review: re-review diffs reviewed_sha..head_sha.
+            handed = (str(metadata.get("head_sha") or metadata.get("commit_sha") or "").strip()
+                      if isinstance(metadata, dict) else "")
+            if handed:
+                payload["head_sha"] = handed
             _append_event(conn, task_id, "review_requested", payload, run_id=run_id)
     except Exception:
         if staged_copies:

@@ -209,7 +209,21 @@ def _git_diff_since(workspace: Optional[str], sha: str, *, head: Optional[str] =
     return text, ""
 
 
-def _incremental_section(prior: dict, workspace: Optional[str], diff_fn) -> str:
+def handed_in_head(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """``head_sha`` the implementer handed in on the latest ``review_requested`` event."""
+    row = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'review_requested' "
+        "ORDER BY id DESC LIMIT 1", (task_id,)).fetchone()
+    try:
+        data = json.loads(row[0] or "{}") if row else {}
+    except (TypeError, ValueError):
+        return None
+    head = str(data.get("head_sha") or "").strip() if isinstance(data, dict) else ""
+    return head or None
+
+
+def _incremental_section(prior: dict, workspace: Optional[str], diff_fn,
+                         head: Optional[str] = None) -> str:
     rnd = prior.get("round")
     out = [f"RE-REVIEW (round {int(rnd) + 1 if isinstance(rnd, int) else '2+'}). "
            "Prior review findings:"]
@@ -225,13 +239,14 @@ def _incremental_section(prior: dict, workspace: Optional[str], diff_fn) -> str:
         out.append("No reviewed sha was recorded for the prior round; incremental diff "
                    "unavailable — fall back to a full review.")
     else:
-        diff, why = diff_fn(workspace, sha)
+        diff, why = diff_fn(workspace, sha, head=head) if head else diff_fn(workspace, sha)
+        span = f"{sha}..{head}" if head else sha
         if diff is None:
-            out.append(f"Incremental diff since {sha} unavailable ({why}); fall back to a full review.")
+            out.append(f"Incremental diff since {span} unavailable ({why}); fall back to a full review.")
         elif not diff:
-            out.append(f"No changes since last reviewed sha {sha}.")
+            out.append(f"No changes since last reviewed sha {span}.")
         else:
-            out.append(f"Review ONLY the changes since last reviewed sha {sha}, re-checking each "
+            out.append(f"Review ONLY the changes since last reviewed sha {span}, re-checking each "
                        f"FAIL above; PASS items need re-checking only if the diff touches them:\n{diff}")
     return "\n".join(out)
 
@@ -396,7 +411,7 @@ def build_review_brief(
         if prior is not None:
             parts.append(_incremental_section(
                 prior, workspace or getattr(task, "workspace_path", None),
-                diff_fn or _git_diff_since))
+                diff_fn or _git_diff_since, head=handed_in_head(conn, task.id)))
         parts.append(SINGLE_PASS_INSTRUCTION)
         return "\n\n".join(parts)
     except Exception as exc:
