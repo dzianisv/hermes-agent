@@ -1,6 +1,5 @@
 """A parked /goal resumes from the idle hook once its barrier lifts, without waiting for another turn."""
 import queue
-import time
 from unittest.mock import patch
 
 import pytest
@@ -29,7 +28,10 @@ class _Cli(CLILoopsMixin):
         return self._mgr
 
 
-def test_idle_hook_queues_the_continuation_when_a_timed_barrier_has_elapsed(hermes_home):
+def test_idle_hook_queues_the_continuation_when_a_timed_barrier_has_elapsed(hermes_home, monkeypatch):
+    from types import SimpleNamespace
+    now = [10000.0]
+    monkeypatch.setattr(goals, "time", SimpleNamespace(time=lambda: now[0]))
     mgr = goals.GoalManager(session_id="resume-idle")
     mgr.set("finish the thing")
     mgr.wait_for_seconds(1, reason="cooldown")
@@ -37,8 +39,7 @@ def test_idle_hook_queues_the_continuation_when_a_timed_barrier_has_elapsed(herm
     with patch("cli._cprint"), patch("cli._DIM", ""), patch("cli._RST", ""):
         cli._maybe_resume_parked_goal()
         assert cli._pending_input.empty()            # still parked
-        mgr.state.waiting_until = time.time() - 1
-        mgr._save()
+        now[0] += 2
         cli._last_goal_barrier_check = 0.0
         cli._maybe_resume_parked_goal()
     assert not cli._pending_input.empty()            # continuation queued

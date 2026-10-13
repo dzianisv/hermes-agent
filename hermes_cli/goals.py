@@ -1531,6 +1531,11 @@ class GoalManager:
         """True when a paused agent goal has been parked by the loop longer than the release window."""
         if s.status != "waiting" or s.source != "agent":
             return False
+        # Ordinary dependency barriers still own the goal slot. Only a loop safety
+        # park is eligible for age-based release; parked_since() returns zero for
+        # timed/process waits and must not make those immediately replaceable.
+        if s.barrier_kind != "safety":
+            return False
         if s.paused_reason == _USER_PAUSED_REASON:
             return False
         since = s.parked_since()

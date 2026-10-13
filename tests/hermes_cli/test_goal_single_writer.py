@@ -84,3 +84,25 @@ def test_commands_reduce_current_row_and_audit_includes_all_requirements(db, mon
     assert a.complete_with_evidence("Claimed success without passing the gate")["verdict"] == "gate_failed"
     assert goals.load_goal("one").status == "active"
     assert len(seen) == 1
+
+
+@pytest.mark.parametrize("barrier", ["time", "pid", "session", "legacy-time"])
+def test_dependency_wait_retains_agent_goal_slot(db, barrier):
+    manager = goals.GoalManager("waiting-owner")
+    manager.set_agent_goal("Finish the original verified artifact")
+    if barrier == "time":
+        manager.wait_for_seconds(60)
+    elif barrier == "pid":
+        import os
+        manager.wait_on(os.getpid())
+    elif barrier == "session":
+        manager.wait_on_session("dependency")
+    else:
+        row = json.loads(db.get_meta("goal:waiting-owner"))
+        row.update(status="active", waiting_until=goals.time.time() + 60)
+        db.set_meta("goal:waiting-owner", json.dumps(row))
+        manager = goals.GoalManager("waiting-owner")
+    assert manager.state.status == "waiting"
+    assert not manager.accepts_agent_goal()
+    assert manager.set_agent_goal("Replace unfinished work") is None
+    assert goals.load_goal("waiting-owner").goal == "Finish the original verified artifact"
