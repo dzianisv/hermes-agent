@@ -27,6 +27,7 @@ async def restore_heartbeat_watches(runner) -> None:
     Run all storage work off-loop so a cold profile DB cannot block adapters.
     """
     from gateway.run import _profile_runtime_scope
+    from gateway.run_goal_wake import handoff_lane_ok
     from gateway.run_idle_gates import profile_has_active_heartbeat
     from hermes_cli.heartbeat import HeartbeatManager
     from hermes_constants import get_hermes_home
@@ -52,6 +53,11 @@ async def restore_heartbeat_watches(runner) -> None:
                 if entry.origin is None or not entry.session_id or entry.suspended:
                     continue
                 try:
+                    # Skip stale source-lane entries of a handed-off session (Telegram entry after a
+                    # Slack handoff): heartbeats must tick on the session's current lane only.
+                    lane, on_lane = handoff_lane_ok(runner, entry.session_id, entry, store)
+                    if not on_lane or lane.session_key != entry.session_key:
+                        continue
                     source = runner._restored_source(entry)
                     by_scope.setdefault(runner._profile_scope_key_for_source(source), []).append((entry, source))
                 except Exception:

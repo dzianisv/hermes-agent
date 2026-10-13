@@ -105,6 +105,40 @@ async def _wake_one(runner, session_id: str, entry: Any, profile_name: Optional[
         return True
 
 
+def handoff_lane_ok(runner, session_id: str, entry: Any, store: Any) -> Any:
+    """Return the routing entry that owns ``session_id``'s current lane.
+
+    A handed-off session keeps its old routing key (store entries are never deleted on handoff), so
+    "most recently updated" can still be the *source* channel for hours — a Telegram-born goal moved
+    to Slack kept waking into Telegram, and heartbeats restored from the stale Telegram entry kept
+    posting there. The session row names the destination platform; only ``handoff_platform`` is
+    trustworthy because the row's chat/thread get re-stamped by whichever lane last ran a turn.
+    Returns ``(lane_entry, on_lane)``: the newest entry on the handoff lane when one exists, else
+    ``entry`` itself with ``on_lane=False`` when it is a stale source lane (the caller decides whether
+    a stale lane is still an acceptable fallback).
+    """
+    session_db = getattr(runner, "_goal_session_db", None)
+    if session_db is None:
+        with suppress(Exception):
+            from hermes_cli.goals import _get_session_db
+            session_db = _get_session_db()
+    if session_db is None:
+        return entry, True
+    with suppress(Exception):
+        row = session_db.get_session(session_id) or {}
+        if row.get("handoff_state") != "completed":
+            return entry, True
+        want = str(row.get("handoff_platform") or "").lower()
+        if not want or _origin_platform(entry.origin) == want:
+            return entry, True
+        for other in store.list_sessions():  # newest first
+            if other.session_id == session_id and other.origin is not None \
+                    and not getattr(other, "suspended", False) and _origin_platform(other.origin) == want:
+                return other, True
+        return entry, False
+    return entry, True
+
+
 async def _scan_one_store(runner, profile_name: Optional[str]) -> int:
     from hermes_cli.goals import list_idle_active_goals, list_parked_goals
 
@@ -119,30 +153,8 @@ async def _scan_one_store(runner, profile_name: Optional[str]) -> int:
         for entry in store.list_sessions():
             if entry.session_id and entry.origin is not None and not getattr(entry, "suspended", False):
                 entries_by_sid.setdefault(entry.session_id, entry)
-        # A handed-off session keeps its old routing key (store entries are never deleted on handoff),
-        # so "most recently updated" can still be the *source* channel for hours — a Telegram-born goal
-        # moved to Slack kept waking into Telegram. The session row names the destination platform.
-        session_db = getattr(runner, "_goal_session_db", None)
-        if session_db is None:
-            with suppress(Exception):
-                from hermes_cli.goals import _get_session_db
-                session_db = _get_session_db()
-        if session_db is not None:
-            for sid, entry in list(entries_by_sid.items()):
-                with suppress(Exception):
-                    row = session_db.get_session(sid) or {}
-                    if row.get("handoff_state") != "completed":
-                        continue
-                    # The row's chat/thread get re-stamped by whichever lane last ran a turn (including
-                    # these wakes), so only ``handoff_platform`` is trustworthy: newest entry on it wins.
-                    want = str(row.get("handoff_platform") or "").lower()
-                    if not want or _origin_platform(entry.origin) == want:
-                        continue
-                    for other in store.list_sessions():  # newest first
-                        if other.session_id == sid and other.origin is not None \
-                                and not getattr(other, "suspended", False) and _origin_platform(other.origin) == want:
-                            entries_by_sid[sid] = other
-                            break
+        for sid, entry in list(entries_by_sid.items()):
+            entries_by_sid[sid] = handoff_lane_ok(runner, sid, entry, store)[0]
     woken = 0
     for rows, idle in ((parked, False), (idle_rows, True)):
         for session_id, _state in rows:

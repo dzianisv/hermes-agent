@@ -350,3 +350,43 @@ def test_synthetic_prompt_event_marks_system_principal_internal():
     human = SessionSource(platform="slack", chat_id="C1", user_id="U1", chat_type="group", thread_id="t")
     assert GoalsMixin._synthetic_prompt_event(handoff, "go").internal is True
     assert GoalsMixin._synthetic_prompt_event(human, "go").internal is False
+
+
+class TestHeartbeatRestoreSkipsStaleHandoffLane:
+    """Heartbeat watches are restored from the routing index, which keeps the pre-handoff Telegram
+    entry forever. Registering it made every heartbeat tick (and its "⏳ Working" / provider-retry
+    bubbles) post into Telegram after the session had moved to Slack."""
+
+    def _restore(self, runner, monkeypatch):
+        from gateway import run_heartbeat_restore as mod
+        import gateway.run as gw_run
+        monkeypatch.setattr(gw_run, "_profile_runtime_scope", lambda home: contextlib.nullcontext(), raising=False)
+        monkeypatch.setattr(gw_run, "_multiplex_profile_homes", lambda cfg: [], raising=False)
+        import gateway.run_idle_gates as gates
+        monkeypatch.setattr(gates, "profile_has_active_heartbeat", lambda home: True)
+        from hermes_cli import heartbeat as hb
+        monkeypatch.setattr(hb.HeartbeatManager, "is_active", lambda self: True)
+        registered = []
+        runner._register_heartbeat_watch = lambda key, source, sid: registered.append((key, source))
+        runner._profile_scope_key_for_source = lambda source: "default"
+        asyncio.run(mod.restore_heartbeat_watches(runner))
+        return registered
+
+    def test_only_handoff_lane_registered(self, hermes_home, monkeypatch):
+        sid = "gw-hb-handoff"
+        db = goals._get_session_db()
+        db.create_session(sid, "telegram")
+        assert db.request_handoff(sid, "slack")
+        db.complete_handoff(sid)
+        telegram = _entry(sid)
+        slack_source = SessionSource(platform="slack", chat_id="C1", user_id="system:handoff", chat_type="group",
+                                     thread_id="t1", user_name="Handoff")
+        slack = SimpleNamespace(session_id=sid, session_key="agent:main:slack:C1:t1", origin=slack_source,
+                                suspended=False, transport_profile=None)
+        registered = self._restore(_Runner([telegram, slack]), monkeypatch)
+        assert [k for k, _ in registered] == ["agent:main:slack:C1:t1"]
+
+    def test_non_handed_off_session_unchanged(self, hermes_home, monkeypatch):
+        sid = "gw-hb-plain"
+        registered = self._restore(_Runner([_entry(sid)]), monkeypatch)
+        assert len(registered) == 1
