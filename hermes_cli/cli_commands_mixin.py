@@ -2317,8 +2317,10 @@ class CLICommandsMixin:
     def _kick_goal(self, prompt: str) -> bool:
         """Queue the next turn without mutating cached conversation history."""
         try:
-            self._pending_input.put(prompt)
-            return True
+            from hermes_cli.cli_loops_mixin import _enqueue_cli_wake
+            mgr = self._get_goal_manager()
+            state = mgr._state if mgr is not None else None
+            return bool(state and _enqueue_cli_wake(self, mgr, "goal", prompt, revision=state.revision))
         except Exception:
             return False
 

@@ -45,6 +45,19 @@ class CLIChatTurnMixin:
         GatewayRunner._apply_fallback_chain_to_agent(agent, self._fallback_model)
 
     def chat(self, message, images: list = None, voice_input: bool = False) -> Optional[str]:
+        from hermes_cli.cli_loops_mixin import _cli_wake_current, _settle_cli_wake
+        self._last_cli_wake_discarded = False
+        try:
+            if not _cli_wake_current(self, message):
+                self._last_cli_wake_discarded = True
+                return None
+            return self._chat_turn(message, images=images, voice_input=voice_input)
+        finally:
+            # The REPL owns cleanup through judging; direct callers end here.
+            if getattr(self, "_active_cli_wake", None) is not message:
+                _settle_cli_wake(message)
+
+    def _chat_turn(self, message, images: list = None, voice_input: bool = False) -> Optional[str]:
         """Run one user turn; returns the agent's response, or None on error.
 
         Input typed while the agent runs goes to ``_interrupt_queue`` (separate from
@@ -58,6 +71,8 @@ class CLIChatTurnMixin:
         """
         from cli import ChatConsole, _ChatTurn, _DIM, _RST, _accent_hex, _cprint, set_secret_capture_callback
         from tools.process_registry_notifications import TimelineNotification
+        from hermes_cli.cli_loops_mixin import CLIWakeInput
+        wake = message if isinstance(message, CLIWakeInput) else None
         # Single-query and direct chat callers do not go through run().
         set_secret_capture_callback(self._secret_capture_callback)
         # Reset per turn; only a real interrupt flips it, so early returns leave it False.
@@ -98,6 +113,7 @@ class CLIChatTurnMixin:
         from agent.notification_presentation import notification_config_snapshot, notification_policy_snapshot
         with notification_policy_snapshot(agent, "cli", notification_config_snapshot()):
             turn = _ChatTurn()
+            turn.cli_wake = wake
             from gateway.warning_notifications import diagnostic_turn_muted
             turn.mute_notification_reply = diagnostic_turn_muted(
                 agent._pending_cli_user_message.get("display_metadata"), "cli", agent._notification_config)
@@ -306,6 +322,12 @@ class CLIChatTurnMixin:
 
     def _chat_run_agent(self, turn, message):
         """Agent-thread body: bind per-thread callbacks/approval key, prepend one-shot notes, run the turn."""
+        from hermes_cli.cli_loops_mixin import _cli_wake_current
+        wake = getattr(turn, "cli_wake", None)
+        if not _cli_wake_current(self, wake):
+            self._last_cli_wake_discarded = True
+            turn.result = {"messages": self.conversation_history, "final_response": ""}
+            return
         from cli import (
             _prepend_note_to_message, set_approval_callback, set_secret_capture_callback,
             set_sudo_password_callback,
@@ -349,6 +371,13 @@ class CLIChatTurnMixin:
             from agent.notification_presentation import notification_turn
             muted = getattr(turn, "mute_notification_reply", False)
             with notification_turn(self.agent, muted=muted, session_id=self.session_id):
+                # Credential/agent setup and the thread hop may outlive a goal revision.
+                if not _cli_wake_current(self, wake):
+                    self._last_cli_wake_discarded = True
+                    turn.result = {"messages": self.conversation_history, "final_response": ""}
+                    return
+                if wake is not None:
+                    wake.started = True
                 turn.result = self.agent.run_conversation(
                     user_message=agent_message,
                     conversation_history=self.conversation_history[:-1],

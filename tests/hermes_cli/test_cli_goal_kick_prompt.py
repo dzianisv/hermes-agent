@@ -20,7 +20,10 @@ def _cli(history):
 
 def _kick(cli, text):
     cli._handle_goal_command("/goal " + text)
-    return cli._pending_input.get_nowait()
+    event = cli._pending_input.get_nowait()
+    from gateway.session_wake import settle
+    settle(event)  # this helper consumes the turn instead of running the REPL
+    return event
 
 
 HANDOFF = "HANDOFF: resume round 3 integration.\n" + "\n".join(f"  - step {i}: merge r3-{i} and run its targeted suite, then the full suite" for i in range(8))

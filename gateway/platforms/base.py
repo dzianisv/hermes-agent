@@ -3854,7 +3854,8 @@ class BasePlatformAdapter(ABC):
         logger.warning("[%s] Healing stale session lock for %s (owner task is done/absent)",
                        self.name, session_key)
         self._active_sessions.pop(session_key, None)
-        self._pending_messages.pop(session_key, None)
+        from gateway.session_wake import settle
+        settle(self._pending_messages.pop(session_key, None))
         self._session_tasks.pop(session_key, None)
         self._discard_text_debounce(session_key)
         return True
@@ -3871,6 +3872,8 @@ class BasePlatformAdapter(ABC):
             self._session_tasks.pop(session_key, None)
             self._release_session_guard(session_key, guard=guard)
             return False
+        from gateway.session_wake import bind_task
+        bind_task(event, task)
         return True
 
     def _track_session_task(self, session_key: str, task: Any) -> bool:
@@ -3892,6 +3895,10 @@ class BasePlatformAdapter(ABC):
         """Cancel in-flight processing for one session. ``release_guard=False`` keeps the guard so
         reset-like commands finish atomically; the await is bounded (5s) so a wedged finally can't
         stall."""
+        if discard_pending:
+            from gateway.session_wake import settle
+            settle(self._pending_messages.pop(session_key, None))
+            self._discard_text_debounce(session_key)
         task = self._session_tasks.pop(session_key, None)
         if task is not None and not task.done():
             logger.debug("[%s] Cancelling active processing for session %s", self.name, session_key)
@@ -3909,7 +3916,8 @@ class BasePlatformAdapter(ABC):
                 logger.debug("[%s] Session cancellation raised while unwinding %s", self.name,
                              session_key, exc_info=True)
         if discard_pending:
-            self._pending_messages.pop(session_key, None)
+            from gateway.session_wake import settle
+            settle(self._pending_messages.pop(session_key, None))
             self._discard_text_debounce(session_key)
         if release_guard:
             self._release_session_guard(session_key)
@@ -4057,6 +4065,17 @@ class BasePlatformAdapter(ABC):
                     return
             if handled:
                 return
+        # A synthetic wake must remain a distinct event even without a runner FIFO.
+        from gateway.session_wake import settle
+        pending = self._pending_messages.get(session_key)
+        if getattr(event, "_session_wake_token", None):
+            if pending is None:
+                self._pending_messages[session_key] = event
+                event._gateway_accepted = True
+            return
+        if getattr(pending, "_session_wake_token", None):
+            # Human input takes priority; the durable goal/heartbeat retries later.
+            settle(self._pending_messages.pop(session_key))
         # Without a runner FIFO, do not merge a wake into an occupied human slot
         # (or collapse distinct wakes into one turn). Its caller can retry admission.
         if event.internal and session_key in self._pending_messages:
@@ -4566,10 +4585,6 @@ class BasePlatformAdapter(ABC):
             if isinstance(e, (SystemExit, KeyboardInterrupt)):
                 raise
         finally:
-            if getattr(event, "_session_wake_token", None):
-                from gateway.session_wake import settle
-                with self._media_delivery_scope(event.source):
-                    await asyncio.to_thread(settle, event)
             await self._release_turn_marker(event)
             event._turn_marker_handoff = False  # a later run of this object clears its own marker
             # Stop typing BEFORE the post-delivery callback: a stuck callback must not keep it
@@ -4588,9 +4603,10 @@ class BasePlatformAdapter(ABC):
         follow-ups grew the C stack to SIGSEGV). Clearing (not deleting) the Event keeps the guard
         live for concurrent inbound; ownership moves so stale-lock detection works."""
         self._clear_session_guard(session_key)
-        self._track_session_task(
-            session_key,
-            asyncio.create_task(self._process_message_background(pending_event, session_key)))
+        task = asyncio.create_task(self._process_message_background(pending_event, session_key))
+        self._track_session_task(session_key, task)
+        from gateway.session_wake import bind_task
+        bind_task(pending_event, task)
 
     def _clear_session_guard(self, session_key: str) -> None:
         """Clear (not delete) the session's interrupt Event so the guard stays live for inbound."""
@@ -4640,6 +4656,9 @@ class BasePlatformAdapter(ABC):
         with contextlib.suppress(Exception):  # flush pending messages to disk before clearing
             from gateway.shutdown_flush import flush_pending_to_file
             flush_pending_to_file(self._pending_messages, reason="adapter_shutdown")
+        from gateway.session_wake import settle
+        for pending in self._pending_messages.values():
+            settle(pending)
         for state in self._text_debounce_store().values():
             state.cancel_timer()
         for bucket in (self._background_tasks, self._expected_cancelled_tasks, self._session_tasks,

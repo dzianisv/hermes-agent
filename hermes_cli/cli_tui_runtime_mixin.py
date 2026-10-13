@@ -59,13 +59,41 @@ class CLITuiRuntimeMixin:
                 step()
 
     def _tui_process_one_input(self, user_input):
+        from hermes_cli.cli_loops_mixin import CLIWakeInput, _cli_wake_current, _settle_cli_wake
+        self._active_cli_wake = user_input if isinstance(user_input, CLIWakeInput) else None
+        try:
+            if not _cli_wake_current(self, user_input):
+                return
+            return self._tui_dispatch_input(user_input)
+        finally:
+            self._active_cli_wake = None
+            _settle_cli_wake(user_input)
+
+    def _tui_dispatch_input(self, user_input):
         """Route one submitted input: file drop, /resume pick, ! shell, slash command, or a chat turn."""
         from cli import _DIM, _PASTE_REF_RE, _RST, _cprint, _detect_file_drop, _looks_like_slash_command, _strip_leaked_bracketed_paste_wrappers, _strip_leaked_terminal_responses_with_meta
         from tools.process_registry_notifications import TimelineNotification
         user_input, is_voice_input, is_seeded_query = self._tui_unwrap_input(user_input)
         if not user_input:
             return
+        from hermes_cli.cli_loops_mixin import CLIWakeInput
+        wake = user_input if isinstance(user_input, CLIWakeInput) else None
         notification_preview = user_input if isinstance(user_input, TimelineNotification) else None
+        if wake is not None:
+            # Never interpret synthetic goal text as a file drop, paste, or voice stop.
+            if wake.kind == "loop" and wake.lstrip().startswith("/"):
+                wake.started = True
+                try:
+                    self.process_command(str(wake))
+                finally:
+                    wake.manager.complete_tick("")
+                return
+            self._agent_running = self._interactive_turn = True
+            try:
+                self.chat(wake)
+            finally:
+                self._tui_after_turn()
+            return
         self._status_bar_suppressed_after_resize = False  # input ends post-resize suppression
 
         submit_images = []
@@ -169,7 +197,8 @@ class CLITuiRuntimeMixin:
             (self._maybe_complete_loop_tick_after_turn, "loop completion"),
         ):
             try:
-                hook()
+                if not getattr(self, "_last_cli_wake_discarded", False):
+                    hook()
             except Exception as _exc:
                 logging.debug("%s hook failed: %s", what, _exc)
 

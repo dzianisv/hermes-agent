@@ -181,6 +181,7 @@ class GatewayGoalsMixin:
         stamp(event, session_id, token)
         event.metadata["gateway_session_key"] = quick_key
         event._heartbeat_execution_started = False
+        event._heartbeat_manager = mgr
         # Provenance read by display_kind_for_event / the turn's quiet surfaces; the event stays
         # non-internal so authorization and the emergency stop still apply.
         event._heartbeat_session_id = session_id
@@ -190,12 +191,6 @@ class GatewayGoalsMixin:
             await adapter.handle_message(event)
         finally:
             track(adapter, quick_key, event)
-            task = getattr(adapter, "_session_tasks", {}).get(quick_key)
-            if task is not None:
-                from gateway.run_heartbeat_acceptance import settle_heartbeat_attempt
-                task.add_done_callback(lambda done: settle_heartbeat_attempt(event, mgr))
-            elif quick_key not in adapter._active_sessions:
-                mgr.abandon_fire()
 
     def _start_heartbeat_poller(self) -> None:
         """Start the single gateway-wide heartbeat poll task (idempotent)."""
@@ -321,12 +316,20 @@ class GatewayGoalsMixin:
         # judge_goal() is a synchronous aux-LLM HTTP call (10-40 s; would block Discord heartbeats).
         # _run_in_executor_with_context carries the profile secret scope / aux runtime contextvars
         # without which aux credential resolution fails under multiplexing.
-        decision = await self._run_in_executor_with_context(
+        evaluation = asyncio.create_task(self._run_in_executor_with_context(
             lambda: mgr.evaluate_after_turn(
                 final_response or "", user_initiated=True, background_processes=_bg_procs,
                 active_delegations=_active_deleg,
             ),
-        )
+        ))
+        try:
+            decision = await asyncio.shield(evaluation)
+        except asyncio.CancelledError:
+            # Cancelling the await does not stop the executor's judge. Keep this
+            # event's ownership until that worker has finished its durable effect.
+            with suppress(Exception):
+                await asyncio.shield(evaluation)
+            raise
         msg = decision.get("message") or ""
         # Deferred until the visible final response is delivered, else "✓ Goal achieved" precedes it.
         if msg and source is not None:
@@ -359,8 +362,8 @@ class GatewayGoalsMixin:
         self, *, agent_result: Any, source: Any, is_internal: bool, event: Any = None,
     ) -> None:
         """Run goal and loop bookkeeping after an agent turn returns."""
-        from gateway.session_wake import settle
-        settle(event)
+        # The adapter owns this event until judge, response and post-delivery work finish.
+        # A continue verdict persists wake_pending; its successor is admitted on the next tick.
         final_text = self._final_text_for_post_turn_hooks(agent_result, event)
         try:
             session_entry = await self.async_session_store.get_or_create_session(

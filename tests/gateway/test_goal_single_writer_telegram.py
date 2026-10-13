@@ -6,6 +6,9 @@ method, synthetic-event builder, reducer, FIFO drain or delivery filter is stubb
 import asyncio
 import contextlib
 import json
+import threading
+import subprocess
+import sys
 from datetime import datetime
 from types import SimpleNamespace
 
@@ -22,6 +25,27 @@ from hermes_state import SessionDB
 from plugins.platforms.telegram.adapter import TelegramAdapter
 
 
+def process_claim(path, sid, kind, revision=None):
+    """Spawn a fresh interpreter/SQLite connection against only this test's DB."""
+    script = """
+import json, sys
+from hermes_state import SessionDB
+from hermes_cli import goals
+from gateway.session_wake import claim
+from pathlib import Path
+db = SessionDB(db_path=Path(sys.argv[1]))
+try:
+    goals._get_session_db = lambda: db
+    print(json.dumps(claim(sys.argv[2], sys.argv[3], revision=json.loads(sys.argv[4]))))
+finally:
+    db.close()
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(path), sid, kind, json.dumps(revision)],
+        check=True, capture_output=True, text=True, timeout=15)
+    return json.loads(completed.stdout.strip())
+
+
 class Clock:
     now = 10000.0
     def time(self):
@@ -36,7 +60,12 @@ class TelegramTransport:
     username = "local_test_bot"
     def __init__(self):
         self.messages, self.actions = [], []
+        self.delivery_entered, self.delivery_release = asyncio.Event(), asyncio.Event()
+        self.suspend_delivery = False
     async def send_message(self, **kwargs):
+        if self.suspend_delivery:
+            self.delivery_entered.set()
+            await self.delivery_release.wait()
         self.messages.append(kwargs)
         return SimpleNamespace(message_id=len(self.messages))
     async def edit_message_text(self, **kwargs):
@@ -52,8 +81,9 @@ def world(tmp_path, monkeypatch):
     monkeypatch.setattr(goals, "_get_session_db", lambda: db)
     clock = Clock()
     # Replace module clock objects, not global time.time (async deadlines stay real).
-    for mod in [goals, heartbeat, __import__("gateway.session_wake", fromlist=["time"])]:
-        monkeypatch.setattr(mod, "time", SimpleNamespace(time=clock.time))
+    from gateway import session_wake
+    for mod in [goals, heartbeat, session_wake]:
+        monkeypatch.setattr(mod, "time", SimpleNamespace(time=clock.time), raising=False)
     yield db, clock
     db.close()
 
@@ -85,15 +115,22 @@ async def test_quiet_single_owner_through_real_telegram(world, monkeypatch):
     async def get_entry(*args, **kwargs):
         return entry
     runner._profile_scope_for_source = lambda _: contextlib.nullcontext()
+    judge_entered, judge_release = threading.Event(), threading.Event()
+    suspend_judge = False
     async def execute(fn, *args):
-        return fn(*args)
+        return await asyncio.to_thread(fn, *args)
     runner._run_in_executor_with_context = execute
     runner._restored_source = lambda e: e.origin
     runner._delivery_adapter_for = lambda _: adapter
     runner._session_key_for_source = lambda _: key
     runner._thread_metadata_for_source = lambda _: {"thread_id": "7"}
     outputs, turns, verdict = [], [], {"verdict": "continue", "reason": "next requirement"}
-    monkeypatch.setattr(goals, "_call_goal_judge_llm", lambda *a: json.dumps(verdict))
+    def judge(*args):
+        if suspend_judge:
+            judge_entered.set()
+            assert judge_release.wait(15), "judge release was not signalled"
+        return json.dumps(verdict)
+    monkeypatch.setattr(goals, "_call_goal_judge_llm", judge)
 
     async def model_boundary(event):
         assert await resolve_heartbeat_owner(runner, event, entry)
@@ -145,14 +182,29 @@ async def test_quiet_single_owner_through_real_telegram(world, monkeypatch):
     clock.advance(121)
     outputs.append("Build artifact checksum verified: abc123.")
     verdict.update(verdict="wait", wait_for_seconds=60, reason="signature worker running")
+    suspend_judge = True
     await wake_lifted_goal_barriers(runner)
-    await drain()
+    assert await asyncio.to_thread(judge_entered.wait, 10)
+    try:
+        clock.advance(7200)
+        # Another scheduler/process must not enter while the judge is suspended.
+        revision = goals.load_goal(entry.session_id).revision
+        assert claim(entry.session_id, "goal", revision=revision) is None
+        assert await asyncio.to_thread(process_claim, db.db_path, entry.session_id, "goal", revision) is None
+    finally:
+        suspend_judge = False
+        judge_release.set()
+        await drain()
     assert len(transport.messages) == 1
 
     clock.advance(61)
     question = "May I publish this artifact to the public download page?"
     verdict.update(verdict="blocked", blocker="human_only", human_decision=question)
     outputs.extend(["Release signature verified.", "[SILENT]"])
+    await wake_lifted_goal_barriers(runner)
+    await drain()
+    assert sum(question in m["text"] for m in transport.messages) == 1
+    assert goals.load_goal(entry.session_id).wake_pending
     await wake_lifted_goal_barriers(runner)
     await drain()
     assert sum(question in m["text"] for m in transport.messages) == 1
@@ -174,8 +226,17 @@ async def test_quiet_single_owner_through_real_telegram(world, monkeypatch):
     verdict.update(verdict="done", reason="published artifact verified")
     await runner._post_turn_goal_continuation(session_entry=entry, source=source, final_response="[SILENT]")
     clock.advance(goals.load_goal(entry.session_id).waiting_until - clock.now + 1)
+    transport.suspend_delivery = True
     await wake_lifted_goal_barriers(runner)
-    await drain()
+    await asyncio.wait_for(transport.delivery_entered.wait(), 10)
+    try:
+        assert goals.load_goal(entry.session_id).status == "done"
+        # The completed goal no longer blocks heartbeat; only the delivery owner does.
+        assert await asyncio.to_thread(process_claim, db.db_path, entry.session_id, "heartbeat") is None
+    finally:
+        transport.suspend_delivery = False
+        transport.delivery_release.set()
+        await drain()
     assert goals.load_goal(entry.session_id).status == "done"
     assert any("https://example.test/download/build.zip" in m["text"].replace("\\", "") for m in transport.messages)
 
@@ -189,3 +250,37 @@ async def test_quiet_single_owner_through_real_telegram(world, monkeypatch):
     assert not any(word in m["text"] for m in transport.messages for word in
                    ["Continuing toward", "remaining", "backing off", "rerouting", "Goal parked", "[SILENT]"])
     assert not outputs
+
+
+def test_live_owner_never_expires_dead_owner_is_reclaimed(world):
+    from gateway.status import get_process_start_time
+    db, clock = world
+    token = claim("liveness", "heartbeat")
+    clock.advance(7200)
+    assert claim("liveness", "heartbeat") is None
+    settle(SimpleNamespace(_session_wake_id="liveness", _session_wake_token=token))
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        owner = {"token": "dead-owner", "kind": "heartbeat", "revision": None,
+                 "pid": child.pid, "start_time": get_process_start_time(child.pid)}
+        db._execute_write(lambda conn: conn.execute(
+            "INSERT INTO state_meta(key,value) VALUES (?,?)",
+            ("session_wake:liveness", json.dumps(owner))))
+        assert claim("liveness", "heartbeat") is None
+    finally:
+        child.terminate()
+        child.wait(timeout=5)
+    replacement = claim("liveness", "heartbeat")
+    assert replacement and replacement != owner["token"]
+    assert process_claim(db.db_path, "liveness", "heartbeat") is None
+    # A recycled PID is not the recorded owner, even though that PID is alive.
+    row = db._execute_write(lambda conn: conn.execute(
+        "SELECT value FROM state_meta WHERE key=?", ("session_wake:liveness",)).fetchone()[0])
+    recycled = json.loads(row)
+    recycled["start_time"] -= 10000
+    db._execute_write(lambda conn: conn.execute(
+        "UPDATE state_meta SET value=? WHERE key=?", (json.dumps(recycled), "session_wake:liveness")))
+    assert claim("liveness", "heartbeat") not in {None, replacement}
+    # A late cleanup from the dead process cannot delete the new owner's claim.
+    settle(SimpleNamespace(_session_wake_id="liveness", _session_wake_token=owner["token"]))
+    assert claim("liveness", "heartbeat") is None

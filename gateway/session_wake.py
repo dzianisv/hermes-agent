@@ -5,14 +5,36 @@ routing key (handoff leaves old keys behind). A goal owns the lane while active 
 waiting; an independent heartbeat must not poll through its barrier. The token
 covers FIFO admission through completion, and is revalidated at agent entry.
 """
+import contextvars
 import json
-import time
+import os
 import uuid
+
+
+def _owner_alive(owner):
+    from gateway.status import get_process_start_time, start_time_fingerprints_match
+    import psutil
+    pid = owner.get("pid")
+    # Legacy leases have no identity; fail closed rather than steal a live turn.
+    if not isinstance(pid, int) or pid <= 0:
+        return True
+    try:
+        process = psutil.Process(pid)
+        if not process.is_running() or process.status() == psutil.STATUS_ZOMBIE:
+            return False
+    except psutil.NoSuchProcess:
+        return False
+    except psutil.AccessDenied:
+        return True
+    started = get_process_start_time(pid)
+    recorded = owner.get("start_time")
+    return (started is None or recorded is None
+            or start_time_fingerprints_match(recorded, started))
 
 
 def claim(session_id, kind, *, revision=None):
     from hermes_cli.goal_controller import _db, read
-    now = time.time()
+    from gateway.status import get_process_start_time
     def apply(conn):
         goal = read(conn, session_id)
         if kind == "goal":
@@ -24,11 +46,12 @@ def claim(session_id, kind, *, revision=None):
         row = conn.execute("SELECT value FROM state_meta WHERE key=?", (key,)).fetchone()
         if row:
             prior = json.loads(row[0])
-            # Crash recovery only. Normal completion releases its exact token.
-            if now < prior["expires"]:
+            # Elapsed wall time never proves the owner died (long turns / suspended judge).
+            if _owner_alive(prior):
                 return None
         token = uuid.uuid4().hex
-        value = {"token": token, "kind": kind, "revision": revision, "expires": now + 3600}
+        value = {"token": token, "kind": kind, "revision": revision,
+                 "pid": os.getpid(), "start_time": get_process_start_time(os.getpid())}
         conn.execute("INSERT OR REPLACE INTO state_meta(key,value) VALUES (?,?)", (key, json.dumps(value)))
         return token
     return _db()._execute_write(apply)
@@ -47,6 +70,7 @@ def release(session_id, token):
 def stamp(event, session_id, token):
     event._session_wake_id = session_id
     event._session_wake_token = token
+    event._session_wake_context = contextvars.copy_context()
 
 
 def current(event):
@@ -70,14 +94,34 @@ def current(event):
 
 def settle(event):
     sid = getattr(event, "_session_wake_id", None)
-    if sid:
+    if not sid or getattr(event, "_session_wake_settled", False):
+        return
+    def finish():
         release(sid, event._session_wake_token)
+        manager = getattr(event, "_heartbeat_manager", None)
+        if manager is not None:
+            from gateway.run_heartbeat_acceptance import settle_heartbeat_attempt
+            settle_heartbeat_attempt(event, manager)
+    scope = getattr(event, "_session_wake_context", None)
+    if scope is not None:
+        scope.copy().run(finish)
+    else:
+        finish()
+    event._session_wake_settled = True
+
+
+def bind_task(event, task):
+    """Bind cleanup before scheduling can be cancelled, including FIFO drain tasks."""
+    if getattr(event, "_session_wake_token", None):
+        event._session_wake_task = task
+        task.add_done_callback(lambda _: settle(event))
 
 
 def track(adapter, key, event):
-    """Release even when auth/stop/preparation rejects before post-turn hooks run."""
-    task = getattr(adapter, "_session_tasks", {}).get(key)
-    if task is not None:
-        task.add_done_callback(lambda _: settle(event))
-    elif key not in getattr(adapter, "_active_sessions", {}):
+    """Rejected attempts settle now; accepted events settle on their own task/drop.
+
+    The task currently at key may still belong to a human. Never attach this
+    event's cleanup to it: queue acceptance isn't execution ownership.
+    """
+    if getattr(event, "_session_wake_task", None) is None and not getattr(event, "_gateway_accepted", False):
         settle(event)

@@ -162,22 +162,31 @@ class GatewayBusySessionMixin:
     @staticmethod
     def _is_goal_continuation_event(event_or_text: Any) -> bool:
         """True for synthetic /goal continuation turns (so pause/clear can spare real /queue items)."""
+        if (getattr(event_or_text, "_session_wake_token", None)
+                and not getattr(event_or_text, "_heartbeat_session_id", None)):
+            return True
         text = getattr(event_or_text, "text", event_or_text) or ""
         return str(text).startswith("[Continuing toward your standing goal]\nGoal:")
 
     def _clear_goal_pending_continuations(self, session_key: str, adapter: Any) -> int:
         """Remove queued synthetic /goal continuations for one session; real /queue items are kept."""
+        from gateway.session_wake import settle
         removed = 0
         pending_slot = getattr(adapter, "_pending_messages", None) if adapter is not None else None
         if isinstance(pending_slot, dict):
             pending_event = pending_slot.get(session_key)
             if self._is_goal_continuation_event(pending_event):
-                pending_slot.pop(session_key, None)
+                settle(pending_slot.pop(session_key, None))
                 removed += 1
 
         overflow = self._overflow_queue(session_key)
         if overflow:
-            kept = [e for e in overflow if not self._is_goal_continuation_event(e)]
+            kept = []
+            for event in overflow:
+                if self._is_goal_continuation_event(event):
+                    settle(event)
+                else:
+                    kept.append(event)
             removed += len(overflow) - len(kept)
             self._peek_session_state(session_key).conversation.queued_events = kept
         return removed
@@ -388,6 +397,8 @@ class GatewayBusySessionMixin:
         }
         if (
             same_security_context
+            and not getattr(existing, "_session_wake_token", None)
+            and not getattr(event, "_session_wake_token", None)
             and MessageType.PHOTO in merge_types
             and merge_types <= {MessageType.TEXT, MessageType.PHOTO}
         ):

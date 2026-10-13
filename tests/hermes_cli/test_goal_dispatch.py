@@ -20,7 +20,12 @@ def _surface(surface, mgr, monkeypatch, prompts=None):
         def execute(arg):
             cli._handle_goal_command('/goal ' + arg)
             while not cli._pending_input.empty():
-                prompts.append(cli._pending_input.get_nowait())
+                event = cli._pending_input.get_nowait()
+                prompts.append(event)
+                # This dispatcher harness consumes the turn instead of running a
+                # model. Complete its ownership just as the real REPL finally does.
+                from hermes_cli.cli_loops_mixin import _settle_cli_wake
+                _settle_cli_wake(event)
         return execute
     if surface == "gateway":
         from gateway.run_busy import GatewayBusySessionMixin

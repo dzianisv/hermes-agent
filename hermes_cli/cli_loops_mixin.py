@@ -14,6 +14,64 @@ from rich.markup import escape as _escape
 _FRESH_START = "  ✨ (◕‿◕)✨ Fresh start! Screen cleared and conversation reset.\n"
 
 
+class CLIWakeInput(str):
+    """A synthetic turn whose ownership survives queueing and string rendering."""
+
+
+def _enqueue_cli_wake(cli, manager, kind, prompt, *, revision=None) -> bool:
+    from gateway import session_wake
+    sid = manager.session_id
+    if getattr(cli, "session_id", sid) != sid:
+        return False
+    # A replacement goal may supersede a queued wake before the REPL gets to it.
+    CLILoopsMixin._mutate_pending_input(cli, lambda items: [
+        item for item in items if _cli_wake_current(cli, item)])
+    token = session_wake.claim(sid, kind, revision=revision)
+    if token is None:
+        return False
+    event = CLIWakeInput("")
+    session_wake.stamp(event, sid, token)
+    try:
+        text = prompt() if callable(prompt) else prompt
+        if not text:
+            session_wake.settle(event)
+            return False
+        event = CLIWakeInput(text)
+        session_wake.stamp(event, sid, token)
+        event.manager = manager
+        event.kind = kind
+        event.started = False
+        event.snapshot = manager.state.to_json() if kind != "goal" else None
+        cli._pending_input.put(event)
+        return True
+    except BaseException:
+        session_wake.settle(event)
+        raise
+
+
+def _cli_wake_current(cli, event) -> bool:
+    from gateway import session_wake
+    if not isinstance(event, CLIWakeInput):
+        return True
+    if event._session_wake_id != getattr(cli, "session_id", None) or not session_wake.current(event):
+        return False
+    if event.kind != "goal":
+        state = event.manager.state
+        return state is not None and state.to_json() == event.snapshot
+    return True
+
+
+def _settle_cli_wake(event):
+    from gateway import session_wake
+    try:
+        if isinstance(event, CLIWakeInput) and event.kind == "loop" and not event.started:
+            state = event.manager.state
+            if state is not None and state.to_json() == event.snapshot:
+                event.manager.abandon_tick()
+    finally:
+        session_wake.settle(event)
+
+
 def _preview(payload: str) -> str:
     return f"{payload[:80]}{'...' if len(payload) > 80 else ''}"
 
@@ -302,6 +360,10 @@ class CLILoopsMixin:
             q.unfinished_tasks = len(after)
             if after:
                 q.not_empty.notify_all()
+        retained = {id(item) for item in after}
+        for item in before:
+            if id(item) not in retained:
+                _settle_cli_wake(item)
         return before, after
 
     def _queue_enqueue(self, text: str) -> None:
@@ -499,24 +561,22 @@ class CLILoopsMixin:
                 while not getattr(self, "_should_exit", False):
                     time.sleep(POLL_SECONDS)
                     try:
-                        mgr = self._get_heartbeat_manager()
-                        if mgr is None or not mgr.is_active():
-                            continue
-                        busy = (
-                            self._agent_running
-                            or getattr(self, "_voice_recording", False)
-                            or getattr(self, "_voice_processing", False)
-                            or not self._pending_input.empty())
-                        if busy:
-                            continue
-                        prompt = mgr.due_prompt()
-                        if prompt:
-                            self._pending_input.put(prompt)
+                        self._maybe_fire_heartbeat_tick()
                     except Exception as exc:
                         logging.debug("heartbeat watchdog tick failed: %s", exc)
             finally:
                 self._heartbeat_watchdog_started = False
         threading.Thread(target=_loop, daemon=True, name="heartbeat-watchdog").start()
+
+    def _maybe_fire_heartbeat_tick(self) -> None:
+        mgr = self._get_heartbeat_manager()
+        if mgr is None or not mgr.is_active():
+            return
+        if (self._agent_running or getattr(self, "_voice_recording", False)
+                or getattr(self, "_voice_processing", False) or not self._pending_input.empty()):
+            return
+        # Claim before due_prompt advances its clock: a competing owner must not eat a tick.
+        _enqueue_cli_wake(self, mgr, "heartbeat", mgr.due_prompt)
 
     def _maybe_resume_parked_goal(self) -> None:
         """Idle hook run from process_loop: when a parked /goal's barrier has lifted (the process
@@ -541,9 +601,7 @@ class CLILoopsMixin:
                 return  # barrier still holds (is_waiting() also applies the age cap)
             prompt = mgr.next_continuation_prompt()
             if prompt:
-                from cli import _DIM, _RST, _cprint
-                _cprint(f"  {_DIM}▶ Goal barrier lifted — resuming.{_RST}")
-                self._pending_input.put(prompt)
+                _enqueue_cli_wake(self, mgr, "goal", prompt, revision=mgr._state.revision)
         except Exception as exc:
             logging.debug("parked-goal resume check failed: %s", exc)
 
@@ -575,14 +633,8 @@ class CLILoopsMixin:
                 return
         except Exception:
             pass
-        wakeup = mgr.fire_tick()
-        if not wakeup:
-            return
         try:
-            state = mgr.state
-            tick_no = state.ticks_fired if state else "?"
-            _cprint(f"  {_DIM}↻ /loop wakeup #{tick_no} firing…{_RST}")
-            self._pending_input.put(wakeup)
+            _enqueue_cli_wake(self, mgr, "loop", mgr.fire_tick)
         except Exception as exc:
             logging.debug("loop tick injection failed: %s", exc)
             try:
@@ -590,15 +642,6 @@ class CLILoopsMixin:
             except Exception:
                 pass
             return
-        # A slash-command loop (`/loop 10m /recap`) is dispatched via process_command and
-        # never reaches chat()'s post-turn finally, so its tick would never complete and
-        # the loop would wedge on awaiting_response. Slash ticks have no model reply to
-        # judge; complete them immediately (caps and scheduling still apply).
-        if wakeup.lstrip().startswith("/"):
-            try:
-                _print_decision_message(mgr.complete_tick(""))
-            except Exception:
-                pass
 
     def _last_assistant_response_text(self) -> str:
         """Text of the most recent assistant message ("" when none); multimodal parts are flattened."""
@@ -702,11 +745,16 @@ class CLILoopsMixin:
             _bg_procs = None
         decision = mgr.evaluate_after_turn(
             last_response, user_initiated=True, background_processes=_bg_procs, active_delegations=_active_deleg)
-        _print_decision_message(decision)
+        if decision.get("verdict") == "blocked_human_pending":
+            _print_decision_message(decision)
+        else:
+            logging.debug("goal decision: %s", decision)
         if decision.get("should_continue"):
             prompt = decision.get("continuation_prompt")
             if prompt:
                 try:
-                    self._pending_input.put(prompt)
+                    # Keep the old owner through the judge; hand off only at successor admission.
+                    _settle_cli_wake(getattr(self, "_active_cli_wake", None))
+                    _enqueue_cli_wake(self, mgr, "goal", prompt, revision=decision.get("revision"))
                 except Exception as exc:
                     logging.debug("goal continuation enqueue failed: %s", exc)
