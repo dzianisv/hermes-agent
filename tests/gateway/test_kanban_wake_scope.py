@@ -225,3 +225,43 @@ def test_slack_adapter_reports_no_scope_for_ambiguous_channels():
     adapter._remember_channel_team("D_SHARED", "T_TWO")
 
     assert adapter.scope_id_for_chat("D_SHARED") is None
+
+
+def test_wake_follows_the_creators_handoff_lane(tmp_path, monkeypatch):
+    """A card created from Telegram whose creator session was handed off to Slack must wake the
+    Slack lane: waking the stale Telegram entry posted progress bubbles into Telegram and held
+    the session's turn lease against the live lane."""
+    from types import SimpleNamespace
+    from gateway.session import SessionSource
+
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "wake-handoff.db"))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    kb.init_db()
+    _completed_subscription(platform="telegram", chat_id="chat-dm", chat_type="dm")
+
+    from hermes_cli import goals
+    db = goals._get_session_db()
+    db.create_session("origin-session", "telegram")
+    assert db.request_handoff("origin-session", "slack")
+    db.complete_handoff("origin-session")
+
+    tg, slack = UnscopedAdapter(), UnscopedAdapter()
+    runner = _runner(tg, Platform.TELEGRAM)
+    runner.adapters[Platform.SLACK] = slack
+    tg_src = SessionSource(platform=Platform.TELEGRAM, chat_id="chat-dm", chat_type="dm", user_id="1")
+    sl_src = SessionSource(platform=Platform.SLACK, chat_id="C1", chat_type="group", thread_id="t1",
+                           user_id="system:handoff")
+    entries = [
+        SimpleNamespace(session_id="origin-session", session_key="agent:main:telegram:dm:chat-dm", origin=tg_src, suspended=False),
+        SimpleNamespace(session_id="origin-session", session_key="agent:main:slack:C1:t1", origin=sl_src, suspended=False),
+    ]
+    runner.session_store = SimpleNamespace(list_sessions=lambda: list(entries))
+    runner._restored_source = lambda e: e.origin
+    runner._delivery_adapter_for = lambda src: runner.adapters.get(src.platform)
+    runner._goal_session_db = db
+
+    asyncio.run(_one_notifier_tick(monkeypatch, runner))
+
+    assert tg.handled == []
+    assert len(slack.handled) == 1
+    assert slack.handled[0].source.chat_id == "C1"
