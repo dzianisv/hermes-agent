@@ -484,8 +484,50 @@ class SessionSessionsMixin:
         if changed:
             self._bump_conversation_generation(conn, session_id, reason)
             if reason in self._GOAL_ORPHANING_END_REASONS or self._is_terminal_for_subagent(conn, session_id, reason):
-                self._close_orphaned_goal(conn, session_id, reason)
+                successor = self._lineage_successor(conn, session_id)
+                if successor:
+                    # Not a user boundary: a live row already continues this conversation
+                    # (async-delegation re-pin, #57498, ends the parent as ``session_switch``
+                    # while the child row carries ``_delegate_from`` = parent). Cancelling here
+                    # killed every parent goal the moment its subagent batch finished
+                    # (2026-10-13: goals 20260923_125158 and 20261012_231801, both
+                    # ``paused_reason = session ended (session_switch)``). Carry the goal on.
+                    self._migrate_goal_to_successor(conn, session_id, successor, reason)
+                else:
+                    self._close_orphaned_goal(conn, session_id, reason)
         return changed
+
+    @staticmethod
+    def _lineage_successor(conn, session_id: str) -> Optional[str]:
+        """Newest LIVE row created as a continuation of *session_id* (``_delegate_from`` or
+        ``_reset_from`` marker, or an open same-key child). None = nothing continues it."""
+        try:
+            row = conn.execute(
+                "SELECT child.id FROM sessions child WHERE child.parent_session_id = ? "
+                "AND child.ended_at IS NULL AND child.id != ? AND ("
+                f"{_sql_json_extract('child.model_config', '$._delegate_from')} = ? OR "
+                f"{_sql_json_extract('child.model_config', '$._reset_from')} = ? OR "
+                "(child.session_key IS NOT NULL AND child.session_key != '' AND child.session_key = "
+                "(SELECT p.session_key FROM sessions p WHERE p.id = ?))) "
+                "ORDER BY child.started_at DESC LIMIT 1",
+                (session_id, session_id, session_id, session_id, session_id),
+            ).fetchone()
+        except Exception:
+            return None
+        return row[0] if row else None
+
+    @staticmethod
+    def _migrate_goal_to_successor(conn, old_id: str, new_id: str, reason: str) -> None:
+        """Carry an active goal onto the successor row inside the same transaction; the old row
+        becomes a tombstone so exactly one active goal exists per conversation."""
+        import copy
+        from hermes_cli.goal_controller import read, write, cancel
+        state = read(conn, old_id)
+        if state is None or state.status in {"done", "cancelled"}:
+            return
+        if read(conn, new_id) is None:
+            write(conn, new_id, copy.deepcopy(state), None)
+        cancel(conn, old_id, f"continued in {new_id} ({reason})")
 
     @staticmethod
     def _is_terminal_for_subagent(conn, session_id: str, reason: str) -> bool:
