@@ -3483,6 +3483,27 @@ def _design_phase_guard(conn: sqlite3.Connection, task_id: str, assignee: str) -
         note = (f"BLOCKER:DEP EM — [design-phase] brief incomplete: missing {', '.join(missing)}. "
                 "Complete the brief, then `hermes kanban unblock <id>`.")
     try:
+        if ok:
+            # Brief gate: park on the card's own content. A plain schedule_task
+            # left nothing to wake on but a manual unblock / re-spec, and every
+            # such wake with the brief still incomplete re-parked it with a new
+            # zero-minute 'scheduled' run (t_ec089e4b, t_86aac7df: 4 each).
+            # Now poll_wait_on wakes it only when title/body/non-worker
+            # comments change, and a re-park on an unchanged brief records no run.
+            from hermes_cli import kanban_wait_on as _wo
+            fp = _wo.brief_fingerprint(conn, task_id)
+            prev = conn.execute(
+                "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'respawn_guarded' "
+                "ORDER BY id DESC LIMIT 1", (task_id,)).fetchone()
+            prev = _kb._json_dict(prev["payload"]) if prev else {}
+            same = prev.get("reason") == reason and prev.get("brief") == fp
+            if _kb.schedule_task(conn, task_id, reason=None if same else note):
+                with _kb.write_txn(conn):
+                    conn.execute(
+                        "UPDATE tasks SET wait_on = ?, wait_on_fingerprint = ?, wait_on_checked_at = ? "
+                        "WHERE id = ?", (f"card_body:{task_id}", fp, 0, task_id))
+                    _kb._append_event(conn, task_id, "respawn_guarded", {"reason": reason, "brief": fp})
+            return reason
         if _kb.schedule_task(conn, task_id, reason=note) and not ok and cfg["architect"]:
             _kb.assign_task(conn, task_id, cfg["architect"])
             # 'scheduled' is never dispatched: re-gate so the architect is

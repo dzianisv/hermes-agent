@@ -6,6 +6,9 @@ every tick to re-discover the same red CI:
     gh-run:<owner/repo>:<run_id>        a GitHub Actions run
     pr:<owner/repo>#<number>[@<sha>]    a PR (head sha + check conclusions)
     card:<task_id>                      another kanban card
+    card_body:<task_id>                 a card's own brief (title, body, and
+                                        comments by anyone but the worker) —
+                                        the design-phase brief-gate park
 
 ``wait_on_task`` records the handle and its current fingerprint and parks the
 card in ``scheduled`` (never dispatched). ``poll_wait_on`` runs on every
@@ -51,14 +54,14 @@ PROGRESS_OUTCOMES = frozenset({"completed", "review_requested", "approved", "cha
 
 @dataclass(frozen=True)
 class Handle:
-    kind: str           # gh-run | pr | card
+    kind: str           # gh-run | pr | card | card_body
     repo: Optional[str]
     ident: str          # run id, PR number, or task id
     sha: Optional[str] = None
 
     def __str__(self) -> str:
-        if self.kind == "card":
-            return f"card:{self.ident}"
+        if self.kind in ("card", "card_body"):
+            return f"{self.kind}:{self.ident}"
         if self.kind == "gh-run":
             return f"gh-run:{self.repo}:{self.ident}"
         return f"pr:{self.repo}#{self.ident}" + (f"@{self.sha}" if self.sha else "")
@@ -66,7 +69,7 @@ class Handle:
 
 _RX_RUN = re.compile(r"^gh-run:([\w.-]+/[\w.-]+):(\d+)$")
 _RX_PR = re.compile(r"^pr:([\w.-]+/[\w.-]+)#(\d+)(?:@([0-9a-fA-F]{7,40}))?$")
-_RX_CARD = re.compile(r"^card:(t_[0-9a-zA-Z]+)$")
+_RX_CARD = re.compile(r"^(card|card_body):(t_[0-9a-zA-Z]+)$")
 
 
 def parse_handle(text: str) -> Handle:
@@ -76,10 +79,10 @@ def parse_handle(text: str) -> Handle:
     if m := _RX_PR.match(s):
         return Handle("pr", m.group(1), m.group(2), (m.group(3) or "").lower() or None)
     if m := _RX_CARD.match(s):
-        return Handle("card", None, m.group(1))
+        return Handle(m.group(1), None, m.group(2))
     raise ValueError(
         f"bad wait_on handle {text!r}; use gh-run:<owner/repo>:<run_id>, "
-        "pr:<owner/repo>#<n>[@<sha>] or card:<task_id>")
+        "pr:<owner/repo>#<n>[@<sha>], card:<task_id> or card_body:<task_id>")
 
 
 def _cfg_int(key: str, default: int) -> int:
@@ -119,8 +122,28 @@ def fingerprint_pr(data: dict) -> str:
                      ",".join(sorted(checks))])
 
 
+def brief_fingerprint(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """Hash of what the design-phase brief gate reads: title, body, and every
+    comment not written by the card's own assignee or the dispatcher (EM /
+    architect answers arrive as comments). ``None`` when the card is gone."""
+    import hashlib
+    row = conn.execute("SELECT title, body, assignee FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    if row is None:
+        return None
+    h = hashlib.sha256()
+    for part in (row["title"] or "", row["body"] or ""):
+        h.update(part.encode()); h.update(b"\0")
+    skip = {row["assignee"] or "", "kanban-dispatcher"}
+    for c in conn.execute("SELECT author, body FROM task_comments WHERE task_id = ? ORDER BY id", (task_id,)):
+        if (c["author"] or "") not in skip:
+            h.update((c["body"] or "").encode()); h.update(b"\0")
+    return h.hexdigest()
+
+
 def default_status(handle: Handle, conn: sqlite3.Connection) -> Optional[str]:
     """Current fingerprint of *handle*; ``None`` = could not observe (stay parked)."""
+    if handle.kind == "card_body":
+        return brief_fingerprint(conn, handle.ident)
     if handle.kind == "card":
         row = conn.execute("SELECT status, completed_at FROM tasks WHERE id = ?",
                            (handle.ident,)).fetchone()
