@@ -72,6 +72,9 @@ def test_matching_fingerprint_keeps_the_live_worker(board):
     killed = []
     tid = _claimed_running(conn, pid=os.getpid(), started_at=get_process_start_time(os.getpid()))
     assert kbd._worker_alive(os.getpid(), get_process_start_time(os.getpid())) is True
+    # A recent heartbeat: a live worker silent since a claim 1h ago is reclaimed (gap #30b).
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET last_heartbeat_at = ? WHERE id = ?", (int(time.time()), tid))
     assert kb.release_stale_claims(conn) == 0
     assert kb.get_task(conn, tid).status == "running"
     kinds = [e.kind for e in kb.list_events(conn, tid)]

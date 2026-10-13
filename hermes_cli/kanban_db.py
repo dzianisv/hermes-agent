@@ -578,6 +578,50 @@ def _resolve_heartbeat_max_stale_seconds() -> int:
     return _env_int("HERMES_KANBAN_CLAIM_HEARTBEAT_MAX_STALE_SECONDS", default, minimum=1)
 
 
+def _host_suspended_seconds_total() -> Optional[float]:
+    """Seconds this host has spent suspended (laptop sleep) since boot; ``None`` if unknowable.
+
+    macOS: ``CLOCK_MONOTONIC`` (mach_continuous_time) counts sleep, ``CLOCK_UPTIME_RAW`` does not.
+    Linux: ``CLOCK_BOOTTIME`` counts suspend, ``CLOCK_MONOTONIC`` does not.
+    """
+    try:
+        if sys.platform == "darwin":
+            return max(0.0, time.clock_gettime(time.CLOCK_MONOTONIC) - time.clock_gettime(time.CLOCK_UPTIME_RAW))
+        if hasattr(time, "CLOCK_BOOTTIME"):
+            return max(0.0, time.clock_gettime(time.CLOCK_BOOTTIME) - time.clock_gettime(time.CLOCK_MONOTONIC))
+    except (OSError, AttributeError):
+        pass
+    return None
+
+
+# (wall_ts, suspended_total) samples taken on each ``release_stale_claims`` pass; lets the
+# staleness check subtract host sleep from a worker's silence (harness gap #30b).
+_SUSPEND_SAMPLES: list[tuple[int, float]] = []
+_SUSPEND_SAMPLES_MAX = 512
+
+
+def _record_suspend_sample(now: int) -> Optional[float]:
+    total = _host_suspended_seconds_total()
+    if total is None:
+        return None
+    _SUSPEND_SAMPLES.append((int(now), float(total)))
+    del _SUSPEND_SAMPLES[:-_SUSPEND_SAMPLES_MAX]
+    return total
+
+
+def _host_suspended_seconds_since(ts: int, current_total: Optional[float]) -> float:
+    """Host sleep between wall time ``ts`` and now. Uses the newest sample at or before ``ts``
+    (else the oldest one — under-counts sleep, i.e. the pre-fix behaviour, never over-counts)."""
+    if current_total is None or not _SUSPEND_SAMPLES:
+        return 0.0
+    base = _SUSPEND_SAMPLES[0][1]
+    for wall, total in _SUSPEND_SAMPLES:
+        if wall > ts:
+            break
+        base = total
+    return max(0.0, current_total - base)
+
+
 # ``detect_crashed_workers`` skips ``_pid_alive`` this long after start: the
 # fork -> /proc window can report a fresh worker dead.
 DEFAULT_CRASH_GRACE_SECONDS = 30
@@ -2949,18 +2993,28 @@ def release_stale_claims(
     host_prefix = _host_prefix()
     stale = conn.execute(
         "SELECT id, claim_lock, worker_pid, worker_started_at, claim_expires, last_heartbeat_at, "
-        "       assignee "
+        "       assignee, started_at "
         "FROM tasks "
         "WHERE status = 'running' AND claim_expires IS NOT NULL "
         "  AND claim_expires < ?", (now,),
     ).fetchall()
     max_stale = _resolve_heartbeat_max_stale_seconds()
+    suspended_total = _record_suspend_sample(now)
     for row in stale:
         host_local = (row["claim_lock"] or "").startswith(host_prefix)
         hb = row["last_heartbeat_at"]
         # Backstop: no heartbeat for ``max_stale`` (2x TTL by default) means no
         # observable progress — reclaim even if the PID is alive (logic loop).
-        heartbeat_stale = hb is not None and (now - int(hb)) > max_stale
+        # Silence is counted from the last heartbeat, or from claim/start time for a
+        # worker that never heartbeated (gap #30b: it used to be extended until
+        # max-runtime). Host sleep is subtracted: a suspended laptop freezes the worker
+        # too, so wall-clock silence across a sleep is not a wedge (gap #30b root cause).
+        silent_since = hb if hb is not None else _row_get(row, "started_at")
+        heartbeat_stale = False
+        if silent_since is not None:
+            silence = (now - int(silent_since)) - _host_suspended_seconds_since(
+                int(silent_since), suspended_total)
+            heartbeat_stale = silence > max_stale
         started_at = _row_get(row, "worker_started_at")
         pid_dead = bool(host_local and row["worker_pid"]
                         and not _worker_alive(row["worker_pid"], started_at))

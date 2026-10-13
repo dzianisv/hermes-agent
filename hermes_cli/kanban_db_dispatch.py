@@ -1133,6 +1133,10 @@ def _terminate_reclaimed_worker(
     kill = _kill_fn(signal_fn)
     if kill is None:
         return info
+    if signal_fn is None and int(pid) == os.getpid():
+        # Never SIGTERM ourselves (dispatcher, or a test runner posing as a worker): hold the claim.
+        info["signal_refused"] = True
+        return info
     if started_at == UNVERIFIED_WORKER_FINGERPRINT:
         # Never signal by bare number: a dead PID is "gone" (reclaim proceeds), a live one is held.
         info["signal_refused"] = True
