@@ -131,6 +131,12 @@ _TRANSIENT_PROVIDER_REASONS = frozenset({
 })
 
 
+def _failure_reason(result):
+    """The turn's classified ``failure_reason`` (``rate_limit``, ``timeout``, ...) or None."""
+    reason = result.get("failure_reason") if isinstance(result, dict) else None
+    return str(reason) if reason else None
+
+
 def _guard_kanban_exit(result, exit_code: int) -> int:
     """Harness #32: a kanban worker never exits with its card still ``running`` and no
     terminal board call — record an explicit block (``network_unavailable`` / ``no_handoff``)."""
@@ -298,7 +304,7 @@ def _run_quiet_single_query(cli, effective_query, emitter=None):
     _exit_code = _guard_kanban_exit(result, _single_query_exit_code(result))
     if emitter is not None:
         _exit_code = emitter.emit_result(result, session_id=cli.session_id or "", exit_code=_exit_code)
-    exit_single_query(_exit_code)
+    exit_single_query(_exit_code, reason=_failure_reason(result))
 
 
 def _route_single_query_images(cli, query, effective_query, single_query_images, single_query_image_urls):
@@ -524,6 +530,7 @@ def _run_single_query_mode(cli, query, image, quiet, oneshot, stream_json: bool 
         # Same exit contract as `-Q`: scripts and the Kanban dispatcher read the outcome from
         # the exit code. This path used to fall through to an implicit 0 for every outcome.
         exit_single_query(_guard_kanban_exit(
-            cli._last_turn_result, _single_query_exit_code(cli._last_turn_result)))
+            cli._last_turn_result, _single_query_exit_code(cli._last_turn_result)),
+            reason=_failure_reason(cli._last_turn_result))
     finally:
         _finalize_single_query(cli)

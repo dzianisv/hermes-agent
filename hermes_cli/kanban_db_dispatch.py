@@ -31,7 +31,7 @@ from typing import Mapping
 from typing import Optional
 from typing import TYPE_CHECKING
 
-from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
+from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_REASON_TRAILER, KANBAN_WORKER_EXIT_TRAILER
 
 if TYPE_CHECKING:
     from hermes_cli.kanban_db import Task
@@ -478,6 +478,26 @@ def _exit_code_kind(code: int) -> "tuple[str, int]":
 _EXIT_TRAILER_RE = re.compile(
     r"^" + re.escape(KANBAN_WORKER_EXIT_TRAILER) + r"(\d+)\s*$", re.MULTILINE,
 )
+
+
+_EXIT_REASON_TRAILER_RE = re.compile(
+    r"^" + re.escape(KANBAN_WORKER_EXIT_REASON_TRAILER) + r"([a-z_]+)\s*$", re.MULTILINE,
+)
+
+# ``failure_reason`` values that mean the PROFILE's provider quota is exhausted. rc 75 is
+# also used for timeouts, stale-provider aborts, server errors and network loss — those are
+# per-call/per-host conditions, not a wall every sibling card will hit.
+_QUOTA_WALL_REASONS = frozenset({"rate_limit", "upstream_rate_limit", "billing"})
+
+
+def _worker_log_exit_reason(task_id: str, board: Optional[str] = None) -> Optional[str]:
+    """``failure_reason`` the worker wrote just before its exit trailer; None when absent."""
+    try:
+        raw = _kb.read_worker_log(task_id, tail_bytes=4000, board=board)
+    except Exception:
+        return None
+    matches = _EXIT_REASON_TRAILER_RE.findall(raw or "")
+    return matches[-1] if matches else None
 
 
 def _worker_log_exit_code(task_id: str, board: Optional[str] = None) -> Optional[int]:
@@ -1850,12 +1870,15 @@ def _classify_dead_worker_exit(
     if kind == "rate_limited":
         # Quota wall — NOT a task failure. Release to the source phase and do
         # NOT count a failure so a long quota window can't trip the breaker.
+        reason = _worker_log_exit_reason(task_id, board=board) if task_id else None
+        payload = {"pid": pid, "claimer": claimer, "exit_code": code}
+        if reason:
+            payload["provider_reason"] = reason
+        label = "quota wall" if reason is None or reason in _QUOTA_WALL_REASONS else reason
         return _DeadWorker(
             kind, code,
-            f"pid {pid} exited rate-limited (quota wall) — requeued without counting a failure",
-            "rate_limited",
-            {"pid": pid, "claimer": claimer, "exit_code": code},
-            rate_limited=True,
+            f"pid {pid} exited rate-limited ({label}) — requeued without counting a failure",
+            "rate_limited", payload, rate_limited=True,
         )
     if kind == "terminal_provider":
         # The worker classified its own provider failure as unhealable (credential
@@ -2317,12 +2340,18 @@ def _profile_rate_limit_cooldown(
     if not assignee:
         return False
     runs = conn.execute(
-        "SELECT r.outcome, r.ended_at FROM task_runs r JOIN tasks t ON t.id = r.task_id "
+        "SELECT r.outcome, r.ended_at, r.metadata FROM task_runs r JOIN tasks t ON t.id = r.task_id "
         "WHERE t.assignee = ? AND r.ended_at IS NOT NULL "
         "AND r.outcome IN ('rate_limited', 'completed') "
         "ORDER BY r.ended_at DESC, r.id DESC LIMIT 32",
         (assignee,),
     ).fetchall()
+    # Only a QUOTA wall is a property of the profile. A run that exited rc 75 for a
+    # timeout / stale provider / network loss names its reason; skip it (live board: 50 of
+    # 52 "rate_limited" runs were pi-acp stale-call aborts, not 429s). Runs without a
+    # recorded reason predate the reason trailer and keep the old quota reading.
+    runs = [r for r in runs if r["outcome"] != "rate_limited"
+            or _kb._json_dict(r["metadata"]).get("provider_reason") in (None, *_QUOTA_WALL_REASONS)]
     if not runs or runs[0]["outcome"] != "rate_limited":
         return False
     streak = 0

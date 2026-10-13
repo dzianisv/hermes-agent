@@ -30,12 +30,20 @@ _MAX_QUIET_NOTIFY_ROUNDS = 8
 KANBAN_WORKER_EXIT_TRAILER = "[kanban-worker-exit] rc="
 
 
-def exit_single_query(code: int) -> None:
-    """``sys.exit(code)`` for a one-shot turn; a Kanban worker first writes the exit trailer to its log."""
+KANBAN_WORKER_EXIT_REASON_TRAILER = "[kanban-worker-exit-reason] "
+
+
+def exit_single_query(code: int, *, reason: str | None = None) -> None:
+    """``sys.exit(code)`` for a one-shot turn; a Kanban worker first writes the exit trailer to its log.
+
+    ``reason`` is the turn's classified ``failure_reason``: rc 75 is shared by quota walls,
+    timeouts, stale provider aborts and network loss, and only the worker knows which."""
     if os.environ.get("HERMES_KANBAN_TASK"):
         with contextlib.suppress(Exception):
             # stderr: stdout may be the ``--stream-json`` record stream, and the worker log
             # captures both streams.
+            if reason:
+                print(f"\n{KANBAN_WORKER_EXIT_REASON_TRAILER}{reason}", file=sys.stderr, flush=True)
             print(f"\n{KANBAN_WORKER_EXIT_TRAILER}{int(code)}", file=sys.stderr, flush=True)
     sys.exit(code)
 
