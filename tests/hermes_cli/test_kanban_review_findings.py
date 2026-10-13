@@ -1,13 +1,12 @@
 """Harness fix #20: change requests carry a PASS/FAIL finding per R/ACCEPTANCE line;
-round 2+ review briefs carry prior findings and only the diff since the last reviewed sha.
+round 2+ review briefs carry prior findings and an instruction to diff from the last reviewed sha.
 
-Real kanban DB under a temp HERMES_HOME and a real git repo for the incremental diff.
+Real kanban DB under a temp HERMES_HOME.
 """
 
 from __future__ import annotations
 
 import json
-import subprocess
 from pathlib import Path
 
 import pytest
@@ -100,21 +99,8 @@ def test_tool_handler_passes_metadata_and_refuses(kanban_home, monkeypatch):
     assert out.get("ok") is True, out
 
 
-def _git(repo, *a):
-    return subprocess.run(["git", "-C", str(repo), *a], check=True, capture_output=True,
-                          text=True).stdout.strip()
-
-
-def test_round2_brief_has_prior_findings_and_incremental_diff(kanban_home, tmp_path):
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    _git(repo, "init", "-q")
-    _git(repo, "config", "user.email", "t@t")
-    _git(repo, "config", "user.name", "t")
-    (repo / "a.txt").write_text("old-content\n")
-    _git(repo, "add", ".")
-    _git(repo, "commit", "-qm", "one")
-    reviewed = _git(repo, "rev-parse", "HEAD")
+def test_round2_brief_has_prior_findings_and_diff_instruction(kanban_home):
+    reviewed = "d" * 40
     with kbc.connect() as conn:
         tid, rc = _in_review(conn)
         first = krb.build_review_brief(conn, kb.get_task(conn, tid), fetch=lambda l: (None, "x"))
@@ -125,14 +111,10 @@ def test_round2_brief_has_prior_findings_and_incremental_diff(kanban_home, tmp_p
                                    _f("ACCEPTANCE", "FAIL", "2 tests red")],
                       "reviewed_sha": reviewed})
         assert ok
-        (repo / "a.txt").write_text("old-content\nnew-classifier\n")
-        _git(repo, "commit", "-qam", "two")
-        brief = krb.build_review_brief(conn, kb.get_task(conn, tid), fetch=lambda l: (None, "x"),
-                                       workspace=str(repo))
+        brief = krb.build_review_brief(conn, kb.get_task(conn, tid), fetch=lambda l: (None, "x"))
     assert "RE-REVIEW (round 2)" in brief
     assert "R2: FAIL — no classifier" in brief and "R1: PASS — rc logged" in brief
-    assert f"since last reviewed sha {reviewed}" in brief
-    assert "-old-content" not in brief  # only the delta, not the whole file
+    assert f"Last reviewed sha: {reviewed}" in brief and f"git diff {reviewed}..HEAD" in brief
 
 
 def test_round2_brief_without_sha_says_so_and_falls_back(kanban_home):
@@ -144,7 +126,8 @@ def test_round2_brief_without_sha_says_so_and_falls_back(kanban_home):
         assert ok
         assert "reviewed_sha" not in krb.prior_review(conn, tid)
         brief = krb.build_review_brief(conn, kb.get_task(conn, tid), fetch=lambda l: (None, "x"))
-    assert "No reviewed sha was recorded" in brief and "fall back to a full review" in brief
+    assert "No reviewed sha was recorded" in brief and "do a full review" in brief
+    assert "fall back" not in brief
 
 
 def test_rereview_model_config(monkeypatch):

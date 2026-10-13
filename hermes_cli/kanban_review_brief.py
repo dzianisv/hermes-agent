@@ -72,7 +72,6 @@ def requirement_lines(texts: list[str]) -> list[str]:
 
 _R_ID_RE = re.compile(r"^\s*(?:[-*>]\s*)?\**(R\d+|ACCEPTANCE)\**\s*[:.)\-–—]", re.I)
 FINDING_VERDICTS = frozenset({"PASS", "FAIL"})
-_DIFF_MAX_CHARS = 40_000
 
 
 def requirement_ids(texts: list[str]) -> list[str]:
@@ -158,57 +157,6 @@ def rereview_model() -> tuple[Optional[str], Optional[str]]:
     return m, (p if m else None)
 
 
-def _has_commit(repo: str, sha: str) -> bool:
-    import subprocess
-    try:
-        return subprocess.run(["git", "-C", repo, "cat-file", "-e", f"{sha}^{{commit}}"],
-                              capture_output=True, timeout=10).returncode == 0
-    except Exception:
-        return False
-
-
-def _repos_containing(workspace: str, sha: str) -> list[str]:
-    """Git checkouts at or under ``workspace`` (depth <= 2) that contain ``sha``.
-
-    A scratch workspace is usually NOT the PR repo: it lives under ~/.hermes (itself a git
-    repo) and the worker clones/worktrees the PR repo beneath it, so ``git -C workspace``
-    resolves the wrong repository ("Invalid revision range")."""
-    root = Path(workspace)
-    cands = [root]
-    for depth_glob in ("*/.git", "*/*/.git"):
-        cands += sorted(p.parent for p in root.glob(depth_glob))
-    out: list[str] = []
-    for c in cands:
-        if str(c) not in out and _has_commit(str(c), sha):
-            out.append(str(c))
-    return out
-
-
-def _git_diff_since(workspace: Optional[str], sha: str, *, head: Optional[str] = None,
-                    ) -> tuple[Optional[str], str]:
-    import subprocess
-    if not workspace or not Path(workspace).is_dir():
-        return None, "no workspace to diff in"
-    repos = _repos_containing(workspace, sha)
-    if not repos:
-        return None, f"reviewed sha {sha[:12]} not found in any git checkout under {workspace}"
-    repo = repos[0]
-    target = head if head and _has_commit(repo, head) else "HEAD"
-    try:
-        r = subprocess.run(["git", "-C", repo, "diff", f"{sha}..{target}"],
-                           capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)
-    except Exception as exc:
-        return None, f"git diff failed: {type(exc).__name__}"
-    if r.returncode != 0:
-        return None, f"git diff {sha[:12]}..{target[:12]} in {repo} failed: {(r.stderr or '').strip()[:160]}"
-    text = r.stdout
-    if not text.strip():
-        return "", ""
-    if len(text) > _DIFF_MAX_CHARS:
-        text = text[:_DIFF_MAX_CHARS] + f"\n… [diff truncated at {_DIFF_MAX_CHARS} chars]"
-    return text, ""
-
-
 def handed_in_head(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
     """``head_sha`` the implementer handed in on the latest ``review_requested`` event."""
     row = conn.execute(
@@ -222,8 +170,7 @@ def handed_in_head(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
     return head or None
 
 
-def _incremental_section(prior: dict, workspace: Optional[str], diff_fn,
-                         head: Optional[str] = None) -> str:
+def _incremental_section(prior: dict, head: Optional[str] = None) -> str:
     rnd = prior.get("round")
     out = [f"RE-REVIEW (round {int(rnd) + 1 if isinstance(rnd, int) else '2+'}). "
            "Prior review findings:"]
@@ -236,18 +183,12 @@ def _incremental_section(prior: dict, workspace: Optional[str], diff_fn,
         out.append(f"(no structured findings recorded) reason: {prior.get('reason') or '-'}")
     sha = str(prior.get("reviewed_sha") or "").strip()
     if not sha:
-        out.append("No reviewed sha was recorded for the prior round; incremental diff "
-                   "unavailable — fall back to a full review.")
+        out.append("No reviewed sha was recorded for the prior round: do a full review.")
     else:
-        diff, why = diff_fn(workspace, sha, head=head) if head else diff_fn(workspace, sha)
-        span = f"{sha}..{head}" if head else sha
-        if diff is None:
-            out.append(f"Incremental diff since {span} unavailable ({why}); fall back to a full review.")
-        elif not diff:
-            out.append(f"No changes since last reviewed sha {span}.")
-        else:
-            out.append(f"Review ONLY the changes since last reviewed sha {span}, re-checking each "
-                       f"FAIL above; PASS items need re-checking only if the diff touches them:\n{diff}")
+        target = head or "HEAD"
+        out.append(f"Last reviewed sha: {sha}. Handed-in head: {target}. In the code repo itself, "
+                   f"run `git diff {sha}..{target}`. First verify each prior finding above, then "
+                   "review only those changes; raise no new findings on unchanged code unless critical.")
     return "\n".join(out)
 
 
@@ -384,7 +325,6 @@ def _fetch_design(link: str) -> tuple[Optional[str], str]:
 
 def build_review_brief(
     conn: sqlite3.Connection, task, *, fetch: Optional[Callable[[str], tuple]] = None,
-    workspace: Optional[str] = None, diff_fn: Optional[Callable] = None,
 ) -> str:
     """The reviewer brief appended to the worker's first prompt. Never raises."""
     try:
@@ -409,9 +349,7 @@ def build_review_brief(
                          + "; also pass metadata.reviewed_sha (the head you reviewed).")
         prior = prior_review(conn, task.id)
         if prior is not None:
-            parts.append(_incremental_section(
-                prior, workspace or getattr(task, "workspace_path", None),
-                diff_fn or _git_diff_since, head=handed_in_head(conn, task.id)))
+            parts.append(_incremental_section(prior, head=handed_in_head(conn, task.id)))
         parts.append(SINGLE_PASS_INSTRUCTION)
         return "\n\n".join(parts)
     except Exception as exc:

@@ -3685,7 +3685,7 @@ def _dispatch_lane_task(
     from hermes_cli.kanban_review_brief import (
         build_review_brief, is_review_spawn, prior_review, rereview_model)
     if is_review_spawn(claimed, lane):
-        claimed.review_brief = build_review_brief(conn, claimed, workspace=str(workspace))
+        claimed.review_brief = build_review_brief(conn, claimed)
         # Round 2+ reviews an incremental diff: optional cheaper model
         # (kanban.rereview_model / kanban.rereview_provider). Per-task override wins.
         if not claimed.model_override and prior_review(conn, claimed.id) is not None:
