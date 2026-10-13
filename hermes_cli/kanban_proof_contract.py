@@ -96,7 +96,7 @@ def run_proof(command: str, cwd: str | None, timeout: int | None = None) -> dict
     wd = cwd if cwd and os.path.isdir(cwd) else None
     started = time.time()
     try:
-        cp = subprocess.run(command, shell=True, cwd=wd, capture_output=True, text=True,
+        cp = subprocess.run(command, shell=True, cwd=wd, capture_output=True, text=True, encoding="utf-8", errors="replace",
                             timeout=timeout, stdin=subprocess.DEVNULL)
         exit_code, output, timed_out = cp.returncode, (cp.stdout or "") + (cp.stderr or ""), False
     except subprocess.TimeoutExpired as e:

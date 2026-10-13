@@ -96,7 +96,7 @@ def _cfg_int(key: str, default: int) -> int:
 
 def _gh_json(args: list[str]) -> Optional[dict]:
     try:
-        out = subprocess.run(["gh", *args], capture_output=True, text=True, timeout=20)
+        out = subprocess.run(["gh", *args], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=20)
     except (OSError, subprocess.SubprocessError):
         return None
     if out.returncode != 0:
@@ -234,7 +234,7 @@ def default_head(workspace: Optional[str]) -> Optional[str]:
         return None
     try:
         out = subprocess.run(["git", "-C", workspace, "rev-parse", "HEAD"],
-                             capture_output=True, text=True, timeout=5)
+                             capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5)
     except (OSError, subprocess.SubprocessError):
         return None
     return out.stdout.strip() or None if out.returncode == 0 else None

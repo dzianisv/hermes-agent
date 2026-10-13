@@ -1015,7 +1015,7 @@ def _repo_from_git_remote(path: str | None) -> str | None:
         return None
     try:
         url = subprocess.run(["git", "-C", path, "remote", "get-url", "origin"],
-                             capture_output=True, text=True, timeout=10, check=True).stdout.strip()
+                             capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10, check=True).stdout.strip()
     except (OSError, subprocess.SubprocessError):
         return None
     m = re.search(r"github\.com[:/]([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?)(?:\.git)?/?$", url)

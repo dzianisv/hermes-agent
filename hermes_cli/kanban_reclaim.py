@@ -78,7 +78,7 @@ def _run(
 ) -> subprocess.CompletedProcess:
     try:
         return subprocess.run(
-            list(argv), capture_output=True, text=True, timeout=timeout, check=False,
+            list(argv), capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout, check=False,
             cwd=cwd,
         )
     except (OSError, subprocess.SubprocessError):
