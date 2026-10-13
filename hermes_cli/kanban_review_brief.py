@@ -158,17 +158,49 @@ def rereview_model() -> tuple[Optional[str], Optional[str]]:
     return m, (p if m else None)
 
 
-def _git_diff_since(workspace: Optional[str], sha: str) -> tuple[Optional[str], str]:
+def _has_commit(repo: str, sha: str) -> bool:
+    import subprocess
+    try:
+        return subprocess.run(["git", "-C", repo, "cat-file", "-e", f"{sha}^{{commit}}"],
+                              capture_output=True, timeout=10).returncode == 0
+    except Exception:
+        return False
+
+
+def _repos_containing(workspace: str, sha: str) -> list[str]:
+    """Git checkouts at or under ``workspace`` (depth <= 2) that contain ``sha``.
+
+    A scratch workspace is usually NOT the PR repo: it lives under ~/.hermes (itself a git
+    repo) and the worker clones/worktrees the PR repo beneath it, so ``git -C workspace``
+    resolves the wrong repository ("Invalid revision range")."""
+    root = Path(workspace)
+    cands = [root]
+    for depth_glob in ("*/.git", "*/*/.git"):
+        cands += sorted(p.parent for p in root.glob(depth_glob))
+    out: list[str] = []
+    for c in cands:
+        if str(c) not in out and _has_commit(str(c), sha):
+            out.append(str(c))
+    return out
+
+
+def _git_diff_since(workspace: Optional[str], sha: str, *, head: Optional[str] = None,
+                    ) -> tuple[Optional[str], str]:
     import subprocess
     if not workspace or not Path(workspace).is_dir():
         return None, "no workspace to diff in"
+    repos = _repos_containing(workspace, sha)
+    if not repos:
+        return None, f"reviewed sha {sha[:12]} not found in any git checkout under {workspace}"
+    repo = repos[0]
+    target = head if head and _has_commit(repo, head) else "HEAD"
     try:
-        r = subprocess.run(["git", "-C", workspace, "diff", f"{sha}..HEAD"],
+        r = subprocess.run(["git", "-C", repo, "diff", f"{sha}..{target}"],
                            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)
     except Exception as exc:
         return None, f"git diff failed: {type(exc).__name__}"
     if r.returncode != 0:
-        return None, f"git diff {sha[:12]}..HEAD failed: {(r.stderr or '').strip()[:160]}"
+        return None, f"git diff {sha[:12]}..{target[:12]} in {repo} failed: {(r.stderr or '').strip()[:160]}"
     text = r.stdout
     if not text.strip():
         return "", ""
