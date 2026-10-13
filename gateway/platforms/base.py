@@ -4565,12 +4565,15 @@ class BasePlatformAdapter(ABC):
             # Clear the Event BEFORE the stop-typing await so concurrent inbound sees a live guard.
             await self._flush_text_debounce_now(session_key)
             if session_key in self._pending_messages:
-                pending_event = self._pending_messages.pop(session_key)
                 logger.debug("[%s] Processing queued follow-up message", self.name)
                 self._clear_session_guard(session_key)
                 await self._stop_typing_refresh(event.source.chat_id, typing_task, metadata=_thread_metadata)
-                self._spawn_drain_task(pending_event, session_key)
-                return  # Drain task owns the session now.
+                # Leave the event owned by the pending slot across the await:
+                # stop/reset can then discard and settle it during handoff.
+                pending_event = self._pending_messages.pop(session_key, None)
+                if pending_event is not None:
+                    self._spawn_drain_task(pending_event, session_key)
+                    return  # Drain task owns the session now.
         except asyncio.CancelledError:
             expected = asyncio.current_task() in self._expected_cancelled_tasks
             await self._run_processing_hook(

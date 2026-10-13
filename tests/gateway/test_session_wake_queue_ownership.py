@@ -110,7 +110,8 @@ async def test_busy_human_task_cannot_settle_queued_wake(queue_world, kind):
 
 
 @pytest.mark.asyncio
-async def test_cancelled_turn_retains_owner_until_judge_thread_finishes(queue_world, monkeypatch):
+@pytest.mark.parametrize("cancellations", [1, 2, 3])
+async def test_cancelled_turn_retains_owner_until_judge_thread_finishes(queue_world, monkeypatch, cancellations):
     import json
     import threading
     from types import SimpleNamespace
@@ -133,14 +134,43 @@ async def test_cancelled_turn_retains_owner_until_judge_thread_finishes(queue_wo
     task = adapter._session_tasks[key]
     assert await asyncio.to_thread(entered.wait, 10)
     try:
-        task.cancel()
-        await asyncio.sleep(0)
-        assert not task.done()
-        assert current(event)
-        assert claim("queue", "goal", revision=goals.load_goal("queue").revision) is None
+        for _ in range(cancellations):
+            task.cancel()
+            await asyncio.sleep(0)
+            assert not task.done()
+            assert current(event)
+            assert claim("queue", "goal", revision=goals.load_goal("queue").revision) is None
     finally:
         release.set()
         await asyncio.gather(task, return_exceptions=True)
         await asyncio.sleep(0)
     assert goals.load_goal("queue").wake_pending
+    assert claim("queue", "goal", revision=goals.load_goal("queue").revision)
+
+
+@pytest.mark.asyncio
+async def test_cancellation_during_fifo_handoff_settles_queued_owner(queue_world, monkeypatch):
+    runner, adapter, source, key, wake = queue_world
+    entered, release, stopping = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    human = MessageEvent(text="Human request", message_type=MessageType.TEXT, source=source)
+    human._goal_prompt = True
+    async def handler(event):
+        assert event is human
+        entered.set()
+        await release.wait()
+    async def stop_typing(*args, **kwargs):
+        if not stopping.is_set():
+            stopping.set()
+            await asyncio.Event().wait()
+    monkeypatch.setattr(adapter, "_stop_typing_refresh", stop_typing)
+    adapter._message_handler = handler
+    await adapter.handle_message(human)
+    await asyncio.wait_for(entered.wait(), 5)
+    event = wake()
+    runner._enqueue_fifo(key, event, adapter)
+    release.set()
+    await asyncio.wait_for(stopping.wait(), 5)
+    await adapter.cancel_session_processing(key)
+    await asyncio.sleep(0)
+    assert not current(event)
     assert claim("queue", "goal", revision=goals.load_goal("queue").revision)

@@ -327,8 +327,11 @@ class GatewayGoalsMixin:
         except asyncio.CancelledError:
             # Cancelling the await does not stop the executor's judge. Keep this
             # event's ownership until that worker has finished its durable effect.
-            with suppress(Exception):
-                await asyncio.shield(evaluation)
+            # Repeated cancellation (e.g. stop followed by shutdown) must not
+            # detach a still-running executor effect from its wake owner.
+            while not evaluation.done():
+                with suppress(asyncio.CancelledError, Exception):
+                    await asyncio.shield(evaluation)
             raise
         msg = decision.get("message") or ""
         # Deferred until the visible final response is delivered, else "✓ Goal achieved" precedes it.
