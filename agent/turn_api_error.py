@@ -387,14 +387,32 @@ def settle_unrecovered_error(
             if _ladder["action"] == "continue":
                 retry_count = 0
             return _verdict(_ladder["action"], _ladder.get("result"))
+        # Harness #32: a kanban worker whose host is OFFLINE waits (bounded backoff) for
+        # connectivity and resumes this same API call instead of ending the turn; only a spent
+        # budget falls through, tagged ``network_unavailable`` for an explicit board block.
+        from agent import network_wait as _nw
+        _offline = _nw.is_kanban_worker() and _nw.is_network_error(api_error)
+        if _offline and not getattr(_retry, "network_wait_spent", False):
+            _back = _nw.wait_for_network(
+                should_abort=lambda: bool(getattr(agent, "_interrupt_requested", False)),
+                on_wait=agent._emit_diagnostic_status,
+            )
+            if _back:
+                retry_count = 0
+                _retry.auto_recovery_cycles_used = 0
+                return _verdict("continue")
+            _retry.network_wait_spent = True
         _delivered = settle_delivered_partial(agent, messages, current_turn_user_idx)
-        return _verdict("return", max_retries_exhausted_result(
+        _exhausted = max_retries_exhausted_result(
             agent, api_error, classified, max_retries=max_retries, is_rate_limited=is_rate_limited,
             error_msg=error_msg, api_kwargs=api_kwargs, api_messages=api_messages,
             messages=messages, conversation_history=conversation_history,
             api_call_count=api_call_count, approx_tokens=approx_tokens, provider=_provider,
             base_url=_base, model=_model, delivered=_delivered,
-        ))
+        )
+        if _offline and isinstance(_exhausted, dict):
+            _exhausted["failure_reason"] = _nw.NETWORK_UNAVAILABLE
+        return _verdict("return", _exhausted)
 
     wait_time = compute_error_backoff(
         agent, api_error, retry_count=retry_count, max_retries=max_retries,

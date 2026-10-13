@@ -127,7 +127,19 @@ def _sync_cli_session_id_from_agent(cli) -> None:
 # later" instead of "I failed" and the dispatcher does not spend the task's retry budget on it.
 _TRANSIENT_PROVIDER_REASONS = frozenset({
     "rate_limit", "upstream_rate_limit", "billing", "overloaded", "server_error", "timeout",
+    "network_unavailable",
 })
+
+
+def _guard_kanban_exit(result, exit_code: int) -> int:
+    """Harness #32: a kanban worker never exits with its card still ``running`` and no
+    terminal board call — record an explicit block (``network_unavailable`` / ``no_handoff``)."""
+    try:
+        from hermes_cli.kanban_worker_network import ensure_terminal_board_call
+        return ensure_terminal_board_call(result, exit_code)
+    except Exception:
+        logger.warning("kanban exit guard failed", exc_info=True)
+        return exit_code
 
 
 # ``failure_reason`` values a retry can never heal: the credential was rejected, the model does
@@ -283,7 +295,7 @@ def _run_quiet_single_query(cli, effective_query, emitter=None):
     if emitter is None:
         print(f"\nsession_id: {cli.session_id}", file=sys.stderr)
 
-    _exit_code = _single_query_exit_code(result)
+    _exit_code = _guard_kanban_exit(result, _single_query_exit_code(result))
     if emitter is not None:
         _exit_code = emitter.emit_result(result, session_id=cli.session_id or "", exit_code=_exit_code)
     exit_single_query(_exit_code)
@@ -511,6 +523,7 @@ def _run_single_query_mode(cli, query, image, quiet, oneshot, stream_json: bool 
         cli._print_exit_summary(clear_screen=False)
         # Same exit contract as `-Q`: scripts and the Kanban dispatcher read the outcome from
         # the exit code. This path used to fall through to an implicit 0 for every outcome.
-        exit_single_query(_single_query_exit_code(cli._last_turn_result))
+        exit_single_query(_guard_kanban_exit(
+            cli._last_turn_result, _single_query_exit_code(cli._last_turn_result)))
     finally:
         _finalize_single_query(cli)
