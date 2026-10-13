@@ -129,3 +129,14 @@ def test_under_cap_returns_to_implementer(kanban_home):
         who, t = _rereview(conn, tid, "finding 2")
         assert (who, t.status, t.assignee) == ("software-engineer", "ready", "software-engineer")
         assert not _events(conn, tid, "review_loop_detected")
+
+
+def test_rounds_reset_after_unblock(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="ship it", assignee="software-engineer")
+        _round(conn, tid, first=True); _round(conn, tid)
+        assert _round(conn, tid).status == "blocked"
+        assert kb.unblock_task(conn, tid)
+        assert _round(conn, tid).status == "ready"
+        assert _round(conn, tid).status == "ready"
+        assert _round(conn, tid).status == "blocked"

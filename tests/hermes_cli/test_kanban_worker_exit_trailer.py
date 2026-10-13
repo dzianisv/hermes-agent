@@ -76,6 +76,7 @@ def test_fresh_process_sweep_books_the_logged_exit_code(kanban_home, rc, event, 
         # the fact even though the worker_output tail is trimmed (#113611).
         assert kb._json_dict(run["metadata"]).get("exit_code") == rc
         if rc == 0:
+            assert run["outcome"] != "completed"  # rc=0 + card still running is not success
             assert kb._json_dict(run["metadata"]).get("protocol_violation") is True
             assert kbd._protocol_violation_streak(conn, tid) == 1
             assert KANBAN_WORKER_EXIT_TRAILER not in (run["error"] or "")
