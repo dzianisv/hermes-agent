@@ -134,6 +134,30 @@ def _build_subprocess_env() -> dict[str, str]:
     return env
 
 
+# pi-acp turns pi's ``auto_retry_start`` / ``auto_retry_end`` events into these
+# agent_message_chunk lines (pi-acp dist/index.js formatAutoRetryMessage), and when the
+# retries fail it answers session/prompt with stopReason ``end_turn`` (the ``"error"``
+# result is mapped to end_turn), dropping pi's ``errorMessage`` (e.g. "Connection
+# error."). A turn whose only text is this status chatter is a failed provider call, not
+# a model reply.
+_ADAPTER_RETRY_STATUS_RE = re.compile(
+    r"Retrying(?: \(attempt \d+/\d+, waiting \d+s\))?\.\.\.|Retry finished, resuming\.")
+
+
+def _strip_adapter_retry_status(text_parts: list[str]) -> str:
+    """Join the reply, dropping adapter retry chatter; raise ConnectionError when the
+    chatter is all there was (the provider call failed after the adapter's retries)."""
+    raw = "".join(text_parts)
+    if not _ADAPTER_RETRY_STATUS_RE.search(raw):
+        return raw
+    cleaned = _ADAPTER_RETRY_STATUS_RE.sub("", raw)
+    if cleaned.strip():
+        return cleaned.strip()
+    raise ConnectionError(
+        "ACP adapter ended the turn after its provider retries exhausted with no reply "
+        "(connection error swallowed by the adapter): " + raw.strip()[:200])
+
+
 def _jsonrpc_result(message_id: Any, result: Any) -> dict[str, Any]:
     return {"jsonrpc": "2.0", "id": message_id, "result": result}
 
@@ -492,7 +516,7 @@ class CopilotACPClient:
             reasoning_parts: list[str] = []
             prompt = {"sessionId": session_id, "prompt": [{"type": "text", "text": prompt_text}]}
             _request("session/prompt", prompt, text_parts=text_parts, reasoning_parts=reasoning_parts)
-            return "".join(text_parts), "".join(reasoning_parts)
+            return _strip_adapter_retry_status(text_parts), "".join(reasoning_parts)
 
     def _handle_server_message(
         self, msg: dict[str, Any], *, process: subprocess.Popen[str], cwd: str, text_parts: list[str] | None, reasoning_parts: list[str] | None,
