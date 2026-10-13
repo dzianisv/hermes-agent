@@ -363,7 +363,8 @@ def _goal_followup_after_turn(
             except Exception:
                 _bg_procs = None
             decision = goal_mgr.evaluate_after_turn(
-                raw, user_initiated=True, background_processes=_bg_procs, active_delegations=_active_deleg)
+                raw, user_initiated=True, background_processes=_bg_procs, active_delegations=_active_deleg,
+                from_user=not session.pop("_goal_followup_turn", False))
             if verdict_msg := decision.get("message") or "":
                 _emit("status.update", sid, {"kind": "goal", "text": verdict_msg})
             if decision.get("should_continue") and (
@@ -446,6 +447,7 @@ def _run_post_turn_followups(
             if not admitted or session.get("running"):
                 return  # user already sent something — their turn wins
             session["running"] = True
+            session["_goal_followup_turn"] = True
         _dispatch_followup_turn(rid, sid, session, goal_followup, "goal continuation dispatch")
     # Safety net for completion events that arrived mid-turn.  Ownership is positive-proof
     # and compression-chain aware (same fail-closed gate as the poller): session B must

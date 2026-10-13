@@ -48,12 +48,25 @@ GOAL_SCHEMA = {
         "Never create a goal for a plain question, a one-shot answer, or work the user cancelled. "
         "If the user redirects you and the current goal is one YOU set (source=agent), call `create` "
         "with replace=true — do not ask the user to run /goal clear. A user-set /goal always wins "
-        "and cannot be replaced here."
+        "and cannot be replaced here. When you cannot act until something finishes, call `wait` "
+        "(on=subagents|process|seconds|user) instead of replying with silence."
     ),
     "parameters": {
         "type": "object",
         "properties": {
-            "action": {"type": "string", "enum": ["get", "create", "link", "complete"]},
+            "action": {"type": "string", "enum": ["get", "create", "link", "complete", "wait"]},
+            "on": {
+                "type": "string", "enum": ["subagents", "process", "seconds", "user"],
+                "description": (
+                    "For wait: what the goal is blocked on. subagents = your live delegations (lifts when one "
+                    "returns); process = a background process (process_session); seconds = a fixed time "
+                    "(seconds); user = a step only the user can do (question) — lifted only by their reply."
+                ),
+            },
+            "process_session": {"type": "string", "description": "For wait on=process: the process session id."},
+            "seconds": {"type": "integer", "description": "For wait on=seconds: how long."},
+            "question": {"type": "string", "description": "For wait on=user: the one concrete question for the user."},
+            "reason": {"type": "string", "description": "For wait: one line on why."},
             "replace": {
                 "type": "boolean",
                 "description": "For create: replace the agent's own current goal (source=agent) because the user "
@@ -123,6 +136,8 @@ def _state_view(mgr) -> Dict[str, Any]:
         view["linked_task_ids"] = list(s.linked_task_ids)
     if s.pending_human_decisions:
         view["pending_human_decisions"] = list(s.pending_human_decisions)
+    if s.waiting_reason:
+        view["waiting"] = s.waiting_reason
     return view
 
 
@@ -143,7 +158,8 @@ def _build_contract(objective: str, acceptance_criteria: str, verification: str)
 
 def goal_tool(action: str, *, objective: str = "", evidence: str = "", max_turns: Optional[int] = None,
               acceptance_criteria: str = "", verification: str = "", replace: bool = False,
-              task_ids: Optional[list] = None, session_id: Optional[str] = None) -> str:
+              task_ids: Optional[list] = None, session_id: Optional[str] = None, on: str = "",
+              process_session: str = "", seconds: Optional[int] = None, question: str = "", reason: str = "") -> str:
     mgr = _manager(session_id)
     if mgr is None:
         return tool_error("goal tool needs a session; none is bound to this call")
@@ -201,7 +217,37 @@ def goal_tool(action: str, *, objective: str = "", evidence: str = "", max_turns
             return tool_error(f"completion audit refused: {verdict} — {reason}", verdict=verdict, reason=reason)
         return _ok(completed=True, reason=reason)
 
+    if action == "wait":
+        return _wait(mgr, on=(on or "").strip().lower(), process_session=process_session, seconds=seconds,
+                     question=question, reason=reason)
+
     return tool_error(f"unknown action {action!r}")
+
+
+def _wait(mgr, *, on: str, process_session: str, seconds: Optional[int], question: str, reason: str) -> str:
+    """Agent-declared barrier: the goal sleeps on a named thing, not on a judge guess or silence."""
+    from hermes_cli.goals import count_active_delegations
+    if not mgr.is_active():
+        return tool_error("no active goal to wait on")
+    try:
+        if on == "subagents":
+            live = count_active_delegations(mgr.session_id)
+            if live <= 0:
+                return tool_error("no live delegated subagents to wait on; keep working")
+            mgr.wait_on_delegations(live, reason=reason)
+        elif on == "process":
+            if not (process_session or "").strip():
+                return tool_error("wait on=process needs process_session")
+            mgr.wait_on_session(process_session, reason=reason)
+        elif on == "seconds":
+            mgr.wait_for_seconds(int(seconds or 0), reason=reason)
+        elif on == "user":
+            mgr.wait_on_user(question or reason, reason=reason)
+        else:
+            return tool_error("wait needs on=subagents|process|seconds|user")
+    except (TypeError, ValueError, RuntimeError) as exc:
+        return tool_error(f"wait refused: {exc}")
+    return _ok(**{**_state_view(mgr), "waiting": True, "on": on})
 
 
 registry.register(
@@ -210,6 +256,8 @@ registry.register(
         str(args.get("action") or ""), objective=args.get("objective") or "", evidence=args.get("evidence") or "",
         acceptance_criteria=args.get("acceptance_criteria") or "", verification=args.get("verification") or "",
         max_turns=args.get("max_turns"), replace=bool(args.get("replace")),
-        task_ids=args.get("task_ids") if isinstance(args.get("task_ids"), list) else None, session_id=kw.get("session_id")),
+        task_ids=args.get("task_ids") if isinstance(args.get("task_ids"), list) else None, session_id=kw.get("session_id"),
+        on=str(args.get("on") or ""), process_session=str(args.get("process_session") or ""),
+        seconds=args.get("seconds"), question=str(args.get("question") or ""), reason=str(args.get("reason") or "")),
     emoji="⊙",
 )

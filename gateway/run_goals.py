@@ -292,7 +292,7 @@ class GatewayGoalsMixin:
         return factory(sid)
 
     async def _post_turn_goal_continuation(
-        self, *, session_entry: Any, source: Any, final_response: str,
+        self, *, session_entry: Any, source: Any, final_response: str, from_user: bool = False,
     ) -> None:
         """Run the goal judge after a gateway turn (AFTER delivery) and, if still active, enqueue a
         continuation through the adapter FIFO so a simultaneous real user message takes priority."""
@@ -319,7 +319,7 @@ class GatewayGoalsMixin:
         evaluation = asyncio.create_task(self._run_in_executor_with_context(
             lambda: mgr.evaluate_after_turn(
                 final_response or "", user_initiated=True, background_processes=_bg_procs,
-                active_delegations=_active_deleg,
+                active_delegations=_active_deleg, from_user=from_user,
             ),
         ))
         try:
@@ -380,9 +380,13 @@ class GatewayGoalsMixin:
         hooks = [("loop completion", self._post_turn_loop_completion)]
         if final_text.strip():
             hooks.insert(0, ("goal continuation", self._post_turn_goal_continuation))
+        # A real user turn (not a self-injected goal/heartbeat/loop prompt) lifts a waiting-on-user
+        # goal barrier: the user's answer is in it.
+        from_user = not is_internal and not getattr(event, "_goal_prompt", False)
         for label, hook in hooks:
             try:
-                await hook(session_entry=session_entry, source=source, final_response=final_text)
+                kw = {"from_user": from_user} if hook == self._post_turn_goal_continuation else {}
+                await hook(session_entry=session_entry, source=source, final_response=final_text, **kw)
             except Exception as exc:
                 logger.debug("%s hook failed: %s", label, exc)
 

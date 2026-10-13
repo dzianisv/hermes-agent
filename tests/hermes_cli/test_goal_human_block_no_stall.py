@@ -100,7 +100,7 @@ def test_same_question_is_recorded_once_and_never_pauses(goals_mod, monkeypatch)
         assert goals_mod.load_goal("rel").status == "waiting"
     s = goals_mod.load_goal("rel")
     assert s.pending_human_decisions == [TOUCH_ID]
-    assert s.consecutive_human_pending == 7 and s.waiting_until > 0
+    assert s.consecutive_human_pending == 7 and s.barrier_kind == "user" and s.waiting_until == 0
 
 
 def test_distinct_human_questions_accumulate(goals_mod, monkeypatch):

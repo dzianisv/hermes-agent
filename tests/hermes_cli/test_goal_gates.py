@@ -225,7 +225,7 @@ def test_failed_gate_reruns_when_untracked_file_content_changes(tmp_path, monkey
 
 def test_gate_continuation_respects_turn_budget():
     mgr = GoalManager(session_id="gate-budget-sid", default_max_turns=1)
-    mgr.set("budget goal")
+    mgr.set("budget goal", max_turns=1)
     mgr.add_gate("exit 1")
     with patch("hermes_cli.goals.judge_goal"):
         decision = mgr.evaluate_after_turn("only turn")

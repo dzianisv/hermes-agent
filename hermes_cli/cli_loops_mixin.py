@@ -743,8 +743,10 @@ class CLILoopsMixin:
             _active_deleg = count_active_delegations(getattr(self.agent, "session_id", None))
         except Exception:
             _bg_procs = None
+        _from_user = not isinstance(getattr(self, "_active_cli_wake", None), CLIWakeInput)
         decision = mgr.evaluate_after_turn(
-            last_response, user_initiated=True, background_processes=_bg_procs, active_delegations=_active_deleg)
+            last_response, user_initiated=True, background_processes=_bg_procs, active_delegations=_active_deleg,
+            from_user=_from_user)
         if decision.get("verdict") == "blocked_human_pending":
             _print_decision_message(decision)
         else:

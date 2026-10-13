@@ -150,10 +150,6 @@ def test_human_only_block_backs_off_and_dedupes_rewordings(hermes_home):
         assert d2["message"] == "" and d2["should_continue"] is False
         s2 = goals.GoalManager("sid-human-1").state
         assert s2.pending_human_decisions == [q1]
-        assert s2.consecutive_human_pending == 1 and s2.waiting_until > 0
-        mgr.stop_waiting()
-        d3 = mgr.evaluate_after_turn("still nothing else")
-        assert d3["message"] == "" and d3["should_continue"] is False
-        s3 = goals.GoalManager("sid-human-1").state
-        assert s3.consecutive_human_pending == 2
-        assert round(s3.waiting_until - s3.waiting_since) >= 2 * goals.SILENT_TURN_BACKOFF_BASE_S - 2
+        # Same step reworded: wait on the user (no timer re-poke); only their reply lifts it.
+        assert s2.consecutive_human_pending == 1 and s2.barrier_kind == "user" and s2.waiting_until == 0
+        assert mgr.is_waiting()
