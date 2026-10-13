@@ -132,24 +132,3 @@ def test_turn_inside_any_park_emits_no_user_message(hermes_home):
     assert d["verdict"] == "waiting"
     assert d["message"] == ""
 
-
-def test_human_only_block_backs_off_and_dedupes_rewordings(hermes_home):
-    """A human-only blocker parks with doubling backoff and announces a NEW question once;
-    the judge's rewordings of the same ask are neither re-announced nor re-poked (82 notices/h, 2026-10-10)."""
-    mgr = _goal("sid-human-1")
-    q1 = "Will you approve publishing to the Chrome Web Store using Touch ID?"
-    q2 = "Can you provide Touch ID approval to publish the extension to the Chrome Web Store?"
-    wd = {"blocker": goals.BLOCKER_HUMAN_ONLY, "human_decision": q1}
-    with patch("hermes_cli.goals.judge_goal", return_value=("blocked", "needs Touch ID", False, wd, False)):
-        d1 = mgr.evaluate_after_turn("did other work")
-        # new question: announced once, keep working the other requirements
-        assert d1["should_continue"] is True and d1["message"] == q1
-        assert goals.GoalManager("sid-human-1").state.waiting_until == 0
-        wd["human_decision"] = q2  # the judge's rewording of the same ask
-        d2 = mgr.evaluate_after_turn("did more work")
-        assert d2["message"] == "" and d2["should_continue"] is False
-        s2 = goals.GoalManager("sid-human-1").state
-        assert s2.pending_human_decisions == [q1]
-        # Same step reworded: wait on the user (no timer re-poke); only their reply lifts it.
-        assert s2.consecutive_human_pending == 1 and s2.barrier_kind == "user" and s2.waiting_until == 0
-        assert mgr.is_waiting()

@@ -92,11 +92,6 @@ _MAX_PENDING_HUMAN_DECISIONS = 8
 
 # Fed back when ONE step needs the human: record the question as waiting-on-user and keep moving
 # on the other requirements instead of stopping the goal.
-CONTINUATION_PROMPT_HUMAN_PENDING_SUFFIX = (
-    "\n\nStep needing the human: {question} — record it as waiting-on-user in your status and keep "
-    "working the other requirements. It is already listed in /goal status ({count} waiting on the "
-    "user); do not retry that step and do not ask again."
-)
 
 # Muse harness kick for agent-declared goals: fixed sentence, fired whenever a turn ends with the
 # goal still active (idle, stopped, blocked). The goal is never parked by the judge.
@@ -638,6 +633,7 @@ class GoalState:
     # as that count drops (a batch returned), not only when the timer runs out.
     waiting_on_delegations: int = 0
     waiting_reason: Optional[str] = None
+    evidence: Optional[str] = None  # agent goals: the completion evidence (no LLM audit)
     waiting_since: float = 0.0
     contract: GoalContract = field(default_factory=GoalContract)
     # /goal gate add <cmd>: ALL must pass before the judge may declare done.
@@ -709,6 +705,7 @@ class GoalState:
             max_turns=int(data.get("max_turns") or DEFAULT_MAX_TURNS),
             last_verdict=data.get("last_verdict"),
             last_reason=data.get("last_reason"),
+            evidence=data.get("evidence"),
             paused_reason=data.get("paused_reason"),
             subgoals=[str(s).strip() for s in raw_subgoals if str(s).strip()] if isinstance(raw_subgoals, list) else [],
             waiting_on_pid=(int(data["waiting_on_pid"]) if data.get("waiting_on_pid") else None),
@@ -1017,6 +1014,9 @@ def _session_waiting(session_id: str) -> bool:
 
 
 _JSON_OBJECT_RE = re.compile(r"\{.*?\}", re.DOTALL)
+
+
+AGENT_EVIDENCE_MIN_CHARS = 40
 
 
 def _goal_judge_setting(key: str, default, cast):
@@ -1514,7 +1514,6 @@ def draft_contract(objective: str, *, timeout: Optional[float] = None) -> Option
 # ── GoalManager — the orchestration surface CLI + gateway talk to ──────
 
 _SILENCE_PARK_PREFIX = "agent replied with a silence marker"
-_HUMAN_PARK_PREFIX = "waiting on a human-only step"
 
 
 def _is_silence_park_reason(reason: Optional[str]) -> bool:
@@ -1761,6 +1760,15 @@ class GoalManager:
         gate = self._check_gates()
         if gate is not None:
             return gate
+        if state.source == "agent":
+            # Agent goals: no LLM audit. Concrete evidence is required and persisted on the goal.
+            evidence = (evidence or "").strip()
+            if len(evidence) < AGENT_EVIDENCE_MIN_CHARS:
+                return _decision(state.status, False, None, "refused",
+                                 f"evidence must be concrete (>= {AGENT_EVIDENCE_MIN_CHARS} chars)", "")
+            state.evidence = evidence
+            self.mark_done(evidence[:500])
+            return _decision("done", False, None, "done", evidence[:500], "")
         verdict, reason, parse_failed, _wait, transport_failed = judge_goal(
             state.goal, f"Completion claim with evidence:\n{evidence}",
             subgoals=state.subgoals or None, contract=state.contract if state.has_contract() else None,
@@ -2198,6 +2206,18 @@ class GoalManager:
                 return self._budget_pause(state, "gate_failed", gate_decision.get("reason", ""), note=" (a quality gate is still failing)")
             return gate_decision
 
+        if state.source == "agent":
+            # Agent goals are never judged per turn: heartbeat continuation only, bounded by the
+            # turn budget; completion goes through goal(action="complete", evidence=...).
+            if state.turns_used >= state.max_turns:
+                # Stop continuing; never pause an agent goal (the user or a new turn can still drive it).
+                self._save()
+                return _decision("active", False, None, "budget_exhausted",
+                                 f"turn budget exhausted ({state.turns_used}/{state.max_turns})", "")
+            state.last_verdict, state.last_reason = "continue", "heartbeat"
+            self._save()
+            return _decision("active", True, self.next_continuation_prompt(), "continue", "heartbeat", "")
+
         verdict, reason, parse_failed, wait_directive, transport_failed = judge_goal(
             state.goal, last_response, subgoals=state.subgoals or None, background_processes=background_processes,
             contract=state.contract if state.has_contract() else None, active_delegations=active_delegations,
@@ -2234,16 +2254,6 @@ class GoalManager:
                 return _decision("active", True, (self.next_continuation_prompt() or "")
                                  + REVERSIBLE_DECISION_SUFFIX.format(question=question),
                                  "blocked_reversible", reason, "")
-            if state.source == "agent":
-                if category == BLOCKER_HUMAN_ONLY:
-                    return self._human_block(state, question, reason)
-                state.consecutive_blocked += 1
-                self._save()
-                n = state.consecutive_blocked
-                return _decision(
-                    "active", True, self._reroute_prompt(state, reason), "blocked_transient", reason,
-                    f"↻ Blocked ({category}, {n} in a row) — rerouting, not parking: {reason}",
-                )
             # Money / credentials-permissions / irreversible (or an unclassified "unachievable"):
             # the user goal pauses for the user, as before.
             return self._pause_decision(
@@ -2281,24 +2291,6 @@ class GoalManager:
         # toward goal (9/20)" line after every turn is machinery text (97/day on Doc Brown's thread).
         return _decision("active", True, self.next_continuation_prompt(), "continue", reason, "")
 
-    def _human_block(self, state: "GoalState", question: str, reason: str) -> Dict[str, Any]:
-        """Agent goal hit a step only the user can do. A NEW step is announced once and the agent
-        keeps working the other requirements. The SAME step again (in any wording) means nothing
-        else is left: park on the user — no timer, no re-poke, lifted only by the user's reply."""
-        state.consecutive_blocked = 0
-        existing = state.pending_step_for(question)
-        if existing is None:
-            state.record_pending_human_decision(question)
-            state.consecutive_human_pending = 0
-            self._save()
-            return _decision("active", True, self._human_pending_prompt(question, len(state.pending_human_decisions)),
-                             "blocked_human_pending", reason, question)
-        state.consecutive_human_pending += 1
-        self.wait_on_user(existing, reason=f"{_HUMAN_PARK_PREFIX}: {existing}")
-        logger.info("goal %s: human-only step asked again — waiting for the user's reply: %s",
-                    self.session_id, existing[:120])
-        return _decision("active", False, None, "blocked_human_pending", reason, "")
-
     def _judge_outage(self, state: "GoalState", reason: str, active_delegations: int) -> Dict[str, Any]:
         """Judge API unreachable. The goal's state never depends on judge availability: keep it
         active, hold a short backoff timer, alert the operator once, resume on the next good verdict.
@@ -2334,32 +2326,10 @@ class GoalManager:
         n, limit = state.consecutive_stalled, max_stalled_turns()
         if n < limit:
             return None
-        if state.source == "agent":
-            backoff = min(SILENT_TURN_BACKOFF_BASE_S * (2 ** (n - limit)), SILENT_TURN_BACKOFF_MAX_S)
-            self._park(f"no progress for {n} turns; backing off {backoff}s", uncapped=True,
-                       waiting_until=time.time() + backoff)
-            return _decision("active", False, None, "stalled", f"no progress for {n} turns", "")
         return self._pause_decision(
             f"no progress for {n} turns in a row", "stalled", f"no progress for {n} turns",
             f"⏸ Goal paused — the last {n} turns made no progress (same reply each time). "
             "Use /goal resume to keep going, or /goal clear to stop.",
-        )
-
-    def _human_pending_prompt(self, question: str, count: int) -> str:
-        body = self.next_continuation_prompt() or ""
-        return body + CONTINUATION_PROMPT_HUMAN_PENDING_SUFFIX.format(question=question, count=count)
-
-    def _reroute_prompt(self, state: "GoalState", reason: str) -> str:
-        body = self.next_continuation_prompt() or ""
-        return (
-            body + "\n\n[Last turn ended blocked — do NOT stop or ask the user to retry]\n"
-            f"Blocker: {reason}\n"
-            "Take a different route this turn, for example: put the change in a non-protected file "
-            "(a skill, profile notes, or a new doc) instead of the protected one; re-request a timed-out "
-            "approval once; retry a failed tool with a different command or tool; while CI runs, move to "
-            "the next unmet requirement. If a step truly needs a human (spend money, delete/alter customer "
-            "data irreversibly, grant credentials/access, a device-bound action), state the exact question, "
-            "record it as waiting-on-user, and keep working the other requirements."
         )
 
     @command

@@ -41,21 +41,6 @@ def _agent_goal(goals, sid="s1"):
     return mgr
 
 
-def test_approval_timeout_reroutes_instead_of_parking(goals_mod, monkeypatch):
-    seen: list = []
-    _judge(goals_mod, monkeypatch, APPROVAL_TIMEOUT, seen)
-    mgr = _agent_goal(goals_mod)
-    d = mgr.evaluate_after_turn("approval prompt timed out. Type retry to try again.")
-    assert d["should_continue"] is True
-    assert d["status"] == "active"
-    assert "non-protected file" in d["continuation_prompt"]
-    assert "approval prompt timed out" in d["continuation_prompt"]
-    # persisted across a fresh manager (real state_meta)
-    again = goals_mod.GoalManager(session_id="s1")
-    assert again.state.status == "active" and again.state.consecutive_blocked == 1
-    assert "human_only" in seen[0]  # judge prompt asks for the category
-
-
 def test_repeated_blocked_verdicts_never_park_an_agent_goal(goals_mod, monkeypatch):
     # Muse semantics: no park-on-blocked. Only complete / user pause|clear / max_turns end it.
     _judge(goals_mod, monkeypatch, {"verdict": "blocked", "reason": "tool error"}, [])
@@ -75,19 +60,6 @@ def test_progress_resets_blocked_budget(goals_mod, monkeypatch):
     _judge(goals_mod, monkeypatch, {"verdict": "continue", "reason": "progress"}, [])
     mgr.evaluate_after_turn("made progress")
     assert mgr.state.consecutive_blocked == 0
-
-
-def test_human_only_records_the_question_and_keeps_going(goals_mod, monkeypatch):
-    q = "Approve spending $240/month on a second GPU node?"
-    _judge(goals_mod, monkeypatch, {"verdict": "blocked", "blocker": "human_only",
-                                     "human_decision": q, "reason": "needs budget approval"}, [])
-    mgr = _agent_goal(goals_mod)
-    d = mgr.evaluate_after_turn("I need approval to buy a node")
-    assert d["status"] == "active" and d["should_continue"] is True
-    assert q in d["message"]
-    assert "Continue working toward the active goal" in d["continuation_prompt"]
-    assert f"Step needing the human: {q}" in d["continuation_prompt"]
-    assert goals_mod.GoalManager(session_id="s1").state.pending_human_decisions == [q]
 
 
 def test_user_goal_blocked_still_pauses(goals_mod, monkeypatch):

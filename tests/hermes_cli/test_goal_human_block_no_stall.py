@@ -67,81 +67,6 @@ MUSE_KICK = "Continue working toward the active goal, verify requirement by requ
 # ── 1) blocked / human_only never parks an agent goal ─────────────────────────────────────────
 
 
-def test_human_only_block_keeps_the_goal_active_and_records_the_question(goals_mod, monkeypatch):
-    seen = _judge(goals_mod, monkeypatch, _human_block())
-    mgr = _release_goal(goals_mod)
-    d = mgr.evaluate_after_turn("The privacy form needs Touch ID; I can't complete it. Stopping here.")
-    assert d["status"] == "active" and d["should_continue"] is True
-    kick = d["continuation_prompt"]
-    assert MUSE_KICK in kick
-    assert f"Step needing the human: {TOUCH_ID}" in kick and "waiting-on-user" in kick
-    assert "PR #2270 merged" in kick                      # the other requirements ride along
-    assert TOUCH_ID in d["message"]
-    # persisted for /goal status and the status bar, on a fresh manager
-    again = goals_mod.GoalManager(session_id="rel")
-    assert again.state.status == "active"
-    assert again.state.pending_human_decisions == [TOUCH_ID]
-    assert "waiting on user" in again.status_line() and "Touch ID" in again.status_line()
-    assert "human_only" in seen[0]
-
-
-def test_same_question_is_recorded_once_and_never_pauses(goals_mod, monkeypatch):
-    """The same human-only question again = nothing else left to do. The goal stays ACTIVE (never
-    paused) but waits with a doubling backoff instead of re-poking at once — re-poking re-asked the
-    Touch ID question ~6x/min for an hour (82 notices in the user's chat, 2026-10-10)."""
-    _judge(goals_mod, monkeypatch, _human_block())
-    mgr = _release_goal(goals_mod)
-    d = mgr.evaluate_after_turn("still needs Touch ID 0")
-    assert d["status"] == "active" and d["should_continue"] is True and MUSE_KICK in d["continuation_prompt"]
-    for i in range(1, 8):
-        mgr.stop_waiting()
-        d = mgr.evaluate_after_turn(f"still needs Touch ID {i}")
-        assert d["status"] == "waiting" and d["should_continue"] is False and d["message"] == "", d
-        assert goals_mod.load_goal("rel").status == "waiting"
-    s = goals_mod.load_goal("rel")
-    assert s.pending_human_decisions == [TOUCH_ID]
-    assert s.consecutive_human_pending == 7 and s.barrier_kind == "user" and s.waiting_until == 0
-
-
-def test_distinct_human_questions_accumulate(goals_mod, monkeypatch):
-    mgr = _release_goal(goals_mod)
-    _judge(goals_mod, monkeypatch, _human_block())
-    mgr.evaluate_after_turn("needs Touch ID")
-    _judge(goals_mod, monkeypatch, _human_block(question="Approve the $49 Product Hunt promo spend?"))
-    d = mgr.evaluate_after_turn("needs spend approval")
-    assert d["status"] == "active"
-    pend = goals_mod.load_goal("rel").pending_human_decisions
-    assert pend == [TOUCH_ID, "Approve the $49 Product Hunt promo spend?"]
-    assert "Waiting on the user" in d["continuation_prompt"] and TOUCH_ID in d["continuation_prompt"]
-
-
-def test_human_only_without_a_question_falls_back_to_the_reason(goals_mod, monkeypatch):
-    _judge(goals_mod, monkeypatch, {"verdict": "blocked", "blocker": "human_only", "reason": "needs owner sign-off"})
-    mgr = _release_goal(goals_mod)
-    d = mgr.evaluate_after_turn("waiting on sign-off")
-    assert d["status"] == "active"
-    assert goals_mod.load_goal("rel").pending_human_decisions == ["needs owner sign-off — approve or decide how to proceed?"]
-
-
-def test_pending_question_stays_listed_after_progress(goals_mod, monkeypatch):
-    mgr = _release_goal(goals_mod)
-    _judge(goals_mod, monkeypatch, _human_block())
-    mgr.evaluate_after_turn("needs Touch ID")
-    _judge(goals_mod, monkeypatch, {"verdict": "continue", "reason": "PR #2270 merged, CI running"})
-    d = mgr.evaluate_after_turn("merged PR #2270")
-    assert d["status"] == "active" and MUSE_KICK in d["continuation_prompt"]
-    assert goals_mod.load_goal("rel").pending_human_decisions == [TOUCH_ID]
-
-
-def test_transient_block_continues_with_muse_kick(goals_mod, monkeypatch):
-    _judge(goals_mod, monkeypatch, {"verdict": "blocked", "blocker": "transient", "reason": "approval prompt timed out"})
-    mgr = _release_goal(goals_mod)
-    d = mgr.evaluate_after_turn("approval prompt timed out")
-    assert d["status"] == "active" and d["should_continue"] is True
-    assert MUSE_KICK in d["continuation_prompt"] and "approval prompt timed out" in d["continuation_prompt"]
-    assert goals_mod.load_goal("rel").pending_human_decisions == []
-
-
 def test_idle_turn_with_continue_verdict_fires_the_muse_kick(goals_mod, monkeypatch):
     _judge(goals_mod, monkeypatch, {"verdict": "continue", "reason": "4 requirements still open"})
     mgr = _release_goal(goals_mod)
@@ -161,18 +86,6 @@ def test_user_pause_still_pauses_an_agent_goal(goals_mod, monkeypatch):
     assert mgr.evaluate_after_turn("anything")["should_continue"] is False
 
 
-def test_agent_goal_has_no_turn_budget(goals_mod, monkeypatch):
-    """Live 2026-10-09: '⏸ Goal paused — 23/20 turns used' on an agent goal that still had work.
-    Muse has no budget on agent goals; only acceptance criteria or a human-only blocker end them."""
-    mgr = goals_mod.GoalManager(session_id="mt")
-    assert mgr.set_agent_goal(RELEASE_GOAL, max_turns=2) is not None
-    _judge(goals_mod, monkeypatch, {"verdict": "continue", "reason": "PR still open"})
-    for i in range(5):
-        d = mgr.evaluate_after_turn(f"t{i}")
-        assert d["status"] == "active" and d["should_continue"] is True
-    assert goals_mod.load_goal("mt").turns_used == 5
-
-
 def test_user_goal_keeps_turn_budget(goals_mod, monkeypatch):
     mgr = goals_mod.GoalManager(session_id="ub")
     mgr.set("user goal", max_turns=2)
@@ -180,12 +93,6 @@ def test_user_goal_keeps_turn_budget(goals_mod, monkeypatch):
     assert mgr.evaluate_after_turn("t1")["status"] == "active"
     d = mgr.evaluate_after_turn("t2")
     assert d["status"] == "waiting" and "budget" in goals_mod.load_goal("ub").paused_reason
-
-
-def test_complete_still_closes_the_goal(goals_mod, monkeypatch):
-    _judge(goals_mod, monkeypatch, {"verdict": "done", "reason": "all requirements verified"})
-    mgr = _release_goal(goals_mod)
-    assert mgr.evaluate_after_turn("everything shipped")["status"] == "done"
 
 
 def test_user_goal_human_block_still_pauses_for_the_user(goals_mod, monkeypatch):

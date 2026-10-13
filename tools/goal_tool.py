@@ -8,9 +8,10 @@ opts in; everyone else keeps the schema untouched.
 Rules the handler enforces (never the prompt alone):
 - ``create`` never overwrites a user-set goal — the user's ``/goal`` always wins. It replaces the
   agent's OWN goal only with ``replace=true`` (the user redirected the work), archiving the old row.
-- ``complete`` runs the completion audit (``judge_goal`` against the agent's stated evidence) and
-  refuses when the verdict is not DONE, so an agent cannot wave its own goal through.
-- The goal is tagged ``source="agent"``: ``self-set`` in the status line, parked (not nagged) on BLOCKED.
+- ``complete`` on an agent goal makes no LLM call: it requires concrete evidence (>= 40 chars),
+  stores it on the goal and marks it done. A user ``/goal`` still runs the judge audit.
+- The goal is tagged ``source="agent"``: ``self-set`` in the status line; never judged per turn,
+  only heartbeat-continued within its turn budget.
 """
 
 from __future__ import annotations

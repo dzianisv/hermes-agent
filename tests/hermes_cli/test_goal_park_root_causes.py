@@ -98,32 +98,6 @@ AF900B = [
 ]
 
 
-def test_reworded_human_step_waits_on_user_and_does_not_spin(goals, monkeypatch):
-    replies = [{"verdict": "blocked", "blocker": "human_only", "human_category": "credentials",
-                "human_decision": q, "reason": "needs Touch ID"} for q in AF900B]
-    _judge(goals, monkeypatch, replies)
-    mgr = goals.GoalManager(session_id="p2")
-    mgr.set_agent_goal("Release VibeBrowser 1.1.43 to the Chrome Web Store")
-    d1 = mgr.evaluate_after_turn("did the other requirements")
-    assert d1["should_continue"] is True and d1["message"] == AF900B[0]
-    d2 = mgr.evaluate_after_turn("nothing else left")
-    assert d2["should_continue"] is False and d2["message"] == ""
-    s = goals.GoalManager("p2").state
-    assert s.pending_human_decisions == [AF900B[0]]
-    assert s.barrier_kind == "user" and s.waiting_until == 0
-    mgr = goals.GoalManager("p2")
-    # No timer: it stays parked however long, and an internal (non-user) turn does not lift it.
-    assert mgr.is_waiting()
-    d3 = mgr.evaluate_after_turn("self wake", from_user=False)
-    assert d3["should_continue"] is False and mgr.is_waiting()
-    turns = goals.GoalManager("p2").state.turns_used
-    # The user's reply lifts it.
-    d4 = mgr.evaluate_after_turn("Den: approved, Touch ID done", from_user=True)
-    assert not goals.GoalManager("p2").is_waiting()
-    assert goals.GoalManager("p2").state.turns_used == turns + 1
-    assert d4["verdict"] != "waiting"
-
-
 # ── (3) long-running goals stop on lack of progress, not on a raw turn count ──────────────────
 
 def test_long_running_user_goal_with_progress_not_capped_at_20(goals, monkeypatch):

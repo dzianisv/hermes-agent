@@ -44,19 +44,6 @@ def _judge_wait(seconds: int, reason: str):
 
 
 class TestAgentGoalWaitCap:
-    def test_judge_wait_on_ci_is_capped_at_max_wait_seconds(self, hermes_home):
-        mgr = _agent_goal("agent-wait-cap")
-        before = time.time()
-        with _judge_wait(900, "waiting on CI"):
-            decision = mgr.evaluate_after_turn("pushed; CI running")
-        assert decision["verdict"] == "wait"
-        assert decision["should_continue"] is False          # parked, but only briefly
-        remaining = mgr.state.waiting_until - before
-        assert 0 < remaining <= goals.DEFAULT_MAX_WAIT_SECONDS + 1
-        # A wait verdict is loop bookkeeping, never a chat notice (the park is visible in /goal).
-        assert decision["message"] == ""
-        assert decision["reason"] == "waiting on CI"
-
     def test_cap_reads_goals_max_wait_seconds(self, hermes_home):
         mgr = _agent_goal("agent-wait-cfg")
         with patch("hermes_cli.config.load_config", return_value={"goals": {"max_wait_seconds": 42}}):

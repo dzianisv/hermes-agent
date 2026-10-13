@@ -22,7 +22,7 @@ def db(tmp_path, monkeypatch):
 def test_delayed_effect_loses_to_current_owner(db, monkeypatch, change, audit):
     db.create_session("parent", source="telegram")
     manager = goals.GoalManager("parent")
-    manager.set_agent_goal("Ship the verified artifact")
+    manager.set("Ship the verified artifact")
     entered, finish = threading.Event(), threading.Event()
 
     def judge(*args, **kwargs):
@@ -67,7 +67,7 @@ def test_delayed_effect_loses_to_current_owner(db, monkeypatch, change, audit):
 
 def test_commands_reduce_current_row_and_audit_includes_all_requirements(db, monkeypatch):
     a, b = goals.GoalManager("one"), goals.GoalManager("one")
-    a.set_agent_goal("Ship the verified artifact")
+    a.set("Ship the verified artifact")
     b.add_subgoal("Verify the customer-facing URL")
     a.link_tasks(["t_abcdef"])
     assert goals.load_goal("one").subgoals == ["Verify the customer-facing URL"]
