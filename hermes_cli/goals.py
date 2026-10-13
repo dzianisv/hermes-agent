@@ -1498,14 +1498,17 @@ class GoalManager:
 
     @command
     def set_agent_goal(self, objective: str, *, contract: Optional[GoalContract] = None,
-                       max_turns: Optional[int] = None) -> Optional[GoalState]:
-        """Install a goal the agent declared on itself (``source="agent"``). Never overwrites an
-        active goal or any user-declared goal — the user always wins; returns None in that case.
-        A parked agent goal it replaces is archived first (``goal_archive:<session>:<ts>``)."""
-        if not self.accepts_agent_goal():
-            return None
+                       max_turns: Optional[int] = None, replace: bool = False) -> Optional[GoalState]:
+        """Install a goal the agent declared on itself (``source="agent"``). Never overwrites a
+        user-declared goal — the user always wins; returns None in that case. An active agent goal
+        is overwritten only with ``replace=True`` (the user redirected the work mid-goal), so the
+        agent never has to ask the user to ``/goal clear`` its own declaration. Any agent goal it
+        replaces is archived first (``goal_archive:<session>:<ts>``)."""
         previous = self._state
-        if previous is not None and previous.status == "waiting":
+        own = previous is not None and self.has_goal() and previous.source == "agent"
+        if not self.accepts_agent_goal() and not (replace and own):
+            return None
+        if previous is not None and self.has_goal():
             self._archives.append(previous)
         state = self.set(objective, contract=contract, max_turns=max_turns)
         state.source = "agent"

@@ -6,7 +6,8 @@ Service-gated on ``goals.agent_tool`` (off by default): a profile that wants goa
 opts in; everyone else keeps the schema untouched.
 
 Rules the handler enforces (never the prompt alone):
-- ``create`` never overwrites a user-set or active goal — the user's ``/goal`` always wins.
+- ``create`` never overwrites a user-set goal — the user's ``/goal`` always wins. It replaces the
+  agent's OWN goal only with ``replace=true`` (the user redirected the work), archiving the old row.
 - ``complete`` runs the completion audit (``judge_goal`` against the agent's stated evidence) and
   refuses when the verdict is not DONE, so an agent cannot wave its own goal through.
 - The goal is tagged ``source="agent"``: ``self-set`` in the status line, parked (not nagged) on BLOCKED.
@@ -44,13 +45,20 @@ GOAL_SCHEMA = {
         "and no goal is set — state the outcome, not the next step, plus the acceptance criteria "
         "the audit will check. Call `complete` only when "
         "you can cite evidence the outcome exists; the completion audit refuses otherwise. "
-        "Never create a goal for a plain question, a one-shot answer, or work the user cancelled; "
-        "a user-set /goal always wins and cannot be replaced here."
+        "Never create a goal for a plain question, a one-shot answer, or work the user cancelled. "
+        "If the user redirects you and the current goal is one YOU set (source=agent), call `create` "
+        "with replace=true — do not ask the user to run /goal clear. A user-set /goal always wins "
+        "and cannot be replaced here."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "action": {"type": "string", "enum": ["get", "create", "link", "complete"]},
+            "replace": {
+                "type": "boolean",
+                "description": "For create: replace the agent's own current goal (source=agent) because the user "
+                               "redirected the work. Refused for user-set goals.",
+            },
             "objective": {
                 "type": "string",
                 "description": "For create: the outcome in one sentence, verifiable, 12–600 chars.",
@@ -134,7 +142,7 @@ def _build_contract(objective: str, acceptance_criteria: str, verification: str)
 
 
 def goal_tool(action: str, *, objective: str = "", evidence: str = "", max_turns: Optional[int] = None,
-              acceptance_criteria: str = "", verification: str = "",
+              acceptance_criteria: str = "", verification: str = "", replace: bool = False,
               task_ids: Optional[list] = None, session_id: Optional[str] = None) -> str:
     mgr = _manager(session_id)
     if mgr is None:
@@ -152,16 +160,20 @@ def goal_tool(action: str, *, objective: str = "", evidence: str = "", max_turns
         objective = (objective or "").strip()
         if not (_MIN_OBJECTIVE_CHARS <= len(objective) <= _MAX_OBJECTIVE_CHARS):
             return tool_error(f"objective must be {_MIN_OBJECTIVE_CHARS}–{_MAX_OBJECTIVE_CHARS} chars")
-        if not mgr.accepts_agent_goal():
+        if replace and mgr.has_goal() and mgr.state is not None and mgr.state.source != "agent":
+            return tool_error("the current goal was set by the user with /goal; it cannot be replaced by the "
+                              "agent — the user clears it with /goal clear", **_state_view(mgr))
+        if not mgr.accepts_agent_goal() and not (replace and mgr.state is not None and mgr.state.source == "agent"):
             s = mgr.state
             if s is not None and s.status == "waiting" and s.source == "agent":
                 return tool_error("this session's goal is parked and still holds the slot; the user answers "
                                   "its pending question and runs /goal resume, or it becomes replaceable after "
                                   "goals.parked_release_hours", **_state_view(mgr))
             return tool_error("a goal is already set for this session; finish it with complete, "
+                              "pass replace=true if it is your own goal and the user redirected you, "
                               "or the user clears it with /goal clear", **_state_view(mgr))
         contract = _build_contract(objective, acceptance_criteria, verification)
-        state = mgr.set_agent_goal(objective, contract=contract, max_turns=max_turns)
+        state = mgr.set_agent_goal(objective, contract=contract, max_turns=max_turns, replace=bool(replace))
         if state is None:
             return tool_error("goal not set", **_state_view(mgr))
         if task_ids:
@@ -197,7 +209,7 @@ registry.register(
     handler=lambda args, **kw: goal_tool(
         str(args.get("action") or ""), objective=args.get("objective") or "", evidence=args.get("evidence") or "",
         acceptance_criteria=args.get("acceptance_criteria") or "", verification=args.get("verification") or "",
-        max_turns=args.get("max_turns"),
+        max_turns=args.get("max_turns"), replace=bool(args.get("replace")),
         task_ids=args.get("task_ids") if isinstance(args.get("task_ids"), list) else None, session_id=kw.get("session_id")),
     emoji="⊙",
 )

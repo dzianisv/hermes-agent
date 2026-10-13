@@ -155,3 +155,25 @@ def test_create_refused_on_cron_session():
     out = json.loads(goal_tool("create", objective="Deliver a stock screen with verified numbers for ten tickers",
                                session_id="cron_abc_20261012_174824"))
     assert "error" in out and "one-shot" in out["error"]
+
+
+def test_agent_replaces_its_own_goal_when_user_redirects(_isolated):
+    """The user redirected the work mid-goal. The agent must not have to ask for /goal clear on a
+    goal it set itself: create(replace=true) swaps it and archives the old row (2026-10-13 incident:
+    agent set a wrong goal, then asked the user to clear it)."""
+    _call(action="create", objective="Resolve the 22 AgentPod gap rows on the Notion board")
+    r = _call(action="create", objective="Fix the harness re-pin bug and verify it live")
+    assert "error" in r and "replace=true" in r["error"]
+    r = _call(action="create", replace=True, objective="Fix the harness re-pin bug and verify it live")
+    assert r["created"] and r["goal"].startswith("Fix the harness") and r["source"] == "agent"
+    import sqlite3
+    with sqlite3.connect(_isolated.db_path) as c:
+        rows = c.execute("SELECT value FROM state_meta WHERE key LIKE 'goal_archive:s1:%'").fetchall()
+    assert rows and "AgentPod gap rows" in rows[0][0], "replaced agent goal must be archived"
+
+
+def test_agent_cannot_replace_a_user_set_goal():
+    goals_mod.GoalManager(session_id="s1").set("User-typed objective that must survive")
+    r = _call(action="create", replace=True, objective="Agent tries to take over the slot")
+    assert "error" in r and "/goal clear" in r["error"]
+    assert goals_mod.GoalManager(session_id="s1").state.goal.startswith("User-typed")
