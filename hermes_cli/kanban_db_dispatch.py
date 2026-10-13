@@ -3437,7 +3437,8 @@ def _design_phase_guard(conn: sqlite3.Connection, task_id: str, assignee: str) -
         return None
     parts = [task.title or "", task.body or ""]
     try:
-        parts += [c.body or "" for c in _kb.list_comments(conn, task_id)]
+        from hermes_cli import kanban_wait_on as _wo_sel
+        parts += _wo_sel.brief_comment_bodies(conn, task_id)  # same selection as the wake hash
     except Exception:
         pass
     text = "\n".join(parts)
@@ -3529,13 +3530,14 @@ def _design_phase_guard(conn: sqlite3.Connection, task_id: str, assignee: str) -
                 "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'respawn_guarded' "
                 "ORDER BY id DESC LIMIT 1", (task_id,)).fetchone()
             prev = _kb._json_dict(prev["payload"]) if prev else {}
-            same = prev.get("reason") == reason and prev.get("brief") == fp
+            # Unchanged gap = no new run, even if an unrelated comment woke it.
+            same = prev.get("reason") == reason and prev.get("missing") == missing
             if _kb.schedule_task(conn, task_id, reason=None if same else note):
                 with _kb.write_txn(conn):
                     conn.execute(
                         "UPDATE tasks SET wait_on = ?, wait_on_fingerprint = ?, wait_on_checked_at = ? "
                         "WHERE id = ?", (f"card_body:{task_id}", fp, 0, task_id))
-                    _kb._append_event(conn, task_id, "respawn_guarded", {"reason": reason, "brief": fp})
+                    _kb._append_event(conn, task_id, "respawn_guarded", {"reason": reason, "brief": fp, "missing": missing})
             return reason
         if _kb.schedule_task(conn, task_id, reason=note) and not ok and cfg["architect"]:
             _kb.assign_task(conn, task_id, cfg["architect"])

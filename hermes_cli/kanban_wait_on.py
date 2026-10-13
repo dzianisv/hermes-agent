@@ -122,21 +122,30 @@ def fingerprint_pr(data: dict) -> str:
                      ",".join(sorted(checks))])
 
 
+BRIEF_COMMENT_EXCLUDED_AUTHORS = frozenset({"kanban-dispatcher"})
+
+
+def brief_comment_bodies(conn: sqlite3.Connection, task_id: str) -> list[str]:
+    """The comments the design-phase brief gate reads AND the ``card_body`` wake
+    hash covers -- one selection so they cannot drift (#29: the gate read every
+    comment while the hash skipped the assignee's, so a brief completed in an
+    assignee comment passed the gate but never woke the card). Every comment
+    except the dispatcher's own park notes, which quote marker text."""
+    return [c["body"] or "" for c in conn.execute(
+        "SELECT author, body FROM task_comments WHERE task_id = ? ORDER BY id", (task_id,))
+        if (c["author"] or "") not in BRIEF_COMMENT_EXCLUDED_AUTHORS]
+
+
 def brief_fingerprint(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
-    """Hash of what the design-phase brief gate reads: title, body, and every
-    comment not written by the card's own assignee or the dispatcher (EM /
-    architect answers arrive as comments). ``None`` when the card is gone."""
+    """Hash of exactly what the design-phase brief gate reads: title, body and
+    :func:`brief_comment_bodies`. ``None`` when the card is gone."""
     import hashlib
-    row = conn.execute("SELECT title, body, assignee FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    row = conn.execute("SELECT title, body FROM tasks WHERE id = ?", (task_id,)).fetchone()
     if row is None:
         return None
     h = hashlib.sha256()
-    for part in (row["title"] or "", row["body"] or ""):
+    for part in (row["title"] or "", row["body"] or "", *brief_comment_bodies(conn, task_id)):
         h.update(part.encode()); h.update(b"\0")
-    skip = {row["assignee"] or "", "kanban-dispatcher"}
-    for c in conn.execute("SELECT author, body FROM task_comments WHERE task_id = ? ORDER BY id", (task_id,)):
-        if (c["author"] or "") not in skip:
-            h.update((c["body"] or "").encode()); h.update(b"\0")
     return h.hexdigest()
 
 

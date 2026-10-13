@@ -87,3 +87,31 @@ def test_em_comment_wakes_card(conn):
     kb.add_comment(conn, tid, author="product-lead-agentpod", body="ACCEPTANCE: 1. y")
     disp.dispatch_once(conn, spawn_fn=spawn)
     assert spawned == [tid]
+
+
+def test_assignee_comment_completing_brief_wakes_card(conn):
+    """#29: the gate counts the assignee's comments, so the wake hash must too —
+    otherwise a brief completed in an assignee comment passes the gate but never wakes."""
+    tid = kb.create_task(conn, title="impl", body=INCOMPLETE, assignee="software-engineer",
+                         created_by="product-lead-agentpod")
+    spawned = []
+    spawn = lambda task, ws, **k: spawned.append(task.id)
+    disp.dispatch_once(conn, spawn_fn=spawn)
+    assert kb.get_task(conn, tid).status == "scheduled"
+    kb.add_comment(conn, tid, author="software-engineer", body="ACCEPTANCE: 1. y")
+    disp.dispatch_once(conn, spawn_fn=spawn)
+    assert spawned == [tid]
+    assert _scheduled_runs(conn, tid) == 1
+
+
+def test_gate_and_wake_hash_share_comment_selection(conn):
+    from hermes_cli import kanban_wait_on as wo
+    tid = kb.create_task(conn, title="impl", body=INCOMPLETE, assignee="software-engineer")
+    kb.add_comment(conn, tid, author="software-engineer", body="ACCEPTANCE: a")
+    kb.add_comment(conn, tid, author="kanban-dispatcher", body="ACCEPTANCE: park note")
+    assert wo.brief_comment_bodies(conn, tid) == ["ACCEPTANCE: a"]
+    before = wo.brief_fingerprint(conn, tid)
+    kb.add_comment(conn, tid, author="kanban-dispatcher", body="noise")
+    assert wo.brief_fingerprint(conn, tid) == before
+    kb.add_comment(conn, tid, author="software-engineer", body="more")
+    assert wo.brief_fingerprint(conn, tid) != before
