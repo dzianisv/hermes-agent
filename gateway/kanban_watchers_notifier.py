@@ -648,15 +648,46 @@ class _KanbanNotification:
             parent_chat_id=_delivery_meta.get("parent_chat_id"),
         )
         _source._transport_adapter_ref = weakref.ref(self.adapter)
+        _source, _adapter = self._handoff_lane(_source)
         from gateway.run import _async_profile_runtime_scope
         if self.sub_profile and getattr(getattr(self.runner, "config", None), "multiplex_profiles", False):
             from hermes_cli.profiles import profile_exists
             if not profile_exists(self.sub_profile):
                 raise RuntimeError(f"Kanban wake profile {self.sub_profile!r} no longer exists")
         async with _async_profile_runtime_scope(self.runner._resolve_profile_home_for_source(_source)):
-            await deliver_wake(self.adapter, text=self.synth, session_id=self.session_key, source=_source,
+            await deliver_wake(_adapter, text=self.synth, session_id=self.session_key, source=_source,
                                notification_category="diagnostic" if self.wake_diagnostic else "result")
         self._log_woke()
+
+    def _handoff_lane(self, source: Any) -> tuple:
+        """Subscriptions are stamped with the lane the card was CREATED from. After the creator
+        session is handed off (Telegram -> Slack) that lane is stale: waking it posted the card's
+        progress bubbles into Telegram and held the session's turn lease against the live Slack lane.
+        One wake source per session: redirect to the routing entry on ``handoff_platform``."""
+        from gateway.run_goal_wake import handoff_lane_ok
+        sid = self.session_key or getattr(self.task, "session_id", None) or ""
+        store = getattr(self.runner, "session_store", None)
+        if not sid or store is None:
+            return source, self.adapter
+        try:
+            mine = next((e for e in store.list_sessions()
+                         if e.session_id == sid and e.origin is not None and not getattr(e, "suspended", False)
+                         and str(getattr(getattr(e.origin, "platform", None), "value", getattr(e.origin, "platform", ""))).lower()
+                         == self.platform_str), None)
+            if mine is None:
+                return source, self.adapter
+            lane, on_lane = handoff_lane_ok(self.runner, sid, mine, store)
+            if lane is mine or not on_lane:
+                return source, self.adapter
+            lane_source = self.runner._restored_source(lane)
+            adapter = self.runner._delivery_adapter_for(lane_source) or self.adapter
+            lane_source._transport_adapter_ref = weakref.ref(adapter)
+            logger.info("kanban notifier: creator %s handed off; waking on %s instead of %s",
+                        sid, getattr(getattr(lane_source, "platform", None), "value", lane_source.platform), self.platform_str)
+            return lane_source, adapter
+        except Exception:
+            logger.debug("kanban notifier: handoff lane lookup for %s failed", sid, exc_info=True)
+            return source, self.adapter
 
     async def _send_event(self, ev: Any, msg: str) -> bool:
         """Send one text ping; raises on adapter exception or SendResult(success=False)."""
