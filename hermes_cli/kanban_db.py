@@ -4038,8 +4038,10 @@ def request_review(
                     (trow["current_run_id"],),
                 ).fetchone()
                 implementer = arow["profile"] if arow else None
-            if implementer is None and trow["assignee"] != reviewer:
+            if implementer is None:
                 implementer = trow["assignee"]
+            if _canonical_assignee(implementer) == reviewer:
+                implementer = None
             assignee_sql = ", assignee = ?" if reviewer is not None else ""
             run_guard = "" if expected_run_id is None else " AND current_run_id = ?"
             params: tuple[Any, ...] = (

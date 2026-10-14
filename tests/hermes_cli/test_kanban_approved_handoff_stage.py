@@ -89,3 +89,23 @@ def test_approve_refused_outside_review_run(kanban_home):
         kb.claim_task(conn, tid)
         ok, reason = kb.approve_for_merge(conn, tid, summary="LGTM")
         assert not ok and "review" in reason
+
+
+def test_reviewer_run_handoff_never_records_reviewer_as_implementer(kanban_home):
+    """Real card t_4a1dcb17: card assigned to reviewer, reviewer run 6767 called
+    request_review -> implementer=reviewer, so approval run 6769 handed the
+    merge stage back to the reviewer (run 6770)."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="ship it", assignee="reviewer")
+        claimed = kb.claim_task(conn, tid)
+        assert kb.request_review(conn, tid, summary="looks fine", reviewer="reviewer",
+                                 expected_run_id=claimed.current_run_id)
+        rv = kb.claim_review_task(conn, tid)
+        ok, why = kb.approve_for_merge(conn, tid, summary="LGTM at abc",
+                                       expected_run_id=rv.current_run_id)
+        assert not ok and "merger" in why
+        assert kb.get_task(conn, tid).assignee == "reviewer"
+        ok, who = kb.approve_for_merge(conn, tid, summary="LGTM at abc",
+                                       expected_run_id=rv.current_run_id,
+                                       merger="software-engineer")
+        assert ok and who == "software-engineer"
