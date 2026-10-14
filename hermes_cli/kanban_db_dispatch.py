@@ -3201,12 +3201,14 @@ def _call_spawn_fn(spawn_fn, task: Task, workspace: str, board: Optional[str]) -
 def _design_phase_cfg() -> Optional[dict]:
     # Read from the root hermes home so every dispatcher process (any profile
     # gateway, CLI) applies the same board rule.
+    # hermes_yaml, not PyYAML: pyyaml is no longer a dependency, and the bare
+    # except below turned its ImportError into "guard off" (#29).
+    import hermes_yaml as yaml
+    from pathlib import Path
+    root = Path(os.environ.get("HERMES_ROOT_HOME") or Path.home() / ".hermes") / "config.yaml"
     try:
-        import yaml
-        from pathlib import Path
-        root = Path(os.environ.get("HERMES_ROOT_HOME") or Path.home() / ".hermes") / "config.yaml"
         cfg = ((yaml.safe_load(root.read_text()) or {}).get("kanban") or {}).get("design_phase") or {}
-    except Exception:
+    except FileNotFoundError:
         return None
     if not cfg or not cfg.get("enabled", True):
         return None
