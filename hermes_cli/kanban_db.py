@@ -4618,6 +4618,26 @@ def invalidate_descendants_for_parent_reopen(
     return {"invalidated": invalidated, "terminations": terminations}
 
 
+_BRIEF_LINE_PREFIXES = ("ACCEPTANCE:", "PROOF:")
+
+
+def _carry_brief_lines(old_body: str, new_body: str) -> str:
+    """Re-append ACCEPTANCE:/PROOF: lines from ``old_body`` that the rewritten
+    ``new_body`` dropped, so the dispatcher's design-phase brief gate (which
+    requires them) does not park a freshly specified card."""
+    new_low = (new_body or "").lower()
+    carried: list[str] = []
+    for prefix in _BRIEF_LINE_PREFIXES:
+        if prefix.lower() in new_low:
+            continue
+        for line in (old_body or "").splitlines():
+            if line.strip().upper().startswith(prefix):
+                carried.append(line.strip())
+    if not carried:
+        return new_body
+    return (new_body or "").rstrip("\n") + "\n\n" + "\n".join(carried)
+
+
 def specify_triage_task(
     conn: sqlite3.Connection, task_id: str, *, title: Optional[str] = None,
     body: Optional[str] = None, assignee: Optional[str] = None, author: Optional[str] = None,
@@ -4643,6 +4663,8 @@ def specify_triage_task(
             sets.append("title = ?")
             params.append(title.strip())
             changed_fields.append("title")
+        if body is not None:
+            body = _carry_brief_lines(existing["body"] or "", body)
         if body is not None and (body or "") != (existing["body"] or ""):
             sets.append("body = ?")
             params.append(body)

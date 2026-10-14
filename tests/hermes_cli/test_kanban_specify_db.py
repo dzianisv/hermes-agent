@@ -80,3 +80,26 @@ def test_specify_records_audit_comment_only_when_author_given(kanban_home):
     assert comments2 == []
 
 
+
+
+def test_specify_preserves_acceptance_and_proof_lines(kanban_home):
+    old = "rough\nACCEPTANCE: endpoint returns 200\nPROOF: curl output in comment"
+    with kbc.connect() as conn:
+        tid = _create_triage(conn, body=old)
+    with kbc.connect() as conn:
+        assert kb.specify_triage_task(conn, tid, body="**Goal**\nRewritten.", author="spec")
+        body = kb.get_task(conn, tid).body
+    assert body.startswith("**Goal**\nRewritten.")
+    assert "ACCEPTANCE: endpoint returns 200" in body
+    assert "PROOF: curl output in comment" in body
+
+
+def test_specify_keeps_new_acceptance_when_present(kanban_home):
+    old = "ACCEPTANCE: old\nPROOF: old proof"
+    with kbc.connect() as conn:
+        tid = _create_triage(conn, body=old)
+    with kbc.connect() as conn:
+        kb.specify_triage_task(conn, tid, body="Goal\nACCEPTANCE: new")
+        body = kb.get_task(conn, tid).body
+    assert "ACCEPTANCE: new" in body and "ACCEPTANCE: old" not in body
+    assert "PROOF: old proof" in body

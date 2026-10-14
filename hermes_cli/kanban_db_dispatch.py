@@ -3436,7 +3436,9 @@ def _design_phase_guard(conn: sqlite3.Connection, task_id: str, assignee: str) -
         marks = ",".join("?" * len(cfg["architects"]))
         row = conn.execute(
             f"SELECT 1 FROM task_runs WHERE task_id = ? AND profile IN ({marks}) "
-            "AND outcome IN ('completed', 'blocked') LIMIT 1",
+            # 'review_requested' = architect handed the design to the implementer
+            # (t_40c0ac33 bounced back to the architect without it, 2026-10-11).
+            "AND outcome IN ('completed', 'blocked', 'review_requested') LIMIT 1",
             (task_id, *sorted(cfg["architects"])),
         ).fetchone()
         ok = row is not None
