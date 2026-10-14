@@ -1854,6 +1854,14 @@ async def _async_profile_runtime_scope(profile_home: "Path"):
         yield
 
 
+def profile_store_scope(profile_home):
+    """Scope for a served profile's store; ``None`` = the launch profile (scoped once multiplexed)."""
+    if profile_home is not None:
+        return _async_profile_runtime_scope(profile_home)
+    from tui_gateway.launch_profile_policy import async_launch_profile_scope_if_multiplexed
+    return async_launch_profile_scope_if_multiplexed()
+
+
 def load_gateway_config_for_runner() -> "GatewayConfig":
     """Load gateway config for the process-level GatewayRunner. An UNSET ``multiplex_profiles`` is
     settled first by ``resolve_multiplex_mode`` (the default is on; the boot guard keeps a fleet that
@@ -4849,8 +4857,7 @@ def _start_gateway_housekeeping(
     if runner is not None and loop is not None:
         # Goals parked on a wait barrier (judge `wait`, goal tool wait_on*) resume once the barrier
         # lifts: the gateway has no CLI-style idle hook, so this tick is what wakes them.
-        from gateway.run_goal_wake import housekeeping_goal_barrier_wake
-        chores.append((1, "Goal barrier wake", lambda: housekeeping_goal_barrier_wake(runner, loop)))
+        chores.append((1, "Goal barrier wake", lambda: loop.call_soon_threadsafe(runner._start_heartbeat_poller)))
     chores += [
         (5, "Channel directory refresh", lambda: adapters and _housekeeping_channel_directory(adapters, loop)),
         (60, "Media cache cleanup", _housekeeping_media_caches),

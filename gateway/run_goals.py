@@ -151,13 +151,7 @@ class GatewayGoalsMixin:
             session_id = current
             watch[quick_key] = (source, session_id)
         adapter = self._delivery_adapter_for(source)
-        if adapter is None or not adapter._message_handler:
-            return
-        if (
-            self._is_session_running(quick_key)
-            or quick_key in adapter._active_sessions
-            or self._queue_depth(quick_key, adapter=adapter) > 0
-        ):
+        if not self._lane_free(quick_key, adapter):
             return  # keep missed intervals due until user work has drained
         from agent.estop import check_paused
 
@@ -512,18 +506,10 @@ class GatewayGoalsMixin:
         store — a ``/loop`` set from a secondary profile's chat would never fire. Every served
         profile's store is scanned under its own runtime scope (same shape as ``_handoff_watcher``),
         and each hit is fired against that profile's adapters."""
-        from gateway.run import _async_profile_runtime_scope, _handoff_watch_scopes
+        from gateway.run import _handoff_watch_scopes, profile_store_scope as _scope
         from gateway.run_idle_gates import profile_has_active_loop
         await asyncio.sleep(5)  # let platforms finish connecting
         warned_no_route: set = set()
-
-        def _scope(profile_home):
-            # profile_home None = the launch profile's own store; once the process multiplexes it
-            # binds its own scope instead of running on ambient env (see _scope_or_null).
-            if profile_home is not None:
-                return _async_profile_runtime_scope(profile_home)
-            from tui_gateway.launch_profile_policy import async_launch_profile_scope_if_multiplexed
-            return async_launch_profile_scope_if_multiplexed()
 
         async def _scan_one_store(profile_name: Optional[str]) -> None:
             from hermes_cli.loops import list_active_loops

@@ -15,7 +15,7 @@ import sys
 import time
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -88,6 +88,10 @@ class _Runner:
 
     def _queue_depth(self, key, *, adapter=None):
         return 1 if key in self.adapter._pending_messages else 0
+
+    def _lane_free(self, key, adapter):
+        from gateway.run_busy import GatewayBusySessionMixin
+        return GatewayBusySessionMixin._lane_free(self, key, adapter)
 
     def _profile_scope_for_source(self, source):
         return contextlib.nullcontext()
@@ -229,13 +233,13 @@ def test_housekeeping_tick_registers_the_wake_chore():
     def fake_wait(stop_event, interval, queue_watch, chore_fn):
         stop_event.set()
 
+    loop, runner = MagicMock(), MagicMock()
     with patch("gateway.run_delivery_queue_watch.wait_for_next_tick", fake_wait), \
-         patch("gateway.run._housekeeping_chore", lambda label, fn: captured.setdefault(label, fn)), \
-         patch("gateway.run_goal_wake.housekeeping_goal_barrier_wake") as wake:
-        gateway_run._start_gateway_housekeeping(threading.Event(), adapters={}, loop=object(), runner=object())
+         patch("gateway.run._housekeeping_chore", lambda label, fn: captured.setdefault(label, fn)):
+        gateway_run._start_gateway_housekeeping(threading.Event(), adapters={}, loop=loop, runner=runner)
     assert "Goal barrier wake" in captured
     captured["Goal barrier wake"]()
-    assert wake.call_count == 1
+    loop.call_soon_threadsafe.assert_called_once_with(runner._start_heartbeat_poller)
 
 
 class TestIdleActiveWake:

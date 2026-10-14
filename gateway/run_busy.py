@@ -121,6 +121,13 @@ class GatewayBusySessionMixin:
             depth += 1
         return depth
 
+    def _lane_free(self, session_key: str, adapter: Any) -> bool:
+        """True when a synthetic wake may enter: handler wired, no running turn, nothing queued."""
+        return bool(adapter is not None and getattr(adapter, "_message_handler", None)
+                    and not self._is_session_running(session_key)
+                    and session_key not in (getattr(adapter, "_active_sessions", None) or ())
+                    and self._queue_depth(session_key, adapter=adapter) == 0)
+
     def _rescue_orphaned_overflow(self, session_key: str, adapter: Any) -> Optional["MessageEvent"]:
         """Pop the oldest orphaned FIFO overflow event for an idle session (None if nothing to rescue).
 
