@@ -109,3 +109,19 @@ def test_reviewer_run_handoff_never_records_reviewer_as_implementer(kanban_home)
                                        expected_run_id=rv.current_run_id,
                                        merger="software-engineer")
         assert ok and who == "software-engineer"
+
+
+def test_reviewer_escalation_keeps_original_implementer(kanban_home):
+    """Real card t_49877950: engineer run 6895 requested review; reviewer run
+    6896 re-requested review to agentpod-ceo (event 182802) and was recorded as
+    implementer, so the CEO's changes went to the reviewer, not the engineer."""
+    with kb.connect() as conn:
+        tid = _to_review(conn)
+        rv = kb.claim_review_task(conn, tid)
+        assert kb.request_review(conn, tid, summary="needs CEO call", reviewer="agentpod-ceo",
+                                 expected_run_id=rv.current_run_id)
+        ceo = kb.claim_review_task(conn, tid)
+        ok, who = kb.request_changes(conn, tid, reason="rework X",
+                                     expected_run_id=ceo.current_run_id)
+        assert ok and who == "software-engineer"
+        assert kb.get_task(conn, tid).assignee == "software-engineer"

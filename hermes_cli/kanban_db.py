@@ -4031,11 +4031,17 @@ def request_review(
             # implementer is worse than recording nothing: request_changes()
             # routes on this field, and it already refuses a handoff that
             # carries no implementer provenance.
+            # A review-stage run re-requesting review (escalation) is not the
+            # implementer: keep the one recorded by the original handoff.
             implementer = None
-            if trow["current_run_id"] is not None:
+            run_id = trow["current_run_id"]
+            if run_id is not None and _json_dict(_row_get(_latest_event(
+                    conn, task_id, "claimed", run_id), "payload")).get("source_status") == "review":
+                implementer = _nonblank_str(_json_dict(_row_get(_latest_event(
+                    conn, task_id, "review_requested"), "payload")).get("implementer"))
+            elif run_id is not None:
                 arow = conn.execute(
-                    "SELECT profile FROM task_runs WHERE id = ?",
-                    (trow["current_run_id"],),
+                    "SELECT profile FROM task_runs WHERE id = ?", (run_id,),
                 ).fetchone()
                 implementer = arow["profile"] if arow else None
             if implementer is None:
