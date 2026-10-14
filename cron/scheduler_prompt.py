@@ -94,7 +94,8 @@ def _clip_to_context_budget(text: str) -> str:
 
 def _inject_context_from(job: dict, prompt: str) -> tuple[str, bool]:
     """Prepend the latest output of each ``context_from`` job; returns ``(prompt, injected)``."""
-    context_from = job.get("context_from")
+    # facts_hash jobs only wake on changed facts; without the last report they cannot say what changed.
+    context_from = job.get("context_from") or (["self"] if job.get("facts_hash") else None)
     if not context_from:
         return prompt, False
     from cron.jobs import get_cron_output_dir

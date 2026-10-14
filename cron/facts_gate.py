@@ -3,7 +3,10 @@
 Opt-in per job with ``facts_hash: true``. The job's existing pre-run ``script`` output (success
 or failure text, exactly what the agent would see) is the "facts". Volatile fragments (clocks,
 ages) can be stripped before hashing with ``facts_ignore``: a list of regexes, each match
-removed. If the hash equals ``facts_state.last_hash`` — the hash of the last run that completed
+removed. A script whose output also carries churn (counters, board listings) can print a
+``FACTS:`` line ... ``END FACTS`` line block; then only that block is hashed and the rest is
+context for the agent. A facts_hash job also gets its previous delivered report injected (same
+path as ``context_from: self``) so a changed tick reports the difference, not the whole state. If the hash equals ``facts_state.last_hash`` — the hash of the last run that completed
 and delivered (or deliberately stayed silent) — the tick is skipped with no LLM call and no
 delivery. The hash is stored only after a successful run, so a failed run or failed delivery
 retries the same facts next tick. A manual run (``cronjob run`` / ``hermes cron run``) always
@@ -31,8 +34,14 @@ def is_manual_run(job: dict, extra_prompt: Optional[str]) -> bool:
     return bool(extra_prompt) or bool(job.get("manual_run_at"))
 
 
+_FACTS_BLOCK = re.compile(r"^FACTS:\s*$(.*?)^END FACTS\s*$", re.M | re.S)
+
+
 def facts_hash(output: str, ignore: Optional[list] = None) -> str:
     text = output or ""
+    block = _FACTS_BLOCK.search(text)
+    if block:
+        text = block.group(1)
     for pattern in ignore or []:
         try:
             text = re.sub(pattern, "", text)

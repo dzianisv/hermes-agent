@@ -112,3 +112,27 @@ def test_job_without_flag_unchanged(hermes_env, monkeypatch):
     after = _fire(job["id"], monkeypatch, [])
     assert observed["agent_runs"] == 2
     assert "facts_state" not in after
+
+
+def test_facts_block_hashes_only_the_declared_section():
+    from cron.facts_gate import facts_hash
+
+    a = "FACTS:\ntenant 8788 failed\nEND FACTS\n== board ==\nt_1 ready 3 cards"
+    b = "FACTS:\ntenant 8788 failed\nEND FACTS\n== board ==\nt_2 running 5 cards"
+    c = "FACTS:\ntenant 9999 failed\nEND FACTS\n== board ==\nt_1 ready 3 cards"
+    assert facts_hash(a) == facts_hash(b), "churn outside the FACTS block must not change the hash"
+    assert facts_hash(a) != facts_hash(c)
+    assert facts_hash("no block x") != facts_hash("no block y"), "no block = whole output"
+
+
+def test_facts_hash_job_gets_previous_report_without_context_from(hermes_env):
+    from cron.jobs import get_cron_output_dir
+    from cron.scheduler_prompt import _inject_context_from
+
+    job = {"id": "abc123", "facts_hash": True}
+    out = get_cron_output_dir() / "abc123"
+    out.mkdir(parents=True)
+    (out / "1.md").write_text("# Cron Job: x\n\n## Response\n\ntenant 8788 failed (reported)\n")
+    prompt, injected = _inject_context_from(job, "PROMPT")
+    assert injected and "tenant 8788 failed (reported)" in prompt
+    assert _inject_context_from({"id": "abc123"}, "PROMPT") == ("PROMPT", False)
