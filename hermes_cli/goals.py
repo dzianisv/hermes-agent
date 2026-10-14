@@ -440,7 +440,9 @@ class GoalState:
         floats = {k: float(data.get(k) or 0.0) for k in ("created_at", "last_turn_at", "waiting_until", "waiting_since")}
         return cls(
             goal=data.get("goal", ""),
-            status=data.get("status", "active"),
+            # Read newer writers conservatively without adopting their lifecycle policy.
+            status={"waiting": "paused", "cancelled": "cleared"}.get(
+                data.get("status"), data.get("status", "active")),
             max_turns=int(data.get("max_turns") or DEFAULT_MAX_TURNS),
             last_verdict=data.get("last_verdict"),
             last_reason=data.get("last_reason"),
@@ -668,7 +670,7 @@ def migrate_goal_to_session(old_session_id: str, new_session_id: str, *, reason:
         return False
     try:
         state = load_goal(old_session_id)
-        if state is None or state.status == "cleared":
+        if state is None or state.status not in {"active", "paused"}:
             return False
         # Don't clobber a goal already set on the child (e.g. a resumed lineage).
         if load_goal(new_session_id) is not None:

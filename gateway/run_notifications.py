@@ -327,6 +327,11 @@ class GatewayNotificationsMixin:
                 session_entry.session_key, target_session_id,
             )
             return None
+        from hermes_cli.goals import migrate_goal_to_session
+        await asyncio.to_thread(
+            migrate_goal_to_session, prior_session_id, target_session_id,
+            reason="delegation re-pin",
+        )
         logger.info(
             "Pinned async-delegation completion to owning session %s (was %s) for routing key %s (#57498)",
             target_session_id, prior_session_id, session_entry.session_key,

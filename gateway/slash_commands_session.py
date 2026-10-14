@@ -894,6 +894,8 @@ class GatewaySessionCommandsMixin:
         new_entry = await self.async_session_store.switch_session(session_key, target_id)
         if not new_entry:
             return t("gateway.resume.switch_failed")
+        from hermes_cli.goals import clear_goal
+        await asyncio.to_thread(clear_goal, current_entry.session_id)
         # Conversation boundary: all conversation-scoped state + security state in one funnel call.
         # Conversation boundary: clear ALL conversation-scoped per-session state (model/reasoning overrides
         # #10702, one-turn restores, model notes, last-resolved cache #58403, /queue overflow) + security
@@ -1069,6 +1071,9 @@ class GatewaySessionCommandsMixin:
         new_entry = await self.async_session_store.switch_session(dest_key, new_session_id)
         if not new_entry:
             return t("gateway.branch.switch_failed")
+        if in_place:
+            from hermes_cli.goals import clear_goal
+            await asyncio.to_thread(clear_goal, current_entry.session_id)
         self._clear_session_boundary_security_state(dest_key)
         self._evict_cached_agent(dest_key)
         msg_count = len([m for m in history if m.get("role") == "user"])

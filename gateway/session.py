@@ -1133,6 +1133,8 @@ class SessionStore(
             create_kwargs=db_create_kwargs, origin=old_entry.origin,
             display_name=new_entry.display_name, during=" during reset",
         )
+        from hermes_cli.goals import clear_goal
+        clear_goal(old_entry.session_id)
         return new_entry
 
     def _replace_route_locked(self, session_key, old_entry, session_id, now, **fields) -> SessionEntry:

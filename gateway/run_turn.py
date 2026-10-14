@@ -498,6 +498,11 @@ class GatewayTurnMixin:
                 session_key, bound_session_id, expected_session_id=session_entry.session_id,
             )
             if switched is not None:
+                from hermes_cli.goals import migrate_goal_to_session
+                await asyncio.to_thread(
+                    migrate_goal_to_session, session_entry.session_id, bound_session_id,
+                    reason="compression-tip walk",
+                )
                 session_entry = switched
         if bound_session_id and bound_session_id != stored_session_id:
             # The stored binding pointed at a parent: rewrite it to the canonical descendant.
