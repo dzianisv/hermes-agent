@@ -664,7 +664,7 @@ class _KanbanNotification:
         session is handed off (Telegram -> Slack) that lane is stale: waking it posted the card's
         progress bubbles into Telegram and held the session's turn lease against the live Slack lane.
         One wake source per session: redirect to the routing entry on ``handoff_platform``."""
-        from gateway.run_goal_wake import handoff_lane_ok
+        from gateway.handoff_lane import handoff_lane_ok
         sid = self.session_key or getattr(self.task, "session_id", None) or ""
         store = getattr(self.runner, "session_store", None)
         if not sid or store is None:

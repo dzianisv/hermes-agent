@@ -27,7 +27,7 @@ async def restore_heartbeat_watches(runner) -> None:
     Run all storage work off-loop so a cold profile DB cannot block adapters.
     """
     from gateway.run import _profile_runtime_scope
-    from gateway.run_goal_wake import handoff_lane_ok
+    from gateway.handoff_lane import handoff_lane_ok
     from gateway.run_idle_gates import profile_has_active_heartbeat
     from hermes_cli.heartbeat import HeartbeatManager
     from hermes_constants import get_hermes_home
