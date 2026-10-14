@@ -10,6 +10,15 @@ def _origin_platform(origin: Any) -> str:
     return str(getattr(plat, "value", plat) or "").lower()
 
 
+def live_lanes(store) -> dict:
+    """session_id -> newest unsuspended routing entry with an origin (store lists newest first)."""
+    lanes: dict = {}
+    for e in store.list_sessions():
+        if e.session_id and e.origin is not None and not getattr(e, "suspended", False):
+            lanes.setdefault(e.session_id, e)
+    return lanes
+
+
 def handoff_lane_ok(runner, session_id: str, entry: Any, store: Any) -> Any:
     """Return the routing entry that owns ``session_id``'s current lane.
 

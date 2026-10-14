@@ -108,6 +108,10 @@ class _Runner:
         from gateway.run_goals import GatewayGoalsMixin as GoalsMixin
         return GoalsMixin._synthetic_prompt_event(source, text, internal=internal)
 
+    async def _inject_owned_prompt(self, *args, **kwargs):
+        from gateway.run_goals import GatewayGoalsMixin as GoalsMixin
+        return await GoalsMixin._inject_owned_prompt(self, *args, **kwargs)
+
 
 def _entry(sid: str, chat: str = "c1"):
     source = SessionSource(platform="telegram", chat_id=chat, user_id="u1", chat_type="dm")

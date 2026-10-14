@@ -163,7 +163,7 @@ class GatewayGoalsMixin:
         if not mgr.has_heartbeat():
             watch.pop(quick_key, None)
             return
-        from gateway.session_wake import claim, release, stamp, track
+        from gateway.session_wake import claim, release
         token = await self._run_in_executor_with_context(lambda: claim(session_id, "heartbeat"))
         if not token:
             return
@@ -171,20 +171,25 @@ class GatewayGoalsMixin:
         if not prompt:
             release(session_id, token)
             return
-        event = self._synthetic_prompt_event(source, prompt)
-        stamp(event, session_id, token)
-        event.metadata["gateway_session_key"] = quick_key
-        event._heartbeat_execution_started = False
-        event._heartbeat_manager = mgr
         # Provenance read by display_kind_for_event / the turn's quiet surfaces; the event stays
         # non-internal so authorization and the emergency stop still apply.
-        event._heartbeat_session_id = session_id
-        # A pinned route skips topic recovery: no await between the idle
-        # check and adapter claim. FIFO alone never wakes an idle session.
+        await self._inject_owned_prompt(adapter, source, quick_key, session_id, token, prompt,
+                                        _heartbeat_execution_started=False, _heartbeat_manager=mgr,
+                                        _heartbeat_session_id=session_id)
+
+    async def _inject_owned_prompt(self, adapter, source, key, session_id, token, prompt, **attrs):
+        """Feed a synthetic prompt holding the session_wake owner token into ``adapter``. A pinned
+        route skips topic recovery: no await between the idle check and adapter claim."""
+        from gateway.session_wake import stamp, track
+        event = self._synthetic_prompt_event(source, prompt)
+        stamp(event, session_id, token)
+        event.metadata["gateway_session_key"] = key
+        for name, value in attrs.items():
+            setattr(event, name, value)
         try:
             await adapter.handle_message(event)
         finally:
-            track(adapter, quick_key, event)
+            track(adapter, key, event)
 
     def _start_heartbeat_poller(self) -> None:
         """Start the single gateway-wide heartbeat poll task (idempotent)."""

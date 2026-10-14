@@ -57,6 +57,20 @@ def claim(session_id, kind, *, revision=None):
     return _db()._execute_write(apply)
 
 
+def claim_goal(session_id, idle):
+    """(continuation prompt, owner token) for a goal the gateway may wake now, else None.
+    ``is_waiting()`` clears a lifted barrier (once per barrier); idle wakes are throttled per window."""
+    from hermes_cli.goals import GoalManager
+    mgr = GoalManager(session_id)
+    if mgr.is_waiting() or (idle and not mgr.state_is_idle_stalled()):
+        return None
+    if idle:
+        mgr.touch_last_turn()
+    prompt = mgr.next_continuation_prompt()
+    token = prompt and claim(session_id, "goal", revision=mgr.state.revision)
+    return (prompt, token) if token else None
+
+
 def release(session_id, token):
     from hermes_cli.goal_controller import _db
     def apply(conn):
