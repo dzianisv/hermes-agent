@@ -153,3 +153,27 @@ class TestNamedProfileMultiplexerGuard:
         assert gw.named_profile_served_by_running_multiplexer() is False
 
 
+
+
+def test_per_profile_gateway_ticks_only_its_own_store_a_b_a(tmp_path, monkeypatch):
+    """A ``--profile X`` gateway (not multiplexing) must tick ONLY its own home, never sibling
+    profiles' stores (a stale per-profile gateway ran another profile's jobs on old code).
+    Switching HERMES_HOME A -> B -> A re-resolves the owned set each time."""
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    root = tmp_path / ".hermes"
+    homes = {}
+    for name in ("alpha", "beta"):
+        homes[name] = root / "profiles" / name
+        homes[name].mkdir(parents=True)
+        (homes[name] / "config.yaml").write_text("{}\n")
+
+    import gateway.run as gateway_run
+
+    cfg = GatewayConfig(multiplex_profiles=False)
+    for name in ("alpha", "beta", "alpha"):
+        monkeypatch.setenv("HERMES_HOME", str(homes[name]))
+        assert gateway_run._cron_tick_profile_homes(cfg) == [(name, homes[name])]
+
+    # The host (default-home) gateway still covers every gateway-less profile.
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    assert [n for n, _ in gateway_run._cron_tick_profile_homes(cfg)] == ["default", "alpha", "beta"]

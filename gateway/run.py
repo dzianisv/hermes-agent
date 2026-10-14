@@ -1692,8 +1692,16 @@ def _cron_tick_profile_homes(config: object) -> list[tuple[str, "Path"]]:
     already skips ``active``."""
     from hermes_cli.profiles import get_active_profile_name, get_profile_dir
 
-    homes = _multiplex_profile_homes(config)
     active = get_active_profile_name() or "default"  # launch profile, pre-identity (ticker boot)
+    if active != "default" and not getattr(config, "multiplex_profiles", False):
+        # A per-profile gateway (``--profile X``, not multiplexing) owns ONLY its own store.
+        # Ticking every profile let a stale per-profile gateway run other profiles' jobs on its
+        # old code; the host (default-home) gateway is the one that covers gateway-less profiles.
+        try:
+            return [(active, get_profile_dir(active))]
+        except Exception:
+            return []
+    homes = _multiplex_profile_homes(config)
     if any(name == active for name, _home in homes):
         return homes
     try:
