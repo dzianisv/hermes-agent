@@ -1374,8 +1374,11 @@ def heartbeat_worker(
     now = int(time.time())
     held = int(expected_run_id) if expected_run_id is not None else None
     with _kb.write_txn(conn):
-        sql = "UPDATE tasks SET last_heartbeat_at = ? WHERE id = ? AND status = 'running'"
-        params: tuple = (now, task_id)
+        # A heartbeat renews the lease (row #30: run 6854 was reclaimed 21 min after its last beat).
+        expires = now + _kb._resolve_claim_ttl_seconds()
+        sql = ("UPDATE tasks SET last_heartbeat_at = ?, claim_expires = MAX(COALESCE(claim_expires, 0), ?) "
+               "WHERE id = ? AND status = 'running'")
+        params: tuple = (now, expires, task_id)
         if expected_run_id is not None:
             sql += " AND current_run_id = ?"
             params += (int(expected_run_id),)
