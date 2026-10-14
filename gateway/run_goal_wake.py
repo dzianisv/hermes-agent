@@ -20,8 +20,8 @@ async def wake_lifted_goal_barriers(runner) -> int:
                 rows += [(r[0], True) for r in await run(list_idle_active_goals)]
                 lanes = live_lanes(store) if rows else {}
                 for sid, idle in rows:  # sid not in lanes = CLI/TUI goal: its own idle hook drives it
+                    lane, ok = handoff_lane_ok(runner, sid, lanes[sid], store) if sid in lanes else (None, False)
                     try:
-                        lane, ok = handoff_lane_ok(runner, sid, lanes[sid], store) if sid in lanes else (None, False)
                         if not (source := ok and runner._restored_source(lane)):
                             continue
                         source.profile = getattr(source, "profile", None) or name or None
