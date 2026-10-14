@@ -2,7 +2,7 @@
 
 Muse semantics: waiting on CI / a review / a background process / a subagent is itself a work
 item (poll it, review the diff, prepare the next requirement). So for ``source="agent"`` goals any
-wait barrier is capped at ``goals.max_wait_seconds`` (default 300) and the continuation that
+wait barrier holds until the named thing changes (no age cap) and the continuation that
 resumes after a barrier lifted opens with the "wait has elapsed" kick. User-typed goals keep
 their judge-chosen wait and their verbatim continuation template.
 """
@@ -44,29 +44,25 @@ def _judge_wait(seconds: int, reason: str):
 
 
 class TestAgentGoalWaitCap:
-    def test_cap_reads_goals_max_wait_seconds(self, hermes_home):
-        mgr = _agent_goal("agent-wait-cfg")
-        with patch("hermes_cli.config.load_config", return_value={"goals": {"max_wait_seconds": 42}}):
-            before = time.time()
-            mgr.wait_for_seconds(900, reason="review pending")
-        assert mgr.state.waiting_until - before <= 43
-
-    def test_shorter_waits_are_not_lengthened(self, hermes_home):
-        mgr = _agent_goal("agent-wait-short")
+    def test_agent_timed_wait_is_not_shortened(self, hermes_home):
+        mgr = _agent_goal("agent-wait-long")
         before = time.time()
-        mgr.wait_for_seconds(30, reason="backoff")
-        assert mgr.state.waiting_until - before <= 31
+        mgr.wait_for_seconds(900, reason="review pending")
+        assert mgr.state.waiting_until - before > 890 and mgr.is_waiting()
 
-    def test_pid_barrier_on_agent_goal_lifts_after_cap_even_if_pid_lives(self, hermes_home):
+    def test_agent_pid_wait_holds_until_the_pid_changes(self, hermes_home):
         import os
+        import subprocess
 
         mgr = _agent_goal("agent-wait-pid")
         mgr.wait_on(os.getpid(), reason="subagent running")
-        assert mgr.is_waiting() is True
-        mgr.state.waiting_since = time.time() - goals.DEFAULT_MAX_WAIT_SECONDS - 5
+        mgr.state.waiting_since = time.time() - 24 * 3600   # age alone never lifts it
         mgr._save()
-        assert mgr.is_waiting() is False
-        assert mgr.state.waiting_on_pid is None
+        assert mgr.is_waiting() is True
+        p = subprocess.Popen(["true"]); p.wait()
+        mgr.state.waiting_on_pid = p.pid   # an exited process: the thing changed
+        mgr._save()
+        assert mgr.is_waiting() is False and mgr.state.waiting_on_pid is None
 
     def test_user_goal_wait_is_unchanged(self, hermes_home):
         mgr = goals.GoalManager("user-wait")

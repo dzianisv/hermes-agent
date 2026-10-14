@@ -49,7 +49,7 @@ DEFAULT_MAX_CONSECUTIVE_PARSE_FAILURES = 3
 # 300 continuations in 30 minutes against a model that kept answering NO_REPLY.
 DEFAULT_MAX_CONSECUTIVE_SILENT_TURNS = 5  # after this many, stop doubling and hold at the max backoff
 SILENT_TURN_BACKOFF_BASE_S = 60
-SILENT_TURN_BACKOFF_MAX_S = 1800  # ceiling for backoff parks (exempt from goals.max_wait_seconds); never paused for silence
+SILENT_TURN_BACKOFF_MAX_S = 1800  # ceiling for backoff parks; never paused for silence
 _SILENCE_MARKERS = frozenset({"NO_REPLY", "NO REPLY", "[SILENT]", "SILENT"})
 
 
@@ -73,11 +73,6 @@ _TRANSIENT_ALIASES = {"transient", "self_resolvable", "self-resolvable", "retrya
 # Hours a loop-parked goal (blocked / budget / judge failure — NOT an explicit /goal pause) keeps
 # the session's goal slot before a new agent declaration may replace it (``goals.parked_release_hours``).
 DEFAULT_PARKED_RELEASE_HOURS = 24.0
-# Longest a judge/tool wait barrier may park an AGENT-declared goal (``goals.max_wait_seconds``).
-# Muse semantics: waiting on CI / review / a background process / a subagent is itself a work item
-# (poll it, review the diff, prepare the next requirement), so an agent goal sleeps briefly and
-# wakes with a "check what you were waiting on" kick. User-typed goals keep the judge's full wait.
-DEFAULT_MAX_WAIT_SECONDS = 300
 # An ACTIVE goal with no barrier and no turn for this long is idle-stalled (the agent's last turn
 # ended without a continuation being injected — e.g. a judge "wait" that set no barrier, a
 # gateway restart mid-turn, a dropped FIFO). The barrier-wake chore re-pokes it like a lifted
@@ -1036,20 +1031,6 @@ def parked_release_hours() -> float:
     return DEFAULT_PARKED_RELEASE_HOURS
 
 
-def max_wait_seconds() -> int:
-    """``goals.max_wait_seconds``: the cap on any wait barrier set on an AGENT-declared goal.
-    0 / negative / garbage → default (never "no cap")."""
-    try:
-        from hermes_cli.config import load_config
-
-        value = int((load_config().get("goals") or {}).get("max_wait_seconds", DEFAULT_MAX_WAIT_SECONDS))
-        if value > 0:
-            return value
-    except Exception:
-        pass
-    return DEFAULT_MAX_WAIT_SECONDS
-
-
 def max_stalled_turns() -> int:
     """``goals.max_stalled_turns``: consecutive no-progress turns before a goal stops."""
     try:
@@ -1901,20 +1882,16 @@ class GoalManager:
     def _park(self, reason: str, *, uncapped: bool = False, **barrier) -> GoalState:
         state = self._require_active()
         state.clear_wait()
-        if state.source == "agent" and barrier.get("waiting_until") and not uncapped:
-            # Agent goal: a timed wait sleeps at most ``goals.max_wait_seconds``.
-            cap = time.time() + max_wait_seconds()
-            barrier["waiting_until"] = min(float(barrier["waiting_until"]), cap)
         for k, v in barrier.items():
             setattr(state, k, v)
         state.waiting_reason = (reason or "").strip() or None
         state.waiting_since = time.time()
         return self._save()
 
-    def _barrier_age_cap_s(self, state: GoalState) -> int:
-        """How long a pid/session barrier may hold before judging resumes regardless: the agent-goal
-        wait cap for agent goals, the generous stuck-poller cap for user goals."""
-        return max_wait_seconds() if state.source == "agent" else _MAX_BARRIER_WAIT_S
+    def _barrier_age_cap_s(self, state: GoalState) -> Optional[int]:
+        """Stuck-poller cap for USER goals. An agent's goal wait names its barrier and resumes only
+        when that barrier changes (process exits/fires, deadline passes, user replies)."""
+        return None if state.source == "agent" else _MAX_BARRIER_WAIT_S
 
     @command
     def wait_on(self, pid: int, reason: str = "") -> GoalState:
@@ -2044,7 +2021,7 @@ class GoalManager:
         else:
             return False
         age_cap = self._barrier_age_cap_s(s)
-        if still and s.waiting_since and s.waiting_until == 0.0 and time.time() - s.waiting_since > age_cap:
+        if age_cap and still and s.waiting_since and s.waiting_until == 0.0 and time.time() - s.waiting_since > age_cap:
             logger.info("goal %s: wait barrier on %s exceeded %ds; resuming judging",
                         self.session_id, s.waiting_on_session or s.waiting_on_pid, age_cap)
             still = False
@@ -2094,7 +2071,6 @@ class GoalManager:
                 return None
         else:
             parked_state = self.wait_for_seconds(int(wait_directive["seconds"]), reason=reason, on_delegations=active_delegations)
-            # Agent goals are capped (goals.max_wait_seconds): report the real sleep, not the ask.
             tgt = f"{max(0, math.ceil(parked_state.waiting_until - time.time()))}s"
         # Wait verdicts are loop bookkeeping, not news: the park shows in logs / ``/goal``. Surfacing them
         # on every self-wake ("⏳ Goal parked (judge) — waiting on 300s" every few minutes) is the chat

@@ -1389,10 +1389,6 @@ DEFAULT_CONFIG = {
         # goal slot before the agent may declare a new goal over it (the old one is archived under
         # goal_archive:<session>:<ts>). A goal you paused with /goal pause is never replaced.
         "parked_release_hours": 24,
-        # Longest a judge/tool `wait` may park an AGENT-declared goal (seconds). Waiting on CI, a
-        # review, a background process or a subagent is itself work: the goal sleeps at most this
-        # long, then resumes with "check what you were waiting on". User-typed goals are uncapped.
-        "max_wait_seconds": 300,
     },
     # Loops — /loop re-runs a prompt or slash command on a cadence in-session. Fixed interval fires
     # on the user's clock; self-paced (no interval) starts at the floor and backs off exponentially
