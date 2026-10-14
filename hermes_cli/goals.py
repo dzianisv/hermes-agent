@@ -830,7 +830,7 @@ def _parse_judge_response(raw: str) -> Tuple[str, str, bool, Optional[Dict[str, 
     if verdict == "blocked":
         # Preserve metadata in the existing directive slot; WAIT alone interprets wait targets.
         return verdict, reason, False, {
-            key: str(data.get(key) or "").strip()
+            key: (data[key].strip() if isinstance(data.get(key), str) else None)
             for key in ("blocker", "human_category", "human_decision")
         }
     if verdict != "wait":
@@ -1601,9 +1601,9 @@ class GoalManager:
         # failure/stall/budget guards as ordinary continuation. Missing or conflicting
         # classification stays paused; a corrective prompt never grants authorization.
         transient = verdict == "blocked" and bool(wait_directive) and (
-            wait_directive.get("blocker", "").lower() == "transient"
-            and not wait_directive.get("human_category")
-            and not wait_directive.get("human_decision")
+            (wait_directive.get("blocker") or "").lower() == "transient"
+            and wait_directive.get("human_category") == ""
+            and wait_directive.get("human_decision") == ""
         )
         if verdict == "blocked" and not transient:
             return self._pause_decision(

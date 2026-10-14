@@ -143,6 +143,28 @@ def test_stall_pause_cannot_overwrite_concurrent_boundary(db, monkeypatch, mutat
     assert current.goal == ("G2" if mutation == "replace" else "G1")
     assert current.status == {"clear": "cleared", "pause": "paused", "replace": "active"}[mutation]
 
+@pytest.mark.parametrize("extra", [
+    {}, {"human_category": False, "human_decision": False},
+    {"human_category": None, "human_decision": None},
+    {"human_category": 0, "human_decision": []},
+    {"human_category": "", "human_decision": False},
+    {"human_category": None, "human_decision": ""},
+])
+def test_malformed_human_metadata_is_unknown_and_pauses(db, monkeypatch, extra):
+    payload = {"verdict": "blocked", "reason": "incomplete classification", "blocker": "transient", **extra}
+    reply(monkeypatch, payload)
+    manager = goals.GoalManager("s")
+    manager.set("work")
+    result = manager.evaluate_after_turn("clarification")
+    assert result["status"] == "paused"
+    assert result["verdict"] == "blocked"
+    assert result["should_continue"] is False
+    assert result["continuation_prompt"] is None
+    parsed = goals.judge_goal("work", "clarification")[3]
+    for key in ("human_category", "human_decision"):
+        assert parsed[key] == (extra[key].strip() if isinstance(extra.get(key), str) else None)
+
+
 def test_blocked_metadata_keeps_human_decision_text(db, monkeypatch):
     payload = {"verdict": "blocked", "reason": "Needs consent", "blocker": "human",
                "human_category": "money", "human_decision": "Approve USD 100 for Project X"}
