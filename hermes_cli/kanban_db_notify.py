@@ -445,13 +445,23 @@ def _resolve_notify_target() -> Optional[dict[str, Any]]:
     every CLI/ACP invocation and would auto-subscribe every CLI run."""
     from gateway.session_context import get_session_env as env
     platform, chat_id = env("HERMES_SESSION_PLATFORM", ""), env("HERMES_SESSION_CHAT_ID", "")
+    chat_type = env("HERMES_SESSION_CHAT_TYPE", "") or None
+    thread_id = env("HERMES_SESSION_THREAD_ID", "") or None
+    if (not platform or not chat_id) and env("HERMES_CRON_SESSION", ""):
+        # A cron run reports to the conversation it delivers to (cron clears HERMES_SESSION_*);
+        # deliver=local has no conversation, so the card gets no origin.
+        platform = env("HERMES_CRON_AUTO_DELIVER_PLATFORM", "")
+        chat_id = env("HERMES_CRON_AUTO_DELIVER_CHAT_ID", "")
+        if not platform or not chat_id:
+            return None
+        thread_id = env("HERMES_CRON_AUTO_DELIVER_THREAD_ID", "") or None
+        # Telegram private chats have positive ids; groups/channels are negative.
+        chat_type = "dm" if platform == "telegram" and not chat_id.startswith("-") else None
     if not platform or not chat_id:
         session_key = env("HERMES_SESSION_KEY", "") or os.environ.get("HERMES_SESSION_KEY", "")
         if not session_key:
             return None
         platform, chat_id = "tui", session_key
-    chat_type = env("HERMES_SESSION_CHAT_TYPE", "") or None
-    thread_id = env("HERMES_SESSION_THREAD_ID", "") or None
     message_id = env("HERMES_SESSION_MESSAGE_ID", "") or ""
     notifier_profile = env("HERMES_SESSION_PROFILE", "")
     if not notifier_profile:
