@@ -7,21 +7,20 @@ Two halves, one plugin (both gateways load it):
    gateway): `kanban_task_blocked` / `kanban_task_completed` -> HMAC-signed POST
    to the default gateway's webhook route `kanban-wake`.
 
-2. Redirector (runs in the default gateway that owns the Telegram session):
-   `pre_gateway_dispatch` sees the inbound webhook MessageEvent for route
-   `kanban-wake`, SKIPs the detached webhook agent, and instead schedules the
-   event text as an inbound user-role turn in the configured supervisor
-   session (`kanban_wake.session_key`). The supervisor session therefore wakes
-   with full context and replies in the same chat. Falls back to the
-   detached webhook agent if injection is impossible (so the wake never drops).
+2. Redirector (default gateway): `pre_gateway_dispatch` intercepts the webhook turn and
+   delivers it ONLY to the conversation the card was created in, read from the card's
+   `kanban_notify_subs` rows (written at creation: the chat session, inherited from the
+   creating card, or the creating cron job's deliver target). Wake-mode origins are
+   already woken by core's kanban notifier, so the redirector skips them. A card with no
+   stored origin (plain CLI) gets nothing — never "the user's most recent session".
 
 Config (config.yaml of the default profile):
   kanban_wake:
-    session_key: agent:main:telegram:dm:1916982742:613471   # REQUIRED for redirect
     url:    http://127.0.0.1:8644/webhooks/kanban-wake
     secret_file: ~/.secrets/kanban-wake-secret
     debounce_seconds: 60
   plugins.entries.kanban-wake.allow_gateway_injection: true
+
 """
 from __future__ import annotations
 
@@ -51,7 +50,7 @@ def _cfg() -> dict:
 def _secret() -> str:
     p = os.path.expanduser(_cfg().get("secret_file", "~/.secrets/kanban-wake-secret"))
     try:
-        return open(p, encoding="utf-8").read().strip()
+        return open(p).read().strip()
     except Exception:
         return ""
 
@@ -62,7 +61,10 @@ def _post(text: str, task_id: str = "", event: str = "") -> None:
     url = _cfg().get("url", f"http://127.0.0.1:8644/webhooks/{_ROUTE}")
     body = json.dumps({"text": text, "task_id": task_id, "event": event}).encode()
     ts = str(int(time.time()))
-    headers = {"Content-Type": "application/json", "X-Request-ID": str(uuid.uuid4())}
+    headers = {
+        "Content-Type": "application/json",
+        "X-Request-ID": str(uuid.uuid4()),
+    }
     sec = _secret()
     if sec:
         # The gateway verifier (gateway/platforms/webhook.py, `v2_sig`) compares
@@ -89,8 +91,7 @@ def _emit(event: str, task_id: str | None, **fields) -> None:
         if not (title and reason):
             try:
                 from hermes_cli import kanban_db as kb
-                from hermes_cli import kanban_db_connect as _kbc
-                with _kbc.connect() as conn:
+                with kb.connect() as conn:
                     t = kb.get_task(conn, task_id)
                     if t:
                         title = title or (t.title or "")
@@ -104,7 +105,9 @@ def _emit(event: str, task_id: str | None, **fields) -> None:
         head = "BLOCKED" if event == "blocked" else "DONE"
         text = f"KANBAN {head} {task_id} [{assignee}] {title}\n{reason[:1500]}"
         _post(text, task_id, event)
-        _last[key] = now  # failed delivery must not suppress a retry
+        # Only a DELIVERED wake is debounced. Recording this before _post meant a
+        # failed delivery suppressed the next attempt for the whole window.
+        _last[key] = time.time()
         logger.info("[kanban-wake] emitted %s for %s", event, task_id)
     except Exception as e:  # never break dispatch
         logger.warning("[kanban-wake] emit failed: %s", e)
@@ -120,36 +123,64 @@ def _on_completed(task_id=None, **f):
 
 # ------------------------------------------------------------- redirector ---
 
+def _origin_subs(task_id: str) -> list[dict]:
+    """The card's stored origin(s): ``kanban_notify_subs`` rows written at creation
+    (chat session, inherited from the creating card, or the creating cron job's deliver target)."""
+    if not task_id:
+        return []
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_notify as kbn
+    with kb.connect() as conn:
+        return kbn.list_notify_subs(conn, task_id)
+
+
+def _wakes(sub: dict) -> bool:
+    return (sub.get("delivery_mode") or "notify") in ("notify+wake", "wake")
+
+
+def _origin_session_key(gateway, sub: dict) -> str | None:
+    """Session key of the conversation the card was created in, rebuilt from its stored origin."""
+    from gateway.config import Platform
+    from gateway.session import SessionSource
+    md = sub.get("delivery_metadata") or {}
+    source = SessionSource(
+        platform=Platform(sub["platform"]), chat_id=str(sub["chat_id"]),
+        chat_type=str(sub.get("chat_type") or md.get("chat_type") or "dm"),
+        thread_id=sub.get("thread_id") or None, user_id=sub.get("user_id"),
+        user_id_alt=sub.get("user_id_alt"), parent_chat_id=md.get("parent_chat_id"),
+        scope_id=md.get("scope_id"))
+    return gateway._session_key_for_source(source)
+
+
 def _pre_gateway_dispatch(event=None, gateway=None, **_):
-    """Intercept the kanban-wake webhook turn and re-inject into the supervisor session."""
+    """Intercept the kanban-wake webhook turn; deliver it ONLY to the card's stored origin."""
+    src = getattr(event, "source", None)
+    if src is None or not str(getattr(src, "platform", "")).lower().endswith("webhook"):
+        return None
+    if getattr(src, "user_id", "") != f"webhook:{_ROUTE}":
+        return None
     try:
-        src = getattr(event, "source", None)
-        if src is None or str(getattr(src, "platform", "")).lower().endswith("webhook") is False:
-            return None
-        if getattr(src, "user_id", "") != f"webhook:{_ROUTE}":
-            return None
-        session_key = _cfg().get("session_key")
-        if not session_key or gateway is None:
-            return None  # fall back to detached webhook agent
-        text = getattr(event, "text", "") or ""
-        content = (
-            "[kanban-wake — event from the board, not the user. Act on it now as EM: "
-            "answer the block with a standing decision or ask Den the exact question; "
-            "on DONE verify the PR/merge/live state and drive the next hop. Reply in ≤5 sentences.]\n"
-            + text
-        )
+        payload = getattr(event, "raw_message", None) or {}
+        task_id = str(payload.get("task_id") or "") if isinstance(payload, dict) else ""
+        subs = _origin_subs(task_id)
+        if not subs:
+            logger.info("[kanban-wake] %s has no origin conversation; nothing sent", task_id or "event")
+            return {"action": "skip", "reason": "kanban-wake: card has no origin"}
+        if any(_wakes(s) for s in subs):
+            # Core's kanban notifier already wakes these origins; a second wake would double-post.
+            return {"action": "skip", "reason": "kanban-wake: core notifier owns this origin"}
         sched = getattr(gateway, "_schedule_plugin_message_injection", None)
-        if not callable(sched):
-            return None
-        ok = sched(session_key=session_key, content=content, plugin_id="kanban-wake")
-        if ok:
-            logger.info("[kanban-wake] redirected event into %s", session_key)
-            return {"action": "skip", "reason": "kanban-wake redirected into supervisor session"}
-        logger.warning("[kanban-wake] injection refused for %s; falling back to webhook agent", session_key)
-        return None
+        content = ("[kanban-wake — event from the board you created this card from, not the user.]\n"
+                   + (getattr(event, "text", "") or ""))
+        for sub in subs:
+            key = _origin_session_key(gateway, sub)
+            ok = bool(key and callable(sched) and sched(session_key=key, content=content, plugin_id=_ROUTE))
+            logger.log(logging.INFO if ok else logging.ERROR,
+                       "[kanban-wake] %s -> origin %s %s", task_id, key, "injected" if ok else "REFUSED")
+        return {"action": "skip", "reason": "kanban-wake delivered to card origin"}
     except Exception as e:
-        logger.warning("[kanban-wake] redirect failed: %s", e)
-        return None
+        logger.error("[kanban-wake] origin delivery failed: %s", e)
+        return {"action": "skip", "reason": "kanban-wake: origin delivery failed"}
 
 
 def register(ctx) -> None:

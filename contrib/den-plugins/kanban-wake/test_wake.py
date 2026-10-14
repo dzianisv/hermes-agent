@@ -53,13 +53,48 @@ class WakeTests(unittest.TestCase):
             for _ in range(2): wake._emit('blocked','t_fixture',title='fixture',reason='reason')
             self.assertEqual(post.call_count,1)
 
-    def test_redirect_to_current_session(self):
-        calls=[]
-        gateway=SimpleNamespace(_schedule_plugin_message_injection=lambda **kw: calls.append(kw) or True)
-        event=SimpleNamespace(source=SimpleNamespace(platform='webhook',user_id='webhook:kanban-wake'),text='untrusted event data')
-        with patch.object(wake,'_cfg',return_value={'session_key':'test-session'}):
-            result=wake._pre_gateway_dispatch(event=event,gateway=gateway)
-        self.assertEqual(result['action'],'skip')
-        self.assertEqual(calls[0]['session_key'],'test-session')
+    # ---------------------------------------------------------- redirector ---
+    # Routing contract: the event goes to the card's stored origin, never "most recent session".
+
+    def _run(self, subs, inject_ok=True):
+        calls = []
+        gw = SimpleNamespace(
+            _schedule_plugin_message_injection=lambda **kw: (calls.append(kw), inject_ok)[1],
+            _session_key_for_source=lambda src: f"key:{src.platform.value}:{src.chat_id}:{src.thread_id}")
+        ev = SimpleNamespace(source=SimpleNamespace(platform='webhook', user_id='webhook:kanban-wake'),
+                             text='KANBAN BLOCKED t_x', raw_message={'task_id': 't_x'})
+        with patch.object(wake, '_origin_subs', return_value=subs):
+            return wake._pre_gateway_dispatch(event=ev, gateway=gw), calls
+
+    def test_notify_origin_gets_injected_into_its_thread(self):
+        res, calls = self._run([{'platform': 'telegram', 'chat_id': '1', 'thread_id': '42', 'delivery_mode': 'notify'}])
+        self.assertEqual(res['action'], 'skip')
+        self.assertEqual([c['session_key'] for c in calls], ['key:telegram:1:42'])
+
+    def test_wake_origin_left_to_core_notifier(self):
+        res, calls = self._run([{'platform': 'telegram', 'chat_id': '1', 'thread_id': '42', 'delivery_mode': 'notify+wake'}])
+        self.assertEqual(calls, [])
+        self.assertIn('core notifier', res['reason'])
+
+    def test_no_origin_sends_nothing_and_logs_info(self):
+        with self.assertLogs(wake.logger, level='INFO') as log:
+            res, calls = self._run([])
+        self.assertEqual(calls, [])
+        self.assertEqual(res['action'], 'skip')
+        self.assertIn('no origin', '\n'.join(log.output))
+
+    def test_non_wake_events_pass_through(self):
+        ev = SimpleNamespace(source=SimpleNamespace(platform='telegram', user_id='1'), text='hi')
+        self.assertIsNone(wake._pre_gateway_dispatch(event=ev, gateway=None))
+
+    def test_real_session_key_routes_to_origin_thread(self):
+        from gateway.session import build_session_key, SessionSource
+        from gateway.config import Platform
+        gw = SimpleNamespace(_session_key_for_source=lambda s: build_session_key(s))
+        key = wake._origin_session_key(gw, {'platform': 'telegram', 'chat_id': '1916982742',
+                                            'thread_id': '648763', 'chat_type': 'dm'})
+        self.assertEqual(key, build_session_key(SessionSource(platform=Platform.TELEGRAM, chat_id='1916982742',
+                                                              chat_type='dm', thread_id='648763')))
+        self.assertTrue(key.endswith('648763'))
 
 if __name__ == '__main__': unittest.main()
