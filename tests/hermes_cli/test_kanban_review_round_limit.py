@@ -140,3 +140,25 @@ def test_rounds_reset_after_unblock(kanban_home):
         assert _round(conn, tid).status == "ready"
         assert _round(conn, tid).status == "ready"
         assert _round(conn, tid).status == "blocked"
+
+
+def _approve(conn, tid):
+    claimed = kb.claim_task(conn, tid)
+    assert kb.request_review(conn, tid, summary="PR ready", reviewer="reviewer",
+                             expected_run_id=claimed.current_run_id)
+    kb.claim_review_task(conn, tid)
+    ok, who = kb.approve_for_merge(conn, tid, summary="approved slice 1")
+    assert ok, who
+
+
+def test_rounds_reset_after_approval_of_earlier_slice(kanban_home):
+    """t_9aa956b9: slice 1 got one change request then approval+merge; slice 2's
+    second change request must not be counted as round 3."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="ship it", assignee="software-engineer")
+        _round(conn, tid, first=True)
+        _approve(conn, tid)
+        assert _round(conn, tid).status == "ready"
+        assert _round(conn, tid).status == "ready"
+        assert not _events(conn, tid, "review_loop_detected")
+        assert _round(conn, tid).status == "blocked"

@@ -41,6 +41,7 @@ Hardening invariants — each guards a real failure; don't weaken without answer
 - **Cron ownership is not gated on `gateway.multiplex_profiles`.** That flag gates ADAPTERS; one
   host gateway process ticks EVERY profile's store either way (`run.py::_cron_tick_profile_homes`).
   Gating the tick set on it left every non-launch profile's jobs in a store no ticker visited.
+  Converse: a per-profile gateway (`--profile X`, not multiplexing) ticks only its own home.
 - **Per-profile process assumptions are the bug class.** One process ticks N homes, so anything
   keyed on "this process's profile" is wrong: in-flight state (`_running_job_ids`,
   `_running_since`, `_running_futures`, `_running_worker_pids`, `_running_fire_owners`,

@@ -4175,9 +4175,13 @@ def request_changes(
         # Review-loop budget: the Nth change request (N = review_round_limit)
         # blocks the card needs_input with a comment instead of respawning the
         # implementer; who re-specs it is board policy, not the kernel's.
+        # Only change requests since the last unblock OR approval count: an
+        # earlier slice/PR on the same card that was approved is a closed
+        # review lineage, not part of the current loop.
         rounds = int(conn.execute(
             "SELECT COUNT(*) FROM task_events WHERE task_id = ? AND kind = 'changes_requested' "
-            "AND id > COALESCE((SELECT MAX(id) FROM task_events WHERE task_id = ? AND kind = 'unblocked'), 0)",
+            "AND id > COALESCE((SELECT MAX(id) FROM task_events WHERE task_id = ? "
+            "AND kind IN ('unblocked', 'review_approved')), 0)",
             (task_id, task_id),
         ).fetchone()[0]) + 1
         round_limit = review_round_limit()
