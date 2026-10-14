@@ -87,6 +87,11 @@ _USER_PAUSED_REASON = "user-paused"
 # Cap on remembered waiting-on-user questions per goal (status line / tool view stay readable).
 _MAX_PENDING_HUMAN_DECISIONS = 8
 
+QUIET_TURN_REMINDER = (
+    "\n\n[Reminder] Your last turn was silent and declared no wait. Take the next step, or call "
+    "goal(action=\"wait\", ...) naming what you are waiting on. Another quiet turn pauses the goal."
+)
+
 # Muse harness kick for agent-declared goals: fixed sentence, fired whenever a turn ends with the
 # goal still active (idle, stopped, blocked). The goal is never parked by the judge.
 MUSE_CONTINUATION_PROMPT = (
@@ -2143,7 +2148,19 @@ class GoalManager:
         #  - live delegated subagents → that IS the wait: barrier on them (lifts when one returns);
         #  - otherwise → timer backoff (60 s doubling to the cap), never a pause; the continuation
         #    prompt tells the agent to declare a wait (goal wait) instead of replying with silence.
-        if is_silent_turn_response(last_response):
+        if state.source == "agent" and not active_delegations and is_silent_turn_response(last_response):
+            # Quiet turn with no goal wait declared: one reminder, then pause with one message.
+            state.consecutive_silent += 1
+            state.last_verdict, state.last_reason = "silent", "no reply"
+            if state.consecutive_silent >= 2:
+                return self._pause_decision(
+                    "quiet twice without goal wait", "silent", "no reply after reminder",
+                    f"⏸ Goal paused — the agent went quiet twice without declaring a wait: {state.goal}. "
+                    "Use /goal resume to continue.")
+            self._save()
+            return _decision("active", True, (self.next_continuation_prompt() or "") + QUIET_TURN_REMINDER,
+                             "silent", "reminder", "")
+        if is_silent_turn_response(last_response) and (state.source != "agent" or active_delegations > 0):
             state.consecutive_silent += 1
             n = state.consecutive_silent
             state.last_verdict, state.last_reason = "silent", "no reply"

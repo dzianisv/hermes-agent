@@ -45,3 +45,20 @@ def test_user_goal_still_judged(mgr_factory):
     m.evaluate_after_turn("some work")
     m.complete_with_evidence(EVIDENCE)
     assert len(mgr_factory.calls) == 2
+
+
+def test_quiet_agent_turn_gets_one_reminder_then_pauses_with_one_message(mgr_factory):
+    m = mgr_factory("agent")
+    d1 = m.evaluate_after_turn("[SILENT]")
+    assert d1["should_continue"] and "[Reminder]" in d1["continuation_prompt"] and d1["message"] == ""
+    d2 = m.evaluate_after_turn("")
+    assert not d2["should_continue"] and "Goal paused" in d2["message"] and d2["notice_kind"] == "attention"
+    assert m.state.status == "waiting" and m.state.barrier_kind == "safety"   # = paused
+    assert mgr_factory.calls == [] and m.state.turns_used == 0
+
+
+def test_real_reply_resets_the_reminder(mgr_factory):
+    m = mgr_factory("agent")
+    m.evaluate_after_turn("[SILENT]")
+    m.evaluate_after_turn("pushed the fix")
+    assert m.evaluate_after_turn("[SILENT]")["should_continue"] is True

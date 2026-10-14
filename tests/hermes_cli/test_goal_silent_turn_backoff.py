@@ -34,8 +34,10 @@ def hermes_home(tmp_path, monkeypatch):
 
 
 def _goal(sid: str) -> goals.GoalManager:
+    # Silence backoff applies to user /goal; agent goals get one reminder then pause
+    # (test_goal_agent_no_judge.py).
     mgr = goals.GoalManager(sid)
-    assert mgr.set_agent_goal("ship the PR") is not None
+    assert mgr.set("ship the PR") is not None
     return mgr
 
 
