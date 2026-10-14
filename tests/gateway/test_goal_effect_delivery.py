@@ -31,14 +31,17 @@ def lane(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("mutation", ["clear", "pause", "replace", "none"])
+@pytest.mark.parametrize("mutation", ["clear", "pause", "replace", "contract", "none"])
 async def test_stale_decision_neither_notifies_nor_enqueues(lane, monkeypatch, mutation):
     runner, adapter, source = lane
-    goals.GoalManager("s").set_agent_goal("G1")
+    monkeypatch.setattr(goals.time, "time", lambda: 1234.0)
+    goals.GoalManager("s").set_agent_goal("G1", contract=goals.GoalContract(outcome="old"))
     def judge(*args, **kwargs):
         other = goals.GoalManager("s")
         if mutation == "replace":
             other.set_agent_goal("G2", replace=True)
+        elif mutation == "contract":
+            other.set_agent_goal("G1", replace=True, contract=goals.GoalContract(outcome="new"))
         elif mutation != "none":
             getattr(other, mutation)()
         return "continue", "more work", False, None, False

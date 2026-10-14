@@ -118,20 +118,83 @@ def test_snapshot_precedes_gates_and_normal_decisions_survive(db, monkeypatch, w
             assert db.list_meta_prefix("goal_archive:session:")
 
 
-def test_documented_identical_clock_replacement_can_lose_changed_contract(db, monkeypatch):
-    # B11 is a LIMITATION, not proof of detection: even a different contract is
-    # overwritten if all four approved identity fields collide.
+@pytest.mark.parametrize("verdict", ["continue", "done"])
+def test_identical_clock_replacement_preserves_changed_contract(db, monkeypatch, verdict):
     monkeypatch.setattr(goals.time, "time", lambda: 1234.0)
     manager = goals.GoalManager("session")
     manager.set_agent_goal("same", contract=goals.GoalContract(outcome="old contract"))
     def judge(*args, **kwargs):
         goals.GoalManager("session").set_agent_goal("same", replace=True,
             contract=goals.GoalContract(outcome="different contract"))
-        return "continue", "more", False, None, False
+        return verdict, "old result", False, None, False
     monkeypatch.setattr(goals, "judge_goal", judge)
     result = manager.evaluate_after_turn("work")
+    current = goals.load_goal("session")
+    assert current.contract.outcome == "different contract"
+    assert current.status == "active"
+    assert current.turns_used == 0
+    assert result["verdict"] == "stale"
+    assert result["message"] == ""
+    assert result["should_continue"] is False
+    assert result["continuation_prompt"] is None
+
+
+@pytest.mark.parametrize("mutation", ["set_contract", "add_subgoal", "add_gate", "wait_for_seconds"])
+def test_judge_window_mutation_preserves_full_state(db, monkeypatch, mutation):
+    manager = goals.GoalManager("session")
+    manager.set_agent_goal("work")
+    saved = []
+    def judge(*args, **kwargs):
+        other = goals.GoalManager("session")
+        value = {"set_contract": goals.GoalContract(outcome="new acceptance"),
+                 "add_subgoal": "required criterion", "add_gate": "required check", "wait_for_seconds": 60}[mutation]
+        getattr(other, mutation)(value)
+        saved.append(goals.load_goal("session"))
+        return "done", "old criteria satisfied", False, None, False
+    monkeypatch.setattr(goals, "judge_goal", judge)
+    result = manager.evaluate_after_turn("old result")
+    assert goals.load_goal("session") == saved[0]
+    assert manager.state == saved[0]
+    assert result["verdict"] == "stale"
+    assert result["message"] == ""
+    assert result["should_continue"] is False
+    assert result["continuation_prompt"] is None
+
+
+def test_snapshot_normalizes_contract_without_rejecting_unchanged_state(db, monkeypatch):
+    manager = goals.GoalManager("session")
+    manager.set_agent_goal("work", contract=goals.GoalContract(outcome=" old contract "))
+    monkeypatch.setattr(goals, "judge_goal", lambda *a, **kw: ("continue", "more", False, None, False))
+    result = manager.evaluate_after_turn("work")
     assert result["should_continue"]
+    assert goals.load_goal("session").turns_used == 1
     assert goals.load_goal("session").contract.outcome == "old contract"
+
+
+def test_gate_retry_state_is_persisted_once_per_evaluation(db, monkeypatch):
+    manager = goals.GoalManager("session")
+    manager.set_agent_goal("work")
+    manager.add_gate("required check", max_retries=2)
+    monkeypatch.setattr(goals, "run_gate", lambda gate: (False, 1, "not yet"))
+    for turn in range(1, 4):
+        result = manager.evaluate_after_turn("attempt")
+        current = goals.load_goal("session")
+        assert current.turns_used == turn
+        assert current.gates[0].attempts == turn
+        assert result["should_continue"] is (turn < 3)
+    assert current.status == "paused"
+
+
+def test_judge_wait_counts_once_and_parked_wait_consumes_no_turn(db, monkeypatch):
+    manager = goals.GoalManager("session")
+    manager.set_agent_goal("work")
+    monkeypatch.setattr(goals, "judge_goal", lambda *a, **kw: ("wait", "dependency", False, {"seconds": 60}, False))
+    first = manager.evaluate_after_turn("work")
+    assert first["verdict"] == "wait"
+    assert goals.load_goal("session").turns_used == 1
+    second = goals.GoalManager("session").evaluate_after_turn("parked")
+    assert second["verdict"] == "waiting"
+    assert goals.load_goal("session").turns_used == 1
 
 
 def test_same_second_archive_overwrites_and_transaction_rolls_back(db, monkeypatch):

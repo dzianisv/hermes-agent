@@ -1522,13 +1522,13 @@ class GoalManager:
     def evaluate_after_turn(self, last_response: str, **kwargs) -> Dict[str, Any]:
         """Commit evaluation effects only while the entry snapshot still owns the row.
 
-        Identical clocks/objectives/turn counts/caps cannot distinguish replacement,
-        including a changed contract; this bounded guard is not fully race-safe.
+        Compare the entire normalized state; changed acceptance or wait barriers
+        suppress the old decision even when clocks and objective coincide.
         """
         state = self._state
         if state is None or state.status != "active":
             return _decision(state.status if state else None, False, None, "inactive", "no active goal", "")
-        expected = (state.created_at, state.goal, state.turns_used, state.max_turns)
+        expected = GoalState.from_json(state.to_json())
         self._evaluating = True
         try:
             decision = self._evaluate_after_turn(last_response, **kwargs)
@@ -1539,9 +1539,7 @@ class GoalManager:
             cursor = conn.cursor()
             row = cursor.execute("SELECT value FROM state_meta WHERE key = ?", (_meta_key(self.session_id),)).fetchone()
             current = GoalState.from_json(row[0]) if row else None
-            if current and current.status == "active" and (
-                current.created_at, current.goal, current.turns_used, current.max_turns
-            ) == expected:
+            if current is not None and current == expected:
                 db.set_meta(_meta_key(self.session_id), state.to_json(), cursor=cursor)
                 return True
             self._state = current
