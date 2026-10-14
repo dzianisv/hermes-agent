@@ -1196,8 +1196,8 @@ class GoalManager:
                        max_turns: Optional[int] = None, replace: bool = False) -> GoalState:
         """Replace only our own occupied slot, archiving in the same transaction.
 
-        Archive keys have second precision: a second replacement in that second
-        overwrites its archive. This is not a complete replacement history.
+        Retain one archive row per replacement; an exact timestamp-key collision
+        refuses the replacement rather than overwriting a prior archive.
         """
         objective = (objective or "").strip()
         if not objective:
@@ -1217,7 +1217,10 @@ class GoalManager:
                     raise ValueError("a user-set /goal cannot be replaced by the agent")
                 if replace is not True:
                     raise ValueError("an agent goal is already set; use replace=true")
-                db.set_meta(f"goal_archive:{self.session_id}:{int(state.created_at)}", row[0], cursor=cursor)
+                archive_key = f"goal_archive:{self.session_id}:{state.created_at!r}"
+                if cursor.execute("SELECT 1 FROM state_meta WHERE key = ?", (archive_key,)).fetchone():
+                    raise RuntimeError("goal archive key collision; retry")
+                db.set_meta(archive_key, row[0], cursor=cursor)
             db.set_meta(_meta_key(self.session_id), state.to_json(), cursor=cursor)
         db._execute_write(create)
         self._state = state

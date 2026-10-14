@@ -197,25 +197,44 @@ def test_judge_wait_counts_once_and_parked_wait_consumes_no_turn(db, monkeypatch
     assert goals.load_goal("session").turns_used == 1
 
 
-def test_same_second_archive_overwrites_and_transaction_rolls_back(db, monkeypatch):
-    monkeypatch.setattr(goals.time, "time", lambda: 1234.0)
+def test_same_second_replacements_retain_each_archive_and_roll_back(db, monkeypatch):
+    from itertools import count
+    clock = count(1234.0, 0.01)
+    monkeypatch.setattr(goals.time, "time", lambda: next(clock))
     manager = goals.GoalManager("session")
     manager.set_agent_goal("G1")
     manager.set_agent_goal("G2", replace=True)
     manager.set_agent_goal("G3", replace=True)
     rows = db.list_meta_prefix("goal_archive:session:")
-    assert len(rows) == 1
-    assert goals.GoalState.from_json(rows[0][1]).goal == "G2"
+    assert len(rows) == 2
+    assert {goals.GoalState.from_json(raw).goal for _, raw in rows} == {"G1", "G2"}
+    assert goals.load_goal("session").goal == "G3"
     original = db.set_meta
     def fail_current(key, value, **kwargs):
         if key == "goal:session":
             raise RuntimeError("injected current-row write failure")
         return original(key, value, **kwargs)
     monkeypatch.setattr(db, "set_meta", fail_current)
-    with pytest.raises(RuntimeError):
+    with pytest.raises(RuntimeError, match="injected current-row write failure"):
         manager.set_agent_goal("G4", replace=True)
     assert goals.load_goal("session").goal == "G3"
     assert db.list_meta_prefix("goal_archive:session:") == rows
+
+def test_frozen_archive_key_collision_refuses_without_loss(db, monkeypatch):
+    monkeypatch.setattr(goals.time, "time", lambda: 1234.0)
+    manager = goals.GoalManager("session")
+    manager.set_agent_goal("G1")
+    manager.set_agent_goal("G2", replace=True)
+    before = goals.load_goal("session")
+    rows = db.list_meta_prefix("goal_archive:session:")
+    assert len(rows) == 1
+    assert goals.GoalState.from_json(rows[0][1]).goal == "G1"
+    with pytest.raises(RuntimeError, match="goal archive key collision; retry"):
+        manager.set_agent_goal("G3", replace=True)
+    assert goals.load_goal("session") == before
+    assert manager.state == before
+    assert db.list_meta_prefix("goal_archive:session:") == rows
+
 
 def test_captured_cross_version_json_preserves_main_fields(db):
     import json
