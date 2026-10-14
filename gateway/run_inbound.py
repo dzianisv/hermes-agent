@@ -259,6 +259,8 @@ class GatewayInboundMixin:
         running work or control traffic — recognized slash commands (incl. /pause off, the in-band
         resume) and replies owned by in-flight work (pending update prompt, running session,
         pending slash-confirm, dangerous-command approval) all pass through."""
+        if self._is_goal_continuation_event(event):
+            return False
         with suppress(Exception):
             _estop_cmd = event.get_command()
             if _estop_cmd:

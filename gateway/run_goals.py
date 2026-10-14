@@ -273,6 +273,10 @@ class GatewayGoalsMixin:
     ) -> None:
         """Run the goal judge after a gateway turn (AFTER delivery) and, if still active, enqueue a
         continuation through the adapter FIFO so a simultaneous real user message takes priority."""
+        from agent.estop import is_engaged
+        if is_engaged():
+            return
+
         def _load():
             from hermes_cli.goals import GoalManager
             max_turns = self._goal_max_turns_from_config()
@@ -310,7 +314,7 @@ class GatewayGoalsMixin:
         try:
             adapter = self._delivery_adapter_for(source)
             _quick_key = self._session_key_for_source(source)
-            if adapter and _quick_key:
+            if adapter and _quick_key and not is_engaged():
                 self._enqueue_fifo(_quick_key, self._synthetic_prompt_event(source, prompt), adapter)
         except Exception as exc:
             logger.debug("goal continuation: enqueue failed: %s", exc)
