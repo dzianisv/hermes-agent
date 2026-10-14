@@ -65,10 +65,7 @@ def is_silent_turn_response(text: Optional[str]) -> bool:
 # Consecutive transport failures (401, timeout, DNS) before auto-pause: a broken API key returns
 # 401 every call and must not spend every turn on an unreachable judge.
 DEFAULT_MAX_CONSECUTIVE_TRANSPORT_FAILURES = 5
-# Agent-declared goals follow Muse semantics: the judge's BLOCKED never parks them. A transient
-# blocker gets a "take a different route" continuation; a human-only blocker is recorded as
-# waiting-on-user and the agent keeps working the other requirements. Only an audited `complete`,
-# a user /goal pause|clear, or the max_turns safety stop ends an active agent goal.
+# Judge blocker categories (user goals only; agent goals are never judged per turn).
 BLOCKER_HUMAN_ONLY = "human_only"
 BLOCKER_TRANSIENT = "transient"
 _HUMAN_ONLY_ALIASES = {"human_only", "human-only", "human", "human_decision", "needs_human", "user_decision"}
@@ -89,9 +86,6 @@ DEFAULT_IDLE_WAKE_SECONDS = 900
 _USER_PAUSED_REASON = "user-paused"
 # Cap on remembered waiting-on-user questions per goal (status line / tool view stay readable).
 _MAX_PENDING_HUMAN_DECISIONS = 8
-
-# Fed back when ONE step needs the human: record the question as waiting-on-user and keep moving
-# on the other requirements instead of stopping the goal.
 
 # Muse harness kick for agent-declared goals: fixed sentence, fired whenever a turn ends with the
 # goal still active (idle, stopped, blocked). The goal is never parked by the judge.
@@ -611,13 +605,8 @@ class GoalState:
     # Tracked separately from parse failures: a broken API key returns 401 every call and must
     # auto-pause instead of burning the budget on an unreachable judge.
     consecutive_transport_failures: int = 0   # judge API/transport errors in a row
-    # Agent goals: consecutive BLOCKED verdicts answered with a reroute continuation.
-    consecutive_blocked: int = 0
     # Continuations answered with nothing / a bare silence marker in a row (backoff + pause).
     consecutive_silent: int = 0
-    consecutive_human_pending: int = 0
-    # Judge ``wait`` verdicts in a row: each capped re-wake that only re-parks doubles the cap.
-    consecutive_wait: int = 0
     # User-added criteria (/subgoal). Both the judge and continuation prompts include them.
     subgoals: List[str] = field(default_factory=list)
     # Wait barrier (judge ``wait`` verdict or ``/goal wait``): parks the loop instead of re-poking the
@@ -691,7 +680,7 @@ class GoalState:
     def from_json(cls, raw: str) -> "GoalState":
         data = json.loads(raw)
         raw_subgoals = data.get("subgoals") or []
-        ints = {k: int(data.get(k) or 0) for k in ("turns_used", "consecutive_parse_failures", "consecutive_transport_failures", "waiting_on_delegations", "consecutive_blocked", "consecutive_silent", "consecutive_human_pending", "consecutive_wait", "consecutive_stalled")}
+        ints = {k: int(data.get(k) or 0) for k in ("turns_used", "consecutive_parse_failures", "consecutive_transport_failures", "waiting_on_delegations", "consecutive_silent", "consecutive_stalled")}
         floats = {k: float(data.get(k) or 0.0) for k in ("created_at", "last_turn_at", "waiting_until", "waiting_since", "paused_at")}
         raw_pending = data.get("pending_human_decisions") or []
         state = cls(
@@ -1908,17 +1897,8 @@ class GoalManager:
         state = self._require_active()
         state.clear_wait()
         if state.source == "agent" and barrier.get("waiting_until") and not uncapped:
-            # Agent goal: a timed wait sleeps at most ``goals.max_wait_seconds`` — the wake then
-            # tells the agent to check what it waited on (poll, review) and keep going.
-            # Backoff parks (``uncapped``) are exempt: they exist because re-running produced
-            # nothing (silence / the same human-only question); clamping them to the cap turned
-            # a 1800 s backoff into a 300 s wake storm (132 wakes in one day, 2026-10-11).
-            # A judge that re-issues the same far deadline on every capped wake (e.g. "wait until
-            # 6:33 PM" clamped to 300 s -> 18 full agent turns in 90 min, 2026-10-12) gets the
-            # same exponential backoff as silence: the cap doubles per consecutive wait verdict.
-            n = max(1, int(state.consecutive_wait or 1))
-            cap_s = min(max(max_wait_seconds(), max_wait_seconds() * (2 ** (n - 1))), SILENT_TURN_BACKOFF_MAX_S)
-            cap = time.time() + cap_s
+            # Agent goal: a timed wait sleeps at most ``goals.max_wait_seconds``.
+            cap = time.time() + max_wait_seconds()
             barrier["waiting_until"] = min(float(barrier["waiting_until"]), cap)
         for k, v in barrier.items():
             setattr(state, k, v)
@@ -1998,7 +1978,6 @@ class GoalManager:
             return False
         s.clear_wait()
         s.pending_human_decisions = []
-        s.consecutive_human_pending = 0
         self._save()
         return True
 
@@ -2216,11 +2195,9 @@ class GoalManager:
             logger.info("goal %s: goal judge reachable again; resuming normal judging", self.session_id)
 
         if verdict == "wait" and wait_directive:
-            state.consecutive_wait += 1
             parked = self._apply_wait_directive(wait_directive, reason, active_delegations=active_delegations)
             if parked is not None:
                 return parked
-        state.consecutive_wait = 0
 
         if verdict == "blocked":
             info = wait_directive if isinstance(wait_directive, dict) and "blocker" in wait_directive else {}
@@ -2230,7 +2207,6 @@ class GoalManager:
                 if category == BLOCKER_HUMAN_ONLY else None
             if human_kind == HUMAN_CATEGORY_REVERSIBLE:
                 # A reversible choice ("which model?") is not the user's to make: decide, note, proceed.
-                state.consecutive_blocked += 1
                 self._save()
                 return _decision("active", True, (self.next_continuation_prompt() or "")
                                  + REVERSIBLE_DECISION_SUFFIX.format(question=question),
@@ -2242,8 +2218,6 @@ class GoalManager:
                 f"🚫 Goal judged unachievable — paused: {reason} Re-scope with /goal set, or override with /goal resume.",
             )
 
-        state.consecutive_blocked = 0
-        state.consecutive_human_pending = 0
         if verdict == "done":
             state.status = "done"
             self._save()
