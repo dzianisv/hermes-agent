@@ -50,13 +50,16 @@ def test_user_goal_always_wins():
     assert "error" in r and r["goal"] == "ship the docs site"
 
 
-def test_agent_complete_skips_judge_and_stores_evidence(monkeypatch):
+def test_complete_requires_passing_audit(monkeypatch):
     _call(action="create", objective="Publish the release notes for v1.2.14 to Notion")
-    monkeypatch.setattr(goals_mod, "judge_goal", lambda *a, **kw: pytest.fail("agent goals are not judged"))
-    assert "error" in _call(action="complete", evidence="I wrote the notes")
-    ev = "Published: https://notion.so/release-notes-1-2-14, verified via API GET 200"
-    assert _call(action="complete", evidence=ev)["completed"] is True
-    assert goals_mod.load_goal("s1").evidence == ev
+    monkeypatch.setattr(goals_mod, "judge_goal", lambda *a, **kw: ("continue", "no page url shown", False, None, False))
+    r = _call(action="complete", evidence="I wrote the notes and will publish soon")
+    assert "error" in r and r["verdict"] == "continue"
+    assert goals_mod.GoalManager(session_id="s1").is_active()
+    monkeypatch.setattr(goals_mod, "judge_goal", lambda *a, **kw: ("done", "page exists", False, None, False))
+    r = _call(action="complete", evidence="Published: https://notion.so/release-notes-1-2-14, verified via API GET 200")
+    assert r["completed"] is True
+    assert not goals_mod.GoalManager(session_id="s1").has_goal()
 
 
 def test_complete_without_evidence_or_goal_errors():

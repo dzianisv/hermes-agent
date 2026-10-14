@@ -98,6 +98,26 @@ AF900B = [
 ]
 
 
+def test_user_wait_holds_through_self_wakes_and_lifts_on_user_reply(goals, monkeypatch):
+    """Restored (wait half of the af900b test): a goal waiting on the user stays parked with no timer;
+    an internal turn does not lift it, the user's reply does."""
+    _judge(goals, monkeypatch, [CONTINUE])
+    mgr = goals.GoalManager(session_id="p2")
+    mgr.set_agent_goal("Release VibeBrowser 1.1.43 to the Chrome Web Store")
+    mgr.wait_on_user(AF900B[0])
+    mgr.wait_on_user(AF900B[1])   # a rewording of the same step is not recorded twice
+    s = goals.GoalManager("p2").state
+    assert s.pending_human_decisions == [AF900B[0]]
+    assert s.barrier_kind == "user" and s.waiting_until == 0
+    mgr = goals.GoalManager("p2")
+    d = mgr.evaluate_after_turn("self wake", from_user=False)
+    assert d["should_continue"] is False and mgr.is_waiting()
+    turns = goals.GoalManager("p2").state.turns_used
+    d = mgr.evaluate_after_turn("Den: approved, Touch ID done", from_user=True)
+    assert not goals.GoalManager("p2").is_waiting()
+    assert goals.GoalManager("p2").state.turns_used == turns + 1
+    assert d["verdict"] != "waiting"
+
 # ── (3) long-running goals stop on lack of progress, not on a raw turn count ──────────────────
 
 def test_long_running_user_goal_with_progress_not_capped_at_20(goals, monkeypatch):

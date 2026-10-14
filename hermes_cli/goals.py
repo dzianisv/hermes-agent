@@ -633,7 +633,6 @@ class GoalState:
     # as that count drops (a batch returned), not only when the timer runs out.
     waiting_on_delegations: int = 0
     waiting_reason: Optional[str] = None
-    evidence: Optional[str] = None  # agent goals: the completion evidence (no LLM audit)
     waiting_since: float = 0.0
     contract: GoalContract = field(default_factory=GoalContract)
     # /goal gate add <cmd>: ALL must pass before the judge may declare done.
@@ -705,7 +704,6 @@ class GoalState:
             max_turns=int(data.get("max_turns") or DEFAULT_MAX_TURNS),
             last_verdict=data.get("last_verdict"),
             last_reason=data.get("last_reason"),
-            evidence=data.get("evidence"),
             paused_reason=data.get("paused_reason"),
             subgoals=[str(s).strip() for s in raw_subgoals if str(s).strip()] if isinstance(raw_subgoals, list) else [],
             waiting_on_pid=(int(data["waiting_on_pid"]) if data.get("waiting_on_pid") else None),
@@ -1014,9 +1012,6 @@ def _session_waiting(session_id: str) -> bool:
 
 
 _JSON_OBJECT_RE = re.compile(r"\{.*?\}", re.DOTALL)
-
-
-AGENT_EVIDENCE_MIN_CHARS = 40
 
 
 def _goal_judge_setting(key: str, default, cast):
@@ -1760,15 +1755,6 @@ class GoalManager:
         gate = self._check_gates()
         if gate is not None:
             return gate
-        if state.source == "agent":
-            # Agent goals: no LLM audit. Concrete evidence is required and persisted on the goal.
-            evidence = (evidence or "").strip()
-            if len(evidence) < AGENT_EVIDENCE_MIN_CHARS:
-                return _decision(state.status, False, None, "refused",
-                                 f"evidence must be concrete (>= {AGENT_EVIDENCE_MIN_CHARS} chars)", "")
-            state.evidence = evidence
-            self.mark_done(evidence[:500])
-            return _decision("done", False, None, "done", evidence[:500], "")
         verdict, reason, parse_failed, _wait, transport_failed = judge_goal(
             state.goal, f"Completion claim with evidence:\n{evidence}",
             subgoals=state.subgoals or None, contract=state.contract if state.has_contract() else None,
@@ -2207,13 +2193,8 @@ class GoalManager:
             return gate_decision
 
         if state.source == "agent":
-            # Agent goals are never judged per turn: heartbeat continuation only, bounded by the
-            # turn budget; completion goes through goal(action="complete", evidence=...).
-            if state.turns_used >= state.max_turns:
-                # Stop continuing; never pause an agent goal (the user or a new turn can still drive it).
-                self._save()
-                return _decision("active", False, None, "budget_exhausted",
-                                 f"turn budget exhausted ({state.turns_used}/{state.max_turns})", "")
+            # Agent goals are never judged per turn (heartbeat continuation only, no turn budget);
+            # completion goes through goal(action="complete", evidence=...) and its audit.
             state.last_verdict, state.last_reason = "continue", "heartbeat"
             self._save()
             return _decision("active", True, self.next_continuation_prompt(), "continue", "heartbeat", "")

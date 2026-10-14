@@ -1,4 +1,4 @@
-"""Agent-set goals (source=agent) are never LLM-judged; user /goal still is."""
+"""Agent-set goals (source=agent) are never LLM-judged per turn; user /goal still is."""
 from __future__ import annotations
 
 import pytest
@@ -31,26 +31,13 @@ def mgr_factory(tmp_path, monkeypatch):
     return make
 
 
-def test_agent_goal_completes_without_judge(mgr_factory):
-    m = mgr_factory("agent")
-    d = m.complete_with_evidence(EVIDENCE)
-    assert d["status"] == "done" and mgr_factory.calls == []
-    assert m.state.evidence == EVIDENCE
-
-
-def test_agent_goal_short_evidence_refused(mgr_factory):
-    m = mgr_factory("agent")
-    assert m.complete_with_evidence("done").get("status") == "active"
+def test_agent_goal_never_judged_per_turn_and_has_no_turn_budget(mgr_factory):
+    """Live 2026-10-09: '23/20 turns used' on an agent goal with work left. No budget on agent goals."""
+    m = mgr_factory("agent", max_turns=2)
+    out = [m.evaluate_after_turn(f"t{i}") for i in range(5)]
     assert mgr_factory.calls == []
-
-
-def test_agent_goal_never_judged_parked_or_paused_and_stops_at_budget(mgr_factory):
-    m = mgr_factory("agent", max_turns=3)
-    out = [m.evaluate_after_turn("same reply every turn") for _ in range(5)]
-    assert mgr_factory.calls == []
-    assert all(d["status"] == "active" for d in out)
-    assert [d["should_continue"] for d in out] == [True, True, False, False, False]
-    assert m.state.status == "active" and not m.is_waiting()
+    assert all(d["status"] == "active" and d["should_continue"] for d in out)
+    assert m.state.turns_used == 5 and not m.is_waiting()
 
 
 def test_user_goal_still_judged(mgr_factory):

@@ -2909,9 +2909,6 @@ def _extend_run_claim(conn: sqlite3.Connection, task_id: str, expires: int) -> O
     return run_id
 
 
-_LAST_STALE_SWEEP: dict = {}  # db path -> last release_stale_claims pass (host-sleep gap rule)
-
-
 def release_stale_claims(
     conn: sqlite3.Connection, *, signal_fn=None, failure_limit: Optional[int] = None,
 ) -> int:
@@ -2946,13 +2943,6 @@ def release_stale_claims(
     ``exit_reason.reason = "pid_dead"`` — the extend branch requires a live PID.
     """
     now = int(time.time())
-    # Host sleep: a sweep gap > 3x the dispatch tick means we were suspended and
-    # heartbeats could not land; skip one pass instead of reclaiming healthy workers.
-    db = conn.execute("PRAGMA database_list").fetchone()[2]
-    last, _LAST_STALE_SWEEP[db] = _LAST_STALE_SWEEP.get(db), now
-    tick = float(_kanban_cfg().get("dispatch_interval_seconds", 60) or 60)
-    if last and now - last > 3 * tick:
-        return 0
     reclaimed = 0
     host_prefix = _host_prefix()
     stale = conn.execute(

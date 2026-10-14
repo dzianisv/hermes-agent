@@ -77,13 +77,3 @@ def test_reclaim_never_signals_own_process(board, monkeypatch):
     assert kb.get_task(board, tid).status == "running"
     assert "reclaim_deferred" in _kinds(board, tid)
 
-
-def test_sweep_gap_over_3x_tick_skips_reclaim_once(board, monkeypatch):
-    """Host sleep: a gap since the last sweep > 3x dispatch tick skips one reclaim pass."""
-    monkeypatch.setattr(kbd, "_pid_alive", lambda pid: False, raising=False)
-    tid = _running(board, age=kb.DEFAULT_CLAIM_TTL_SECONDS * 3, heartbeat=True)
-    db = board.execute("PRAGMA database_list").fetchone()[2]
-    monkeypatch.setitem(kb._LAST_STALE_SWEEP, db, int(time.time()) - 3600)
-    assert kb.release_stale_claims(board) == 0
-    assert kb.get_task(board, tid).status == "running"
-    assert kb.release_stale_claims(board) == 1  # next normal-gap pass reclaims
