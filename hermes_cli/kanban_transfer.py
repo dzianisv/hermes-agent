@@ -95,10 +95,12 @@ def _scrub_local_state(conn: sqlite3.Connection) -> None:
            SET status            = 'released',
                outcome           = COALESCE(outcome, 'reclaimed'),
                ended_at          = COALESCE(ended_at, ?),
+               metadata          = json_set(COALESCE(metadata, '{}'), '$.exit_reason', json(?)),
                last_heartbeat_at = NULL
          WHERE status = 'running'
         """,
-        (int(time.time()),),
+        (int(time.time()), json.dumps({"reason": "released", "rc": None, "signal": None,
+                                       "stderr_tail": "", "handoff_called": False})),
     )
     conn.execute("UPDATE task_runs SET claim_lock = NULL, worker_pid = NULL")
 

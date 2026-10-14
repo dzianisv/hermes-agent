@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import json
 import random
 import re
 import secrets
@@ -1050,9 +1051,11 @@ def _backfill_legacy_inflight_runs(conn: sqlite3.Connection) -> None:
             if upd.rowcount != 1:
                 conn.execute(
                     "UPDATE task_runs SET status = 'reclaimed', "
-                    "    outcome = 'reclaimed', ended_at = ? "
+                    "    outcome = 'reclaimed', ended_at = ?, metadata = ? "
                     "WHERE id = ?",
-                    (int(time.time()), cur.lastrowid),
+                    (int(time.time()), json.dumps({"exit_reason": {
+                        "reason": "reclaimed", "rc": None, "signal": None,
+                        "stderr_tail": "", "handoff_called": False}}), cur.lastrowid),
                 )
 
 

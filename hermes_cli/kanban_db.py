@@ -2390,9 +2390,12 @@ def _append_event(
 def _end_run(
     conn: sqlite3.Connection, task_id: str, *, outcome: str, summary: Optional[str] = None,
     error: Optional[str] = None, metadata: Optional[dict] = None, status: Optional[str] = None,
+    exit_reason: Optional[str] = None,
 ) -> Optional[int]:
     """Close the active run (``status`` defaults to ``outcome``) and clear
     ``current_run_id``; None when no run was active (never-claimed task).
+    The ONE way a live run ends: it always records ``metadata.exit_reason``
+    (``exit_reason`` names the class, default the outcome).
 
     ``worker_pid`` / ``worker_started_at`` / ``claim_lock`` stay on the closed
     row: they are the only evidence left of the OS process once the task row
@@ -2402,7 +2405,8 @@ def _end_run(
     run_id = _current_run_id(conn, task_id)
     if run_id is None:
         return None
-    metadata = _carry_live_run_metadata(conn, run_id, metadata)
+    metadata = _with_exit_reason(conn, task_id, run_id, _carry_live_run_metadata(conn, run_id, metadata),
+                                 exit_reason or outcome)
     conn.execute(
         """
         UPDATE task_runs
@@ -2420,6 +2424,18 @@ def _end_run(
     )
     conn.execute("UPDATE tasks SET current_run_id = NULL WHERE id = ?", (task_id,))
     return run_id
+
+
+def _with_exit_reason(
+    conn: sqlite3.Connection, task_id: str, run_id: Optional[int], metadata: Optional[dict], reason: str,
+) -> dict:
+    """Every closed run carries ``metadata.exit_reason``; callers that know a sharper
+    class (crash, stale reclaim) pass their own, everyone else gets the outcome."""
+    if (metadata or {}).get("exit_reason"):
+        return metadata
+    from hermes_cli import kanban_worker_exit as kwe
+
+    return {**(metadata or {}), "exit_reason": kwe.build_exit_reason(conn, task_id, reason=reason, run_id=run_id)}
 
 
 # Keys a run collects while it is LIVE (the worker's own session id, the dispatcher's
@@ -2527,6 +2543,7 @@ def _synthesize_ended_run(
     ).fetchone()
     if profile is _UNSET:
         profile = trow["assignee"] if trow else None
+    metadata = _with_exit_reason(conn, task_id, None, metadata, outcome)
     step_key = trow["current_step_key"] if trow else None
     cur = conn.execute(
         """
@@ -3046,14 +3063,9 @@ def _record_reclaim(
 ) -> Optional[int]:
     """Close the active run as ``reclaimed`` and emit the ``reclaimed`` event
     (payload merged with the termination report). Caller holds the txn."""
-    from hermes_cli import kanban_worker_exit as kwe
-
-    exit_reason = kwe.build_exit_reason(
-        conn, task_id, reason=reason or kwe.RECLAIMED, run_id=_current_run_id(conn, task_id),
-    )
     run_id = _end_run(
         conn, task_id, outcome="reclaimed", status="reclaimed", error=error,
-        metadata={**termination, "exit_reason": exit_reason},
+        metadata=termination, exit_reason=reason or "reclaimed",
     )
     payload.update(termination)
     _append_event(conn, task_id, "reclaimed", payload, run_id=run_id)
@@ -4336,17 +4348,7 @@ def _reclaim_dangling_run(
         (task_id, *statuses),
     ).fetchone()
     if stale and stale["current_run_id"]:
-        conn.execute(
-            """
-            UPDATE task_runs
-               SET status = 'reclaimed', outcome = 'reclaimed',
-                   summary = COALESCE(summary, ?),
-                   ended_at = ?,
-                   claim_lock = NULL, claim_expires = NULL, worker_pid = NULL
-             WHERE id = ? AND ended_at IS NULL
-            """,
-            (note, now, int(stale["current_run_id"])),
-        )
+        _end_run(conn, task_id, outcome="reclaimed", summary=note)
 
 
 def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str:
@@ -4745,7 +4747,7 @@ def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> b
         # Archived mid-run (dashboard): close the run so history isn't orphaned.
         run_id = _end_run(
             conn, task_id, outcome="reclaimed", status="reclaimed",
-            summary="task archived with run still active",
+            summary="task archived with run still active", exit_reason="archived",
         )
         _append_event(conn, task_id, "archived", None, run_id=run_id)
     if was_running:
