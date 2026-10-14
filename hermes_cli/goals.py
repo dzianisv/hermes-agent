@@ -145,6 +145,13 @@ REVERSIBLE_DECISION_SUFFIX = (
     "the goal, write down which one and why (one line in your reply), and proceed."
 )
 
+TRANSIENT_BLOCK_SUFFIX = (
+    "\n\n[Last turn stopped on a block you can get past yourself]\n"
+    "Block: {reason}\n"
+    "This does not need the user. Retry, work around it, or do the step you stopped to ask about, "
+    "then keep going on the remaining requirements."
+)
+
 # Judge transport outage: the goal does not depend on judge availability. Hold a short backoff
 # timer, tell the operator once, and resume normally on the first good verdict.
 JUDGE_OUTAGE_ALERT_AFTER = 3
@@ -2213,6 +2220,15 @@ class GoalManager:
                 return _decision("active", True, (self.next_continuation_prompt() or "")
                                  + REVERSIBLE_DECISION_SUFFIX.format(question=question),
                                  "blocked_reversible", reason, "")
+            if category == BLOCKER_TRANSIENT:
+                # Agent-recoverable (tool error, timeout, stopped to ask permission it already has):
+                # continue with a corrective nudge on the normal path, bounded by the turn budget.
+                if self._budget_exhausted(state):
+                    return self._budget_pause(state, "blocked_transient", reason)
+                self._save()
+                return _decision("active", True, (self.next_continuation_prompt() or "")
+                                 + TRANSIENT_BLOCK_SUFFIX.format(reason=reason),
+                                 "blocked_transient", reason, "")
             # Money / credentials-permissions / irreversible (or an unclassified "unachievable"):
             # the user goal pauses for the user, as before.
             return self._pause_decision(
