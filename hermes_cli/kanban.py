@@ -811,11 +811,15 @@ def _cmd_comment(args: argparse.Namespace) -> int:
             body = body[: max(0, args.max_len - len(suffix))].rstrip() + suffix
     author = args.author or _profile_author()
     with kbc.connect_closing() as conn:
-        cid = kb.add_comment(conn, args.task_id, author, body)
+        # An agent session (HERMES_SESSION_ID) outside a worker run is an EM/orchestrator
+        # shelling out: same durable-only rule as the kanban_comment tool.
+        agent = bool(os.environ.get("HERMES_SESSION_ID")) and not os.environ.get("HERMES_KANBAN_TASK")
+        cid = kb.add_comment(conn, args.task_id, author, body, durable_only=agent)
     if not cid:
         kind = kb.classify_comment(body)[0]
         print(f"Routed to {'stage field' if kind == 'stage' else 'event log'} on {args.task_id} "
-              "(status lines are not stored as comments)")
+              "(status lines are not stored as comments; agent sessions outside a worker run "
+              "store only DESIGN:/SCOPE:/ACCEPTANCE:/PROOF:/R<n>:/EM DECISION/NEEDS-DESIGN/BLOCKER:/HANDOFF:)")
     else:
         print(f"Comment added to {args.task_id}")
     return 0

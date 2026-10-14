@@ -2106,7 +2106,7 @@ def task_graph_context(conn: sqlite3.Connection, task_id: str) -> dict:
 # ``tasks.current_step_key`` (+ ``stage_set`` event), other status lines to a
 # ``status_note`` event. Lines with these markers are ALWAYS stored as comments.
 _KEEP_COMMENT_RE = re.compile(
-    r"^\s*(?:DESIGN:|SCOPE:|ACCEPTANCE:|PROOF:|R\d+:|EM DECISION|NEEDS-DESIGN|BLOCKER:|## Plan\b)",
+    r"^\s*(?:DESIGN:|SCOPE:|ACCEPTANCE:|PROOF:|R\d+:|EM DECISION|NEEDS-DESIGN|BLOCKER:|(?i:HANDOFF:)|## Plan\b)",
     re.MULTILINE,
 )
 _STAGE_LINE_RE = re.compile(r"^\s*stage\s*:\s*(.*)$", re.IGNORECASE)
@@ -2175,10 +2175,14 @@ def set_stage(
     return row["current_step_key"]
 
 
-def add_comment(conn: sqlite3.Connection, task_id: str, author: str, body: str) -> int:
+def add_comment(conn: sqlite3.Connection, task_id: str, author: str, body: str,
+                *, durable_only: bool = False) -> int:
     """Store a comment; returns its id. With ``kanban.comment_routing`` (default
     on) stage/status lines are routed (returns 0) and an identical body from the
-    same author within ``kanban.comment_dedupe_seconds`` returns the existing id."""
+    same author within ``kanban.comment_dedupe_seconds`` returns the existing id.
+    ``durable_only`` (agent callers outside a dispatcher worker run): only
+    bodies with a lasting marker (DESIGN:, EM DECISION, HANDOFF:, ...) are stored;
+    any other text is a status note and goes to the event log."""
     if not body or not body.strip():
         raise ValueError("comment body is required")
     if not author or not author.strip():
@@ -2191,6 +2195,8 @@ def add_comment(conn: sqlite3.Connection, task_id: str, author: str, body: str) 
     except (TypeError, ValueError):
         dedupe_s = 86400
     kind, stage, note = classify_comment(body) if routing else ("comment", None, None)
+    if routing and durable_only and kind == "comment" and not _KEEP_COMMENT_RE.search(body):
+        kind = "status"
     # ``allow_nested=True``: graph builders (kanban_swarm blackboard seeding)
     # compose comment writes under one outer commit.
     with write_txn(conn, allow_nested=True):

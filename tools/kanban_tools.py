@@ -1026,13 +1026,19 @@ def _handle_comment(args: dict, **kw) -> str:
     # with what reads as a system directive. See #19713.
     author = _persisted_identity()
     with _board(args.get("board")) as (kb, conn):
-        cid = kb.add_comment(conn, tid, author=author, body=str(body))
+        # Dispatcher workers write free-form comments (incl. cross-task handoff, #19713).
+        # Non-worker callers (EM/orchestrator chat, cron, subagents) store a comment only
+        # with a lasting marker; the rest is a status note on the event log.
+        worker = bool(os.environ.get("HERMES_KANBAN_TASK")) and _is_dispatcher_owned_worker()
+        cid = kb.add_comment(conn, tid, author=author, body=str(body), durable_only=not worker)
         if not cid:
             kind = kb.classify_comment(str(body))[0]
-            return _ok(task_id=tid, comment_id=None, routed=kind, note=(
-                "Not stored as a comment: stage/status lines go to the stage field "
-                "and event log. Use kanban_heartbeat(note=..., stage=...) for progress; "
-                "comments are for design, decisions, review findings and handoff."))
+            return _ok(task_id=tid, comment_id=None, routed="status" if kind == "comment" else kind,
+                       note=(
+                "Not stored as a comment: status/progress goes to the stage field and "
+                "event log. Comments from outside a kanban worker run must start with "
+                "DESIGN:, SCOPE:, ACCEPTANCE:, PROOF:, R<n>:, EM DECISION, NEEDS-DESIGN, "
+                "BLOCKER: or HANDOFF:."))
         return _ok(task_id=tid, comment_id=cid)
 
 

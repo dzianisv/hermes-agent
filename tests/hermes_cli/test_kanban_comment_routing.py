@@ -141,6 +141,40 @@ def test_tool_comment_reports_routing(home, monkeypatch):
     assert len(_show(tid)["comments"]) == 1
 
 
+def test_non_worker_tool_comment_status_goes_to_events(home, monkeypatch):
+    """EM/orchestrator sessions (no HERMES_KANBAN_TASK for this card) wrote 61 of 67
+    comments on t_49877950 as free-form status; only marked content is stored."""
+    tid = _create()
+    out = _tool("kanban_comment", {"task_id": tid, "body": "EM run6903: release-tag SUCCESS, next tag"})
+    assert out["ok"] and out["comment_id"] is None and out["routed"] == "status"
+    out = _tool("kanban_comment", {"task_id": tid, "body": "HANDOFF: report at /tmp/r.md"})
+    assert out["comment_id"]
+    shown = _show(tid)
+    assert [c["body"] for c in shown["comments"]] == ["HANDOFF: report at /tmp/r.md"]
+    notes = [e for e in shown["events"] if e["kind"] == "status_note"]
+    assert notes[-1]["payload"]["note"].startswith("EM run6903")
+
+
+def test_worker_free_comments_still_stored(home, monkeypatch):
+    tid, _ = _claimed_worker(monkeypatch)
+    out = _tool("kanban_comment", {"task_id": tid, "body": "Root cause: lease not released"})
+    assert out["comment_id"]
+    other = _create()  # cross-task handoff stays open to workers (#19713)
+    out = _tool("kanban_comment", {"task_id": other, "body": "see my findings on the parent"})
+    assert out["comment_id"]
+
+
+def test_cli_comment_from_agent_session_routes_status(home, monkeypatch):
+    tid = _create()
+    monkeypatch.setenv("HERMES_SESSION_ID", "em-session")
+    kc.run_slash(f"comment {tid} " + shlex.quote("Supervisor coordination: no reclaim"))
+    kc.run_slash(f"comment {tid} " + shlex.quote("EM DECISION: ship it"))
+    assert [c["body"] for c in _show(tid)["comments"]] == ["EM DECISION: ship it"]
+    monkeypatch.delenv("HERMES_SESSION_ID")  # a human at the terminal is unrestricted
+    kc.run_slash(f"comment {tid} " + shlex.quote("note from Den"))
+    assert len(_show(tid)["comments"]) == 2
+
+
 def test_heartbeat_progress_on_run_and_in_next_worker_context(home, monkeypatch):
     with kbc.connect_closing() as conn:
         pass

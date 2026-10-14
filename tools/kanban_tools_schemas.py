@@ -326,7 +326,10 @@ KANBAN_COMMENT_SCHEMA = _schema(
         "worker, final handoff. Progress and status do NOT go here — use "
         "kanban_heartbeat(note=..., stage=...). Lines starting STAGE:, "
         "SCHEDULED:, 'Specified —' or 'Unblocked' are routed to the stage "
-        "field / event log, and a repeat of the same body is not stored again."
+        "field / event log, and a repeat of the same body is not stored again. "
+        "Outside a kanban worker run (EM, orchestrator, cron) only "
+        "bodies starting DESIGN:, SCOPE:, ACCEPTANCE:, PROOF:, R<n>:, EM DECISION, "
+        "NEEDS-DESIGN, BLOCKER: or HANDOFF: are stored; anything else is a status note."
     ),
     {
         "task_id": _prop("string", (
