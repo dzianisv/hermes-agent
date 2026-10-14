@@ -1224,8 +1224,6 @@ def _parse_judge_response(raw: str) -> Tuple[str, str, bool, Optional[Dict[str, 
     if verdict not in {"done", "blocked", "continue", "wait"}:
         verdict = "continue"
     if verdict == "blocked":
-        # The 4th slot carries the blocker classification for BLOCKED (it is the wait directive
-        # only for WAIT); unknown/missing categories fall back to transient (bounded by budget).
         return "blocked", reason, False, _parse_blocker(data)
     if verdict != "wait":
         return verdict, reason, False, None
@@ -2220,21 +2218,11 @@ class GoalManager:
                 return _decision("active", True, (self.next_continuation_prompt() or "")
                                  + REVERSIBLE_DECISION_SUFFIX.format(question=question),
                                  "blocked_reversible", reason, "")
-            if category == BLOCKER_TRANSIENT:
-                # Agent-recoverable (tool error, timeout, stopped to ask permission it already has):
-                # continue with a corrective nudge on the normal path, bounded by the turn budget.
-                if self._budget_exhausted(state):
-                    return self._budget_pause(state, "blocked_transient", reason)
-                self._save()
-                return _decision("active", True, (self.next_continuation_prompt() or "")
-                                 + TRANSIENT_BLOCK_SUFFIX.format(reason=reason),
-                                 "blocked_transient", reason, "")
-            # Money / credentials-permissions / irreversible (or an unclassified "unachievable"):
-            # the user goal pauses for the user, as before.
-            return self._pause_decision(
-                f"judged unachievable: {reason}", "blocked", reason,
-                f"🚫 Goal judged unachievable — paused: {reason} Re-scope with /goal set, or override with /goal resume.",
-            )
+            if category != BLOCKER_TRANSIENT:
+                return self._pause_decision(
+                    f"judged unachievable: {reason}", "blocked", reason,
+                    f"🚫 Goal judged unachievable — paused: {reason} Re-scope with /goal set, or override with /goal resume.",
+                )
 
         if verdict == "done":
             state.status = "done"
@@ -2262,7 +2250,10 @@ class GoalManager:
         self._save()
         # Progress is visible in the log / `/goal status`, never as a chat bubble: a "↻ Continuing
         # toward goal (9/20)" line after every turn is machinery text (97/day on Doc Brown's thread).
-        return _decision("active", True, self.next_continuation_prompt(), "continue", reason, "")
+        prompt = self.next_continuation_prompt()
+        if verdict == "blocked":  # Only transient blocks reach the shared continuation checks.
+            prompt = (prompt or "") + TRANSIENT_BLOCK_SUFFIX.format(reason=reason)
+        return _decision("active", True, prompt, "continue", reason, "")
 
     def _judge_outage(self, state: "GoalState", reason: str, active_delegations: int) -> Dict[str, Any]:
         """Judge API unreachable. The goal's state never depends on judge availability: keep it
