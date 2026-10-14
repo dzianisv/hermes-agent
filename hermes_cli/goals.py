@@ -397,6 +397,7 @@ def run_gate(gate: GoalGate, *, cwd: Optional[str] = None) -> Tuple[bool, int, s
 class GoalState:
     """Serializable goal state stored per session."""
     goal: str
+    source: str = "user"
     status: str = "active"          # active | paused | done | cleared
     turns_used: int = 0
     max_turns: int = DEFAULT_MAX_TURNS
@@ -440,6 +441,7 @@ class GoalState:
         floats = {k: float(data.get(k) or 0.0) for k in ("created_at", "last_turn_at", "waiting_until", "waiting_since")}
         return cls(
             goal=data.get("goal", ""),
+            source=data.get("source", "user"),
             # Read newer writers conservatively without adopting their lifecycle policy.
             status={"waiting": "paused", "cancelled": "cleared"}.get(
                 data.get("status"), data.get("status", "active")),
@@ -1122,6 +1124,8 @@ class GoalManager:
     # --- mutation -----------------------------------------------------
 
     def _save(self) -> Optional[GoalState]:
+        if getattr(self, "_evaluating", False):
+            return self._state  # Evaluation commits all branch effects conditionally, once.
         save_goal(self.session_id, self._state)
         return self._state
 
@@ -1154,6 +1158,37 @@ class GoalManager:
             contract=contract if contract is not None else GoalContract(),
         )
         return self._save()
+
+    def set_agent_goal(self, objective: str, *, contract: Optional[GoalContract] = None,
+                       max_turns: Optional[int] = None, replace: bool = False) -> GoalState:
+        """Replace only our own occupied slot, archiving in the same transaction.
+
+        Archive keys have second precision: a second replacement in that second
+        overwrites its archive. This is not a complete replacement history.
+        """
+        objective = (objective or "").strip()
+        if not objective:
+            raise ValueError("goal text is empty")
+        state = GoalState(goal=objective, source="agent", created_at=time.time(),
+                          max_turns=max_turns or self.default_max_turns,
+                          contract=contract or GoalContract())
+        db = _get_session_db()
+        if db is None:
+            raise RuntimeError("goal database unavailable")
+        def create(conn):
+            cursor = conn.cursor()
+            row = cursor.execute("SELECT value FROM state_meta WHERE key = ?", (_meta_key(self.session_id),)).fetchone()
+            current = GoalState.from_json(row[0]) if row else None
+            if current and current.status in {"active", "paused"}:
+                if current.source != "agent":
+                    raise ValueError("a user-set /goal cannot be replaced by the agent")
+                if replace is not True:
+                    raise ValueError("an agent goal is already set; use replace=true")
+                db.set_meta(f"goal_archive:{self.session_id}:{int(state.created_at)}", row[0], cursor=cursor)
+            db.set_meta(_meta_key(self.session_id), state.to_json(), cursor=cursor)
+        db._execute_write(create)
+        self._state = state
+        return state
 
     def set_contract(self, contract: GoalContract) -> Optional[GoalState]:
         """Attach or replace the completion contract on the active goal."""
@@ -1449,7 +1484,40 @@ class GoalManager:
             "Use /goal resume to keep going, or /goal clear to stop.",
         )
 
-    def evaluate_after_turn(
+    def evaluate_after_turn(self, last_response: str, **kwargs) -> Dict[str, Any]:
+        """Commit evaluation effects only while the entry snapshot still owns the row.
+
+        Identical clocks/objectives/turn counts/caps cannot distinguish replacement,
+        including a changed contract; this bounded guard is not fully race-safe.
+        """
+        state = self._state
+        if state is None or state.status != "active":
+            return _decision(state.status if state else None, False, None, "inactive", "no active goal", "")
+        expected = (state.created_at, state.goal, state.turns_used, state.max_turns)
+        self._evaluating = True
+        try:
+            decision = self._evaluate_after_turn(last_response, **kwargs)
+        finally:
+            self._evaluating = False
+        db = _get_session_db()
+        def commit(conn):
+            cursor = conn.cursor()
+            row = cursor.execute("SELECT value FROM state_meta WHERE key = ?", (_meta_key(self.session_id),)).fetchone()
+            current = GoalState.from_json(row[0]) if row else None
+            if current and current.status == "active" and (
+                current.created_at, current.goal, current.turns_used, current.max_turns
+            ) == expected:
+                db.set_meta(_meta_key(self.session_id), state.to_json(), cursor=cursor)
+                return True
+            self._state = current
+            return False
+        if db is not None and db._execute_write(commit):
+            return decision
+        self._state = load_goal(self.session_id)
+        return _decision(self._state.status if self._state else None, False, None,
+                         "stale", "goal changed during evaluation", "")
+
+    def _evaluate_after_turn(
         self, last_response: str, *, user_initiated: bool = True,
         background_processes: Optional[List[Dict[str, Any]]] = None,
         active_delegations: int = 0,

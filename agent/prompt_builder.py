@@ -235,6 +235,14 @@ def build_memory_guidance(
 MEMORY_GUIDANCE = build_memory_guidance(True, True)
 USER_PROFILE_GUIDANCE = build_memory_guidance(False, True)
 
+GOAL_TOOL_GUIDANCE = (
+    "For a multi-step user request, call goal(get) first, then declare a verifiable outcome "
+    "with goal(create) if none is set. Plain questions need no goal. "
+    "When redirected, replace your own agent-set goal with create(replace=true); "
+    "never ask the user to /goal clear your own goal. User-set goals are protected. "
+    "The existing per-turn judge and turn budget apply to every goal."
+)
+
 SESSION_SEARCH_GUIDANCE = (
     "When the user references something from a past conversation or you suspect relevant cross-session "
     "context exists, use session_search to recall it before asking them to repeat themselves."
