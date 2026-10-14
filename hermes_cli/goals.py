@@ -629,11 +629,11 @@ def _warn_dropped_write(manager: str, kind: str, session_id: str) -> None:
     )
 
 
-def load_goal(session_id: str) -> Optional[GoalState]:
+def load_goal(session_id: str, *, db=None) -> Optional[GoalState]:
     """Load the goal for a session, or None if none exists."""
     if not session_id:
         return None
-    db = _get_session_db()
+    db = db or _get_session_db()
     if db is None:
         return None
     try:
@@ -650,11 +650,11 @@ def load_goal(session_id: str) -> Optional[GoalState]:
         return None
 
 
-def save_goal(session_id: str, state: GoalState) -> None:
+def save_goal(session_id: str, state: GoalState, *, db=None) -> None:
     """Persist a goal to SessionDB. No-op if DB unavailable."""
     if not session_id:
         return
-    db = _get_session_db()
+    db = db or _get_session_db()
     if db is None:
         _warn_dropped_write("GoalManager", "goal", session_id)
         return
@@ -664,13 +664,13 @@ def save_goal(session_id: str, state: GoalState) -> None:
         logger.debug("GoalManager: set_meta failed: %s", exc)
 
 
-def clear_goal(session_id: str) -> None:
+def clear_goal(session_id: str, *, db=None) -> None:
     """Mark a goal cleared in the DB (preserved for audit, status=cleared)."""
-    state = load_goal(session_id)
+    state = load_goal(session_id, db=db)
     if state is None:
         return
     state.status = "cleared"
-    save_goal(session_id, state)
+    save_goal(session_id, state, db=db)
 
 
 def migrate_goal_to_session(old_session_id: str, new_session_id: str, *, reason: str = "") -> bool:

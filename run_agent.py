@@ -1040,11 +1040,14 @@ class AIAgent(
         session_db = getattr(self, "_session_db", None)
         session_id = getattr(self, "session_id", None)
         if getattr(self, "_end_session_on_close", True) and session_db and session_id:
-            _quietly(lambda: session_db.end_session(session_id, "agent_close"))
-            row = session_db.get_session(session_id)
-            if row and row.get("source") == "subagent" and row.get("end_reason") == "agent_close":
-                from hermes_cli.goals import clear_goal
-                clear_goal(session_id)
+            def end_child():
+                session_db.end_session(session_id, "agent_close")
+                row = session_db.get_session(session_id)
+                if row and row.get("source") == "subagent" and row.get("end_reason") == "agent_close":
+                    from hermes_cli.goals import clear_goal, load_goal
+                    if (state := load_goal(session_id, db=session_db)) and state.status in {"active", "paused"}:
+                        clear_goal(session_id, db=session_db)
+            _quietly(end_child)
         if getattr(self, "_owns_session_db", False) and session_db is not None:
             self._owns_session_db = False
             # Shared instances no-op on close(); release the refcount so the registry closes on the last caller.

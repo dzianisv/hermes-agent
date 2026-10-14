@@ -145,3 +145,74 @@ async def test_branch_boundary_clears_only_departed_route(lane, in_place):
     runner._evict_cached_agent = Mock()
     await runner._handle_branch_command(MessageEvent(text="/branch fork", source=source))
     assert goals.load_goal(old.session_id).status == ("cleared" if in_place else "active")
+
+@pytest.mark.parametrize("deferred", [False, True])
+@pytest.mark.parametrize("status", ["active", "paused", "done"])
+def test_terminal_close_uses_owned_store_across_home_contexts(tmp_path, monkeypatch, deferred, status):
+    from concurrent.futures import Future
+    from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+    from hermes_state_registry import acquire, release_or_close
+    from tools.delegate_tool_child_run import _defer_close_after_timeout
+
+    homes = [tmp_path / "launch", tmp_path / "child-profile"]
+    handles = [acquire(home / "state.db") for home in homes]
+    agent = object.__new__(AIAgent)
+    agent.session_id = "child"
+    agent._session_db = acquire(homes[1] / "state.db")
+    agent._owns_session_db = agent._end_session_on_close = True
+    # Only unrelated tool teardown is stubbed; close(), row finalization and
+    # the deferred Future callback execute for real with registry-owned stores.
+    monkeypatch.setattr(agent, "_close_task_resources", lambda *a: None)
+    try:
+        for home, handle in zip(homes, handles):
+            handle.create_session("child", source="subagent")
+            handle.set_meta("goal:child", goals.GoalState(goal=str(home), status=status).to_json())
+            handle.create_session("parent", source="telegram")
+            handle.set_meta("goal:parent", goals.GoalState(goal="parent work").to_json())
+        future = Future()
+        token = set_hermes_home_override(homes[1])
+        try:
+            if deferred:
+                _defer_close_after_timeout(agent, future)
+        finally:
+            reset_hermes_home_override(token)
+        token = set_hermes_home_override(homes[0])
+        try:
+            future.set_result(None) if deferred else agent.close()
+        finally:
+            reset_hermes_home_override(token)
+        launch, owned = [goals.GoalState.from_json(h.get_meta("goal:child")) for h in handles]
+        assert (launch.status, owned.status) == (status, "done" if status == "done" else "cleared")
+        assert agent._owns_session_db is False
+        assert all(goals.GoalState.from_json(h.get_meta("goal:parent")).status == "active" for h in handles)
+    finally:
+        if agent._owns_session_db:
+            release_or_close(agent._session_db)
+            agent._owns_session_db = False
+        for handle in handles:
+            release_or_close(handle)
+
+
+@pytest.mark.parametrize("failure", ["get_session", "clear_goal"])
+def test_close_releases_owned_db_when_terminal_cleanup_fails(tmp_path, monkeypatch, failure):
+    from hermes_state_registry import acquire, release_or_close
+
+    db = acquire(tmp_path / "state.db")
+    db.create_session("child", source="subagent")
+    db.set_meta("goal:child", goals.GoalState(goal="child work").to_json())
+    agent = object.__new__(AIAgent)
+    agent.session_id, agent._session_db = "child", db
+    agent._owns_session_db = agent._end_session_on_close = True
+    monkeypatch.setattr(agent, "_close_task_resources", lambda *a: None)
+    monkeypatch.setattr(db if failure == "get_session" else goals, failure,
+                        Mock(side_effect=OSError("injected cleanup failure")))
+    release = Mock(wraps=release_or_close)
+    monkeypatch.setattr("hermes_state_registry.release_or_close", release)
+    try:
+        agent.close()
+        release.assert_called_once_with(db)
+        assert agent._owns_session_db is False
+    finally:
+        if agent._owns_session_db:
+            release_or_close(db)
+            agent._owns_session_db = False
