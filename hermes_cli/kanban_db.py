@@ -4689,12 +4689,10 @@ def specify_triage_task(
         if cur.rowcount != 1:
             return False
         if changed_fields and author and author.strip():
-            # Not add_comment (own txn + 'commented' event); 'specified' below records it.
-            _insert_comment(
-                conn, task_id, author.strip(),
-                "Specified — updated " + ", ".join(changed_fields) + " and promoted to todo.",
-                int(time.time()),
-            )
+            # A status line, not lasting content: event, not comment.
+            _append_event(conn, task_id, "status_note", {
+                "author": author.strip(),
+                "note": "Specified — updated " + ", ".join(changed_fields) + " and promoted to todo."})
         _append_event(
             conn, task_id, "specified",
             {"changed_fields": changed_fields} if changed_fields else None,

@@ -60,17 +60,19 @@ def test_specify_rejects_blank_title(kanban_home):
         kb.specify_triage_task(conn, tid, title="   ", body="ok")
 
 
-def test_specify_records_audit_comment_only_when_author_given(kanban_home):
-    # With author → comment added.
+def test_specify_records_status_note_not_comment(kanban_home):
+    # With author → status_note event, no comment (comment-noise row).
     with kbc.connect() as conn:
         tid1 = _create_triage(conn, title="a")
         kb.specify_triage_task(
             conn, tid1, title="A-spec", body="b", author="ace"
         )
         comments1 = kb.list_comments(conn, tid1)
-    assert len(comments1) == 1
-    assert "Specified" in comments1[0].body
-    assert comments1[0].author == "ace"
+        notes = [e for e in kb.list_events(conn, tid1) if e.kind == "status_note"]
+    assert comments1 == []
+    assert len(notes) == 1
+    assert "Specified" in notes[0].payload["note"]
+    assert notes[0].payload["author"] == "ace"
 
     # Without author → no comment (silent).
     with kbc.connect() as conn:
