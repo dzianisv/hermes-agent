@@ -82,6 +82,12 @@ _USER_PAUSED_REASON = "user-paused"
 # Cap on remembered waiting-on-user questions per goal (status line / tool view stay readable).
 _MAX_PENDING_HUMAN_DECISIONS = 8
 
+COMPLETION_EVIDENCE_PROMPT = (
+    "Completion claim. Judge ONLY the concrete evidence below (test output, run/event ID, URL, "
+    "command result) against the goal's success criteria. Narrative claims without such evidence "
+    "are not proof.\n\nEvidence:\n{evidence}"
+)
+
 QUIET_TURN_REMINDER = (
     "\n\n[Reminder] Your last turn was silent and declared no wait. Take the next step, or call "
     "goal(action=\"wait\", ...) naming what you are waiting on. Another quiet turn pauses the goal."
@@ -1730,13 +1736,16 @@ class GoalManager:
         gate = self._check_gates()
         if gate is not None:
             return gate
+        # One AI check: does the concrete evidence (test result, run ID, link) meet the success
+        # criteria? "No" returns the reason and the goal stays open; checker down = "unverified".
         verdict, reason, parse_failed, _wait, transport_failed = judge_goal(
-            state.goal, f"Completion claim with evidence:\n{evidence}",
+            state.goal, COMPLETION_EVIDENCE_PROMPT.format(evidence=evidence),
             subgoals=state.subgoals or None, contract=state.contract if state.has_contract() else None,
         )
         if parse_failed or transport_failed:
-            verdict = "unavailable"
+            verdict = "unverified"
         if verdict == "done":
+            state.last_verdict, state.last_reason = "done", reason
             self.mark_done(reason)
         return _decision(state.status, False, None, verdict, reason, "")
 

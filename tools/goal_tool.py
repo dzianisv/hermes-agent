@@ -212,8 +212,9 @@ def goal_tool(action: str, *, objective: str = "", evidence: str = "", max_turns
             return tool_error("complete needs evidence that the outcome exists")
         decision = mgr.complete_with_evidence(evidence)
         verdict, reason = decision["verdict"], decision["reason"]
-        if verdict == "unavailable":
-            return tool_error(f"completion audit unavailable ({reason}); keep working or retry")
+        if verdict == "unverified":
+            return tool_error(f"completion unverified: evidence checker unavailable ({reason}); the goal "
+                              "stays open — retry complete later", verdict=verdict, reason=reason)
         if verdict != "done":
             return tool_error(f"completion audit refused: {verdict} — {reason}", verdict=verdict, reason=reason)
         return _ok(completed=True, reason=reason)
