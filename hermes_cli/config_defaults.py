@@ -1381,6 +1381,7 @@ DEFAULT_CONFIG = {
     # exhausted, or paused. Judge failures fail OPEN; the budget is the backstop.
     "goals": {
         "agent_tool": False,  # Explicit boolean opt-in for agent declarations.
+        "max_stalled_turns": 5,  # Repeated responses after the first, before auto-pause.
         # Max continuation turns before auto-pause (/goal resume) — guards against judge false
         # negatives and unbounded spend.
         "max_turns": 20,

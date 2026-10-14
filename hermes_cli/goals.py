@@ -30,6 +30,12 @@ logger = logging.getLogger(__name__)
 # ── Constants & defaults ──────────────────────────────────────────────
 
 DEFAULT_MAX_TURNS = 20
+DEFAULT_MAX_STALLED_TURNS = 5
+TRANSIENT_BLOCK_SUFFIX = (
+    "\n\nThe judge identified a recoverable blocker: correct the approach and take "
+    "the next authorized step. Do not repeat the clarification or ask the user to "
+    "resume the goal. Do not bypass consent, authorization, or safety constraints."
+)
 DEFAULT_JUDGE_TIMEOUT = 30.0
 # Judge output budget. Reasoning models burn hidden-reasoning tokens before the visible one-line
 # JSON verdict; 200 (the original) reliably truncated it and tripped the auto-pause. 4096 covers
@@ -136,6 +142,12 @@ JUDGE_SYSTEM_PROMPT = (
     "itself names. Never infer one the response does not name — an unnamed "
     "401 belongs to the model provider the agent was calling, not to some "
     "other service's token.\n\n"
+    "For BLOCKED, also return blocker (transient, human, or unknown), "
+    "human_category and human_decision. Use transient ONLY when the agent can "
+    "correct its approach or unnecessary clarification within existing authorization; "
+    "set both human fields to empty strings. Spending money, auth/credentials, irreversible "
+    "actions, safety or consent require human: name the category and decision needed. "
+    "Missing evidence is unknown, never assume authorization.\n\n"
     "WAIT — the goal is NOT done, but the next step is to wait for async "
     "work to finish rather than act again. Choose this ONLY when the agent's "
     "progress is genuinely gated on something running on its own:\n"
@@ -406,6 +418,8 @@ class GoalState:
     last_verdict: Optional[str] = None        # "done" | "blocked" | "continue" | "wait" | "skipped"
     last_reason: Optional[str] = None
     paused_reason: Optional[str] = None       # why we auto-paused (budget, etc.)
+    consecutive_stalled: int = 0
+    last_response_snippet: str = ""
     consecutive_parse_failures: int = 0       # judge-output parse failures in a row
     # Tracked separately from parse failures: a broken API key returns 401 every call and must
     # auto-pause instead of burning the budget on an unreachable judge.
@@ -437,7 +451,7 @@ class GoalState:
     def from_json(cls, raw: str) -> "GoalState":
         data = json.loads(raw)
         raw_subgoals = data.get("subgoals") or []
-        ints = {k: int(data.get(k) or 0) for k in ("turns_used", "consecutive_parse_failures", "consecutive_transport_failures", "waiting_on_delegations")}
+        ints = {k: int(data.get(k) or 0) for k in ("turns_used", "consecutive_stalled", "consecutive_parse_failures", "consecutive_transport_failures", "waiting_on_delegations")}
         floats = {k: float(data.get(k) or 0.0) for k in ("created_at", "last_turn_at", "waiting_until", "waiting_since")}
         return cls(
             goal=data.get("goal", ""),
@@ -448,6 +462,7 @@ class GoalState:
             max_turns=int(data.get("max_turns") or DEFAULT_MAX_TURNS),
             last_verdict=data.get("last_verdict"),
             last_reason=data.get("last_reason"),
+            last_response_snippet=str(data.get("last_response_snippet") or ""),
             paused_reason=data.get("paused_reason"),
             subgoals=[str(s).strip() for s in raw_subgoals if str(s).strip()] if isinstance(raw_subgoals, list) else [],
             waiting_on_pid=(int(data["waiting_on_pid"]) if data.get("waiting_on_pid") else None),
@@ -745,6 +760,17 @@ def _goal_judge_setting(key: str, default, cast):
     return default
 
 
+def _max_stalled_turns() -> int:
+    try:
+        from hermes_cli.config import load_config
+        value = (load_config().get("goals") or {}).get("max_stalled_turns", DEFAULT_MAX_STALLED_TURNS)
+        if type(value) is int and value > 0:
+            return value
+    except Exception:
+        pass
+    return DEFAULT_MAX_STALLED_TURNS
+
+
 def _goal_judge_max_tokens() -> int:
     return _goal_judge_setting("max_tokens", DEFAULT_JUDGE_MAX_TOKENS, int)
 
@@ -780,7 +806,8 @@ def _parse_judge_response(raw: str) -> Tuple[str, str, bool, Optional[Dict[str, 
     """Parse the judge's reply, fail-open. Returns ``(verdict, reason, parse_failed, wait_directive)``.
 
     ``parse_failed`` flags non-JSON output so callers can auto-pause after N in a row.
-    ``wait_directive`` is ``{"session_id"}`` / ``{"pid"}`` / ``{"seconds"}`` for a ``wait``
+    ``wait_directive`` also carries blocker/human metadata for ``blocked``. It is
+    ``{"session_id"}`` / ``{"pid"}`` / ``{"seconds"}`` for a ``wait``
     verdict; a wait with no target is downgraded to ``continue``. Accepts ``{"verdict": ...}`` and
     the legacy ``{"done": <bool>}`` shape.
     """
@@ -800,6 +827,12 @@ def _parse_judge_response(raw: str) -> Tuple[str, str, bool, Optional[Dict[str, 
         verdict = "done" if done else "continue"
     if verdict not in {"done", "blocked", "continue", "wait"}:
         verdict = "continue"
+    if verdict == "blocked":
+        # Preserve metadata in the existing directive slot; WAIT alone interprets wait targets.
+        return verdict, reason, False, {
+            key: str(data.get(key) or "").strip()
+            for key in ("blocker", "human_category", "human_decision")
+        }
     if verdict != "wait":
         return verdict, reason, False, None
 
@@ -1211,6 +1244,8 @@ class GoalManager:
         self._state.status = "active"
         self._state.paused_reason = None
         self._state.clear_wait()   # resuming starts fresh
+        self._state.consecutive_stalled = 0
+        self._state.last_response_snippet = ""
         if reset_budget:
             self._state.turns_used = 0
         return self._save()
@@ -1561,11 +1596,15 @@ class GoalManager:
             if parked is not None:
                 return parked
 
-        # BLOCKED is NOT done: pause so the user sees the judge's reason and can re-scope or override,
-        # instead of burning turns on an unachievable goal or waving it through as complete.
-        # BLOCKED verdict: the judge ruled the goal genuinely cannot be satisfied as stated (impossible, out
-        # of scope, needs user input). See #100954.
-        if verdict == "blocked":
+        # Only explicitly recoverable, non-human blockers continue, through the SAME
+        # failure/stall/budget guards as ordinary continuation. Missing or conflicting
+        # classification stays paused; a corrective prompt never grants authorization.
+        transient = verdict == "blocked" and bool(wait_directive) and (
+            wait_directive.get("blocker", "").lower() == "transient"
+            and not wait_directive.get("human_category")
+            and not wait_directive.get("human_decision")
+        )
+        if verdict == "blocked" and not transient:
             return self._pause_decision(
                 f"judged unachievable: {reason}", "blocked", reason,
                 f"🚫 Goal judged unachievable — paused: {reason} Re-scope with /goal set, or override with /goal resume.",
@@ -1594,14 +1633,38 @@ class GoalManager:
                 + _JUDGE_CONFIG_HINT.format(provider="openrouter", model="google/gemini-3-flash-preview"),
             )
 
+        stalled = self._note_progress(last_response)
         if state.turns_used >= state.max_turns:
-            return self._budget_pause(state, "continue", reason)
+            return self._budget_pause(state, "blocked" if transient else "continue", reason)
+        if stalled >= _max_stalled_turns():
+            return self._pause_decision(
+                f"stalled: {stalled} repeated responses", "stalled", reason,
+                "⏸ Goal paused — repeated responses show no new progress. "
+                "Re-scope with /goal set or resume with /goal resume.",
+            )
 
         self._save()
+        prompt = self.next_continuation_prompt() or ""
+        if transient:
+            prompt += TRANSIENT_BLOCK_SUFFIX
         return _decision(
-            "active", True, self.next_continuation_prompt(), "continue", reason,
+            "active", True, prompt, "blocked" if transient else "continue", reason,
             f"↻ Continuing toward goal ({state.turns_used}/{state.max_turns}): {reason}",
         )
+
+    def _note_progress(self, response: str) -> int:
+        """Count consecutive identical normalized snippets, not proof of task progress.
+
+        A changed response resets the counter, so the unconditional turn cap remains
+        binding even when an agent varies its prose without producing an artifact.
+        """
+        state = self._state
+        snippet = " ".join(response.split())[:_JUDGE_RESPONSE_SNIPPET_CHARS]
+        state.consecutive_stalled = (
+            state.consecutive_stalled + 1 if snippet == state.last_response_snippet else 0
+        )
+        state.last_response_snippet = snippet
+        return state.consecutive_stalled
 
     def next_continuation_prompt(self) -> Optional[str]:
         s = self._state
