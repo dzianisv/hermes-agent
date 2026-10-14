@@ -3596,20 +3596,7 @@ def _dispatch_lane_task(
     if claimed is None:
         return False
     try:
-        workspace, resolved_kind, resolved_branch_name = _kbw.resolve_dispatch_workspace(
-            claimed, board=board,
-        )
-        if resolved_kind != (claimed.workspace_kind or "scratch"):
-            # dir -> worktree promotion: a shared git checkout became this
-            # card's own worktree; persist so retries/cleanup see the truth.
-            with _kb.write_txn(conn):
-                conn.execute("UPDATE tasks SET workspace_kind = ? WHERE id = ?",
-                             (resolved_kind, claimed.id))
-                _kb._append_event(conn, claimed.id, "workspace_isolated", {
-                    "from_kind": claimed.workspace_kind, "from_path": claimed.workspace_path,
-                    "to_path": str(workspace), "branch": resolved_branch_name,
-                })
-            claimed.workspace_kind = resolved_kind
+        workspace, resolved_branch_name = _kbw.claim_workspace(conn, claimed, board=board)
     except Exception as exc:
         if _record_task_failure(
             conn, claimed.id, f"workspace: {exc}",
@@ -3617,14 +3604,11 @@ def _dispatch_lane_task(
         ):
             result.auto_blocked.append(claimed.id)
         return False
-    _kbw.set_workspace_path(conn, claimed.id, str(workspace))
     try:
         from hermes_cli.kanban_wait_on import default_head, record_run_head
         record_run_head(conn, claimed.current_run_id, default_head(str(workspace)))
     except Exception:
         pass
-    if claimed.workspace_kind == "worktree":
-        _kbw.set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
     _kbw._maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
     if lane == "review":
         # Force-load sdlc-review; the kanban lifecycle is already in every

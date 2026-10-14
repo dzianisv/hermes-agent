@@ -577,6 +577,23 @@ def resolve_dispatch_workspace(
     return resolve_workspace(task, board=board), kind, None
 
 
+def claim_workspace(conn: sqlite3.Connection, task: Task, *, board: Optional[str] = None) -> tuple[Path, Optional[str]]:
+    """Resolve a just-claimed task's workspace and persist path/kind/branch; every claim path uses this."""
+    workspace, kind, branch = resolve_dispatch_workspace(task, board=board)
+    if kind != (task.workspace_kind or "scratch"):
+        with _kb.write_txn(conn):  # dir -> worktree promotion; persist so retries/cleanup see it
+            conn.execute("UPDATE tasks SET workspace_kind = ? WHERE id = ?", (kind, task.id))
+            _kb._append_event(conn, task.id, "workspace_isolated", {
+                "from_kind": task.workspace_kind, "from_path": task.workspace_path,
+                "to_path": str(workspace), "branch": branch})
+        task.workspace_kind = kind
+    set_workspace_path(conn, task.id, str(workspace))
+    if kind == "worktree":
+        branch = branch or (task.branch_name or "").strip() or f"wt/{task.id}"
+        set_branch_name(conn, task.id, branch)
+    return workspace, branch
+
+
 def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
     """Resolve (and create if needed) the workspace for a task.
 

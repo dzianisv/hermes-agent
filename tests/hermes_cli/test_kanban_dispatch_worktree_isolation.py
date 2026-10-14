@@ -123,3 +123,31 @@ def test_worktree_card_on_repo_subdir_is_isolated(env):
     ws = Path(_dispatch("repo-board")[t]).resolve()
     assert ws != repo.resolve() and ws != (repo / "pkg").resolve()
     assert _git(ws, "branch", "--show-current") == f"wt/{t}"
+
+
+def test_cli_claim_isolates_dir_card(env):
+    """`hermes kanban claim` (manual/agent claim, no `spawned` event) must not hand out the shared checkout."""
+    import argparse
+    from hermes_cli import kanban as kcli
+    repo = env
+    with kbc.connect(board="repo-board") as conn:
+        t = kb.create_task(conn, title="t", assignee="default", workspace_kind="dir", board="repo-board")
+    import os
+    os.environ["HERMES_KANBAN_BOARD"] = "repo-board"
+    try:
+        assert kcli._cmd_claim(argparse.Namespace(task_id=t, ttl=60)) == 0
+    finally:
+        del os.environ["HERMES_KANBAN_BOARD"]
+    row = _row("repo-board", t)
+    assert row["workspace_kind"] == "worktree" and row["branch_name"] == f"wt/{t}"
+    assert not Path(row["workspace_path"]).resolve().is_relative_to(repo.resolve())
+
+
+def test_worker_terminal_cwd_not_overridden_by_profile_cwd(env, tmp_path, monkeypatch):
+    """A kanban worker's TERMINAL_CWD (its workspace) beats the profile's terminal.cwd (the shared repo)."""
+    from hermes_cli.config import apply_terminal_config_to_env
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    target = {"HERMES_KANBAN_WORKSPACE": str(ws), "TERMINAL_CWD": str(ws)}
+    apply_terminal_config_to_env(env=target, config={"terminal": {"backend": "local", "cwd": str(env)}}, override=True)
+    assert target["TERMINAL_CWD"] == str(ws)

@@ -2174,6 +2174,8 @@ def apply_terminal_config_to_env(
         value = terminal_cfg[cfg_key]
         if not _terminal_config_value_is_bridgeable(cfg_key, value):
             continue
+        if cfg_key == "cwd" and target.get("HERMES_KANBAN_WORKSPACE"):
+            continue  # kanban worker: TERMINAL_CWD is pinned to the card's workspace by the dispatcher
         if cfg_key == "cwd":
             raw_cwd = str(value or "").strip()
             if isinstance(value, str) and not _is_ssh_remote_tilde_cwd(terminal_backend, raw_cwd):
