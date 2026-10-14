@@ -100,6 +100,9 @@ def test_unprotected_paths_and_open_descriptors_still_work(protected_home, tmp_p
 
 @pytest.mark.allow_real_home_io
 def test_explicit_opt_out_allows_only_the_disposable_canary(protected_home):
+    from pm import environments
+
+    assert environments.payload_venv.__module__ == "pm.environments"
     target = protected_home / "file.txt"
     target.write_text("opted out", encoding="utf-8")
     assert target.read_text(encoding="utf-8") == "opted out"
@@ -172,6 +175,56 @@ def test_checkout_inside_a_guarded_root_is_not_hermes_state():
     guard.check(PROJECT_ROOT / ".venv" / "bin" / "python", metadata=True)
     with pytest.raises(AssertionError, match="REAL hermes home"):
         guard.check(PROJECT_ROOT.parent / "config.yaml")
+
+
+def test_checkout_payload_discovery_uses_empty_fixture_not_real_parent(tmp_path, monkeypatch):
+    from pm import environments
+    from tests import conftest
+
+    monkeypatch.setattr(conftest, "_REAL_HERMES_ROOT_CANDIDATES", [PROJECT_ROOT.parent])
+    manifest = PROJECT_ROOT.parent / "manifest.json"
+    with pytest.raises(AssertionError, match="REAL hermes home"):
+        manifest.is_file()
+    probes = []
+    original_is_file = Path.is_file
+
+    def record_probe(path):
+        probes.append(path)
+        return original_is_file(path)
+
+    monkeypatch.setattr(Path, "is_file", record_probe)
+    assert environments.payload_venv(PROJECT_ROOT) is None
+    assert len(probes) == 1
+    assert probes[0].is_relative_to(tmp_path)
+    assert probes[0].name == "manifest.json"
+
+
+def test_late_bootstrap_import_keeps_real_parent_protected(monkeypatch):
+    import importlib
+    from tests import conftest
+
+    monkeypatch.setattr(conftest, "_REAL_HERMES_ROOT_CANDIDATES", [PROJECT_ROOT.parent])
+    monkeypatch.delitem(sys.modules, "hermes_bootstrap", raising=False)
+    assert importlib.import_module("hermes_bootstrap").__file__ == str(PROJECT_ROOT / "hermes_bootstrap.py")
+    with pytest.raises(AssertionError, match="REAL hermes home"):
+        (PROJECT_ROOT.parent / "manifest.json").stat()
+
+
+def test_explicit_payload_still_uses_real_manifest_resolver(tmp_path):
+    from pm import environments
+
+    package = tmp_path / "sealed"
+    checkout = package / "tree"
+    checkout.mkdir(parents=True)
+    venv = package / "venv"
+    venv.mkdir()
+    manifest = package / "manifest.json"
+    manifest.write_text('{"repo": "tree", "venv": "venv"}', encoding="utf-8")
+    assert environments.payload_venv(checkout) == venv
+    assert environments.base_venv(checkout) == venv
+    manifest.write_text('{"repo": "tree", "venv": "../escape"}', encoding="utf-8")
+    with pytest.raises(RuntimeError, match="payload environment escapes its root"):
+        environments.payload_venv(checkout)
 
 
 def test_hermes_exported_scratch_tmp_is_not_the_test_temp_root(tmp_path):

@@ -1392,7 +1392,7 @@ _REAL_HERMES_ROOT_CANDIDATES = _capture_real_hermes_root()
 
 
 @pytest.fixture(autouse=True)
-def _forbid_real_hermes_home_io(monkeypatch, request):
+def _forbid_real_hermes_home_io(monkeypatch, request, tmp_path):
     """Guard Python file/metadata/deletion calls and SQLite against real state.
 
     Native libraries and subprocesses still need their own temporary-home
@@ -1403,6 +1403,14 @@ def _forbid_real_hermes_home_io(monkeypatch, request):
     from tests.home_io_guard import HomeIOGuard
 
     HomeIOGuard(lambda: _REAL_HERMES_ROOT_CANDIDATES).install(monkeypatch)
+    # Incidental checkout discovery must not inspect a live sibling manifest.
+    from pm import environments
+    original_payload_venv = environments.payload_venv
+    empty_root = tmp_path / "empty-payload" / "tree"
+    empty_root.mkdir(parents=True)
+    monkeypatch.setattr(environments, "payload_venv", lambda project_root: original_payload_venv(
+        empty_root if Path(project_root).resolve() == PROJECT_ROOT.resolve() else project_root
+    ))
 
 
 @pytest.fixture
