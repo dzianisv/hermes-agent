@@ -50,6 +50,58 @@ async def test_shutdown_notice_to_active_chats_and_home_channel_honors_policy(tm
 
 
 @pytest.mark.asyncio
+async def test_home_channel_shutdown_broadcast_skipped_when_nothing_in_flight(tmp_path, monkeypatch, caplog):
+    _configure(tmp_path, monkeypatch, None)
+    runner, adapter = make_restart_runner()
+    runner._running_agents = {}
+    monkeypatch.setattr(runner, "_active_cron_job_count", lambda: 0)
+    monkeypatch.setattr(runner, "_active_api_run_count", lambda: 0)
+    runner.config.platforms[Platform.TELEGRAM].home_channel = HomeChannel(
+        platform=Platform.TELEGRAM, chat_id="home-chat", name="Telegram Home")
+
+    with caplog.at_level("INFO", logger="gateway"):
+        await runner._notify_active_sessions_of_shutdown()
+
+    assert adapter.sent_calls == []
+    assert "skipped: no in-flight work" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_home_channel_shutdown_broadcast_still_sent_with_in_flight_work(tmp_path, monkeypatch):
+    _configure(tmp_path, monkeypatch, None)
+    runner, adapter = make_restart_runner()
+    source = make_restart_source(thread_id="42")
+    session_key = build_session_key(source)
+    runner._running_agents = {session_key: MagicMock()}
+    runner._cache_session_source(session_key, source)
+    runner.config.platforms[Platform.TELEGRAM].home_channel = HomeChannel(
+        platform=Platform.TELEGRAM, chat_id="home-chat", name="Telegram Home")
+
+    await runner._notify_active_sessions_of_shutdown()
+
+    by_chat = {c: m for c, m, _meta in adapter.sent_calls}
+    assert set(by_chat) == {source.chat_id, "home-chat"}
+    assert all("Hermes is shutting down" in m for m in by_chat.values())
+
+
+@pytest.mark.asyncio
+async def test_home_channel_shutdown_broadcast_sent_when_cron_in_flight(tmp_path, monkeypatch):
+    _configure(tmp_path, monkeypatch, None)
+    runner, adapter = make_restart_runner()
+    runner._running_agents = {}
+    monkeypatch.setattr(runner, "_active_cron_job_count", lambda: 1)
+    monkeypatch.setattr(runner, "_active_api_run_count", lambda: 0)
+    runner.config.platforms[Platform.TELEGRAM].home_channel = HomeChannel(
+        platform=Platform.TELEGRAM, chat_id="home-chat", name="Telegram Home")
+
+    await runner._notify_active_sessions_of_shutdown()
+
+    chats = [c for c, _m, _meta in adapter.sent_calls]
+    assert chats == ["home-chat"]
+    assert "Hermes is shutting down" in adapter.sent_calls[0][1]
+
+
+@pytest.mark.asyncio
 async def test_in_chat_restart_ack_to_requester_is_never_suppressed(tmp_path, monkeypatch):
     _configure(tmp_path, monkeypatch, True)
     runner, adapter = make_restart_runner()

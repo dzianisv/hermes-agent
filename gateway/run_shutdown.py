@@ -1088,6 +1088,18 @@ class GatewayShutdownMixin:
                     "Home-channel shutdown broadcast suppressed by drain marker (suppress_notification=true)"
                 )
                 return
+        # The broadcast says "your current task will be interrupted"; with nothing in flight that is false
+        # for every recipient (both reported notices fired with active/cron/api == 0). Per-session pings
+        # above already gate on running agents.
+        agents = len(self._snapshot_running_agents())
+        cron = self._active_cron_job_count()
+        api = self._active_api_run_count()
+        if agents + cron + api == 0:
+            logger.info(
+                "Home-channel shutdown broadcast skipped: no in-flight work (agents=%d cron=%d api=%d)",
+                agents, cron, api,
+            )
+            return
         # Snapshot adapters: adapter.send() can hit a fatal path (_handle_fatal) that pops the adapter
         # from self.adapters -> ``RuntimeError: dictionary changed size during iteration``.
         for platform, adapter in list(self.adapters.items()):
