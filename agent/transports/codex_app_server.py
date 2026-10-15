@@ -49,6 +49,11 @@ class CodexAppServerTransportError(CodexAppServerError):
 
 _TRANSPORT_LOST_CODE = -32000
 
+# Bound on waiting for the stderr reader to drain after the app-server exits.
+# The pipe hits EOF once every holder exits; a lingering grandchild that keeps
+# it open must not hang error reporting.
+_STDERR_DRAIN_TIMEOUT_S = 2.0
+
 
 def _snapshot_descendants(pid: int) -> list[Any]:
     """psutil handles for ``pid``'s current descendants ([] when psutil is unavailable)."""
@@ -281,6 +286,11 @@ class CodexAppServerClient:
 
     def stderr_tail(self, n: int = 20) -> list[str]:
         """Return last n lines of codex's stderr (for error reports)."""
+        # A dead app-server's final lines (its crash reason) may still be in the
+        # pipe: let the reader drain to EOF before reporting. Never wait on a
+        # live process, and never while holding the lock the reader appends under.
+        if self._proc.poll() is not None and self._stderr_reader.is_alive():
+            self._stderr_reader.join(timeout=_STDERR_DRAIN_TIMEOUT_S)
         with self._stderr_lock:
             return list(self._stderr_lines[-n:])
 

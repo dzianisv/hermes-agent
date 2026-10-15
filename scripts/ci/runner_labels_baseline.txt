@@ -1,0 +1,16 @@
+# Workflows still allowed to hard-code org-only `*-core` runner labels.
+# These are release/manual lanes pending conversion to the
+# `github.repository_owner == 'NousResearch' && '<label>' || '<hosted>'`
+# form by a follow-up card. This list must only shrink: an entry with no
+# remaining offenders fails scripts/ci/check_runner_labels.py.
+docker.yml
+desktop-bundled-release.yml
+windows-bundle-sdk.yml
+pm-bundle.yml
+nix.yml
+js-tests.yml
+rust-tests.yml
+install-e2e-windows-run.yml
+desktop-bundle-smoke.yml
+windows-venv-e2e.yml
+e2e-desktop.yml
