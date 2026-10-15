@@ -27,6 +27,11 @@ def isolated_kanban_home_with_profiles(monkeypatch):
         if mod.startswith("hermes_cli") or mod.startswith("hermes_state") or mod == "hermes_constants":
             del sys.modules[mod]
     from hermes_cli import kanban_db
+    # The purge above re-imports kanban_db_dispatch, dropping conftest's autouse
+    # memory/disk guard stubs; re-pin them so results don't track the host's disk.
+    from hermes_cli import kanban_db_dispatch as kbd
+    monkeypatch.setattr(kbd, "_system_memory_sample", lambda: {}, raising=False)
+    monkeypatch.setattr(kbd, "_disk_sample", lambda *a, **k: {}, raising=False)
     yield kanban_db
 
 
