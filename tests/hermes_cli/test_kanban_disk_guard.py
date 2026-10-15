@@ -507,6 +507,15 @@ def test_stalled_swap_listing_degrades_to_unknown(kanban_home, tmp_path, monkeyp
         release.set()
 
 
+
+def _warm_plugin_discovery():
+    """Run the process-wide one-time lazy plugin discovery (~2s cold) before
+    timing a tick: claim_task's lifecycle hook triggers it on first use, so an
+    unwarmed timer measures plugin import cost, not the disk probe timeout."""
+    from hermes_cli import plugins
+    plugins._delivery_manager()
+
+
 @pytest.mark.real_disk_guard
 def test_dispatch_with_stalled_probe_does_not_hang(
     kanban_home, all_assignees_spawnable, tmp_path, monkeypatch,
@@ -533,6 +542,7 @@ def test_dispatch_with_stalled_probe_does_not_hang(
         with kbc.connect() as conn:
             for t in ("a", "b", "c"):
                 kb.create_task(conn, title=t, assignee="alice")
+            _warm_plugin_discovery()
             start = time.monotonic()
             res = kbd.dispatch_once(conn, spawn_fn=fake_spawn)
             elapsed = time.monotonic() - start
@@ -604,6 +614,7 @@ def test_dispatch_with_stalled_swap_fallback_does_not_hang(
         with kbc.connect() as conn:
             for t in ("a", "b", "c"):
                 kb.create_task(conn, title=t, assignee="alice")
+            _warm_plugin_discovery()
             start = time.monotonic()
             res = kbd.dispatch_once(conn, spawn_fn=fake_spawn)
             elapsed = time.monotonic() - start
