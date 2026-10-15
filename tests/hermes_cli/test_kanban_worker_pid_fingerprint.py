@@ -149,3 +149,43 @@ def test_unverified_fingerprint_capture_never_authorizes_a_signal(board, monkeyp
     monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
     assert kb.release_stale_claims(conn, signal_fn=sig) == 1
     assert killed == [] and kb.get_task(conn, tid2).status == "ready"
+
+
+def test_start_time_drift_within_5s_is_not_a_recycle(monkeypatch):
+    """macOS psutil start time drifts ~2s (200 centiseconds) between spawn and a later read. That
+    is still our worker: not recycled, and a live pid stays alive. 10s is a different process.
+    A different instantiation epoch with the same start tick is a reboot, not drift."""
+    import gateway.status as status
+    from gateway import drain_control
+
+    epoch = "boot-a:1"
+    recorded_start = 1_700_000_000_00
+    monkeypatch.setattr(drain_control, "current_instantiation_epoch", lambda: epoch)
+    pid = os.getpid()
+
+    for drift in (200, -200):
+        monkeypatch.setattr(status, "get_process_start_time", lambda _pid, d=drift: recorded_start + d)
+        started_at = f"{epoch}|{recorded_start}"
+        assert kbd._pid_recycled(pid, started_at) is False
+        assert kbd._worker_alive(pid, started_at) is True
+
+    monkeypatch.setattr(status, "get_process_start_time", lambda _pid: recorded_start + 1000)
+    assert kbd._pid_recycled(pid, f"{epoch}|{recorded_start}") is True
+
+    monkeypatch.setattr(status, "get_process_start_time", lambda _pid: recorded_start)
+    assert kbd._pid_recycled(pid, f"other-boot:9|{recorded_start}") is True
+
+
+def test_legacy_integer_fingerprint_tolerates_2s_not_10s(monkeypatch):
+    """Rows written before the boot witness store a bare start time. Same 5s window: 2s of drift
+    is still our worker; 10s is a recycle."""
+    import gateway.status as status
+
+    recorded = 1_700_000_000_00
+    pid = os.getpid()
+    monkeypatch.setattr(status, "get_process_start_time", lambda _pid: recorded + 200)
+    assert kbd._pid_recycled(pid, recorded) is False
+    monkeypatch.setattr(status, "get_process_start_time", lambda _pid: recorded - 200)
+    assert kbd._pid_recycled(pid, recorded) is False
+    monkeypatch.setattr(status, "get_process_start_time", lambda _pid: recorded + 1000)
+    assert kbd._pid_recycled(pid, recorded) is True
