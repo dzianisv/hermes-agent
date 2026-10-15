@@ -49,7 +49,7 @@ def _events(conn, tid, kind):
 def test_approve_for_merge_hands_to_implementer_at_merge_stage(kanban_home):
     with kb.connect() as conn:
         tid = _to_review(conn)
-        assert kb.get_task(conn, tid).current_step_key == "review"
+        assert kb.get_task(conn, tid).current_step_key == "in-dev-review"
         rv = kb.claim_review_task(conn, tid)
         ok, who = kb.approve_for_merge(conn, tid, summary="LGTM at abc123",
                                        expected_run_id=rv.current_run_id)
@@ -58,7 +58,7 @@ def test_approve_for_merge_hands_to_implementer_at_merge_stage(kanban_home):
         t = kb.get_task(conn, tid)
         assert t.status == "ready"
         assert t.assignee == "software-engineer"
-        assert t.current_step_key == "merge"
+        assert t.current_step_key == "in-dev-review"
         latest = kb.latest_run(conn, tid)
         assert latest.outcome == "approved"
         assert latest.profile == "reviewer"  # reviewer provenance kept on the run
@@ -80,7 +80,7 @@ def test_changes_requested_records_development_stage(kanban_home):
         kb.claim_review_task(conn, tid)
         ok, _ = kb.request_changes(conn, tid, reason="add tests")
         assert ok
-        assert kb.get_task(conn, tid).current_step_key == "development"
+        assert kb.get_task(conn, tid).current_step_key == "in-dev"
 
 
 def test_approve_refused_outside_review_run(kanban_home):
