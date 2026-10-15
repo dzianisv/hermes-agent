@@ -159,6 +159,15 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
     "HERMES_SESSION_SOURCE",
     "HERMES_SESSION_KEY",
     "HERMES_GATEWAY_SESSION",
+    # Supervisor-identity vars inherited from a launchd/systemd/s6-spawned shell; read by gateway/restart.py
+    # launchd_job_label, is_gateway_supervisor_process, is_supervised_gateway_launch. Leaking them flips
+    # restart/supervisor routing in tests, so blank them (tests needing one setenv it explicitly).
+    "HERMES_LAUNCHD_LABEL",
+    "HERMES_GATEWAY_EXTERNAL_SUPERVISOR",
+    "HERMES_S6_SUPERVISED_CHILD",
+    "HERMES_SUPERVISED_CHILD",
+    "XPC_SERVICE_NAME",
+    "INVOCATION_ID",
     "HERMES_CRON_SESSION",
     "_HERMES_GATEWAY",
     "HERMES_PLATFORM",
