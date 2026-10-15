@@ -3205,7 +3205,10 @@ def _design_phase_cfg() -> Optional[dict]:
     # except below turned its ImportError into "guard off" (#29).
     import hermes_yaml as yaml
     from pathlib import Path
-    root = Path(os.environ.get("HERMES_ROOT_HOME") or Path.home() / ".hermes") / "config.yaml"
+    from hermes_constants import get_default_hermes_root
+    # get_default_hermes_root() maps a profile HERMES_HOME to its root and
+    # honors a custom/isolated HERMES_HOME; Path.home() ignored both.
+    root = Path(os.environ.get("HERMES_ROOT_HOME") or get_default_hermes_root()) / "config.yaml"
     try:
         cfg = ((yaml.safe_load(root.read_text()) or {}).get("kanban") or {}).get("design_phase") or {}
     except FileNotFoundError:
