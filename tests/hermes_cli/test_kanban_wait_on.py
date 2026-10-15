@@ -185,7 +185,6 @@ def test_status_change_is_progress(conn):
 def test_dispatcher_skips_parked_and_respecs(conn, monkeypatch):
     """End to end through dispatch_once: a parked card is never spawned; two
     no-progress runs re-route the next spawn to the architect."""
-    monkeypatch.setattr(kb, "_design_phase_cfg", lambda: None)
     monkeypatch.setattr(kb, "_profile_exists_fn", lambda: None)
     monkeypatch.setattr(kwo, "respec_assignee", lambda: "architect-critic-fable")
     monkeypatch.setattr(kwo, "default_head", lambda _ws: None)

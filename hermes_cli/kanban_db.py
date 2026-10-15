@@ -4641,8 +4641,8 @@ _BRIEF_LINE_PREFIXES = ("ACCEPTANCE:", "PROOF:")
 
 def _carry_brief_lines(old_body: str, new_body: str) -> str:
     """Re-append ACCEPTANCE:/PROOF: lines from ``old_body`` that the rewritten
-    ``new_body`` dropped, so the dispatcher's design-phase brief gate (which
-    requires them) does not park a freshly specified card."""
+    ``new_body`` dropped, so a re-specify never loses the card's acceptance
+    criteria or proof requirement."""
     new_low = (new_body or "").lower()
     carried: list[str] = []
     for prefix in _BRIEF_LINE_PREFIXES:
