@@ -2237,7 +2237,7 @@ def _claim_and_open_run(
                claim_lock    = ?,
                claim_expires = ?,
                started_at    = COALESCE(started_at, ?),
-               current_step_key = {"COALESCE(current_step_key, 'development')" if source_status == "ready" else "current_step_key"}
+               current_step_key = {"COALESCE(current_step_key, 'in-dev')" if source_status == "ready" else "current_step_key"}
          WHERE id = ?
            AND status = '{source_status}'
            AND claim_lock IS NULL
@@ -3448,7 +3448,7 @@ def request_review(
                 """
                 UPDATE tasks
                    SET status        = 'review',
-                       current_step_key = 'review',
+                       current_step_key = 'in-dev-review',
                        claim_lock    = NULL,
                        claim_expires = NULL,
                        worker_pid    = NULL,
@@ -3553,7 +3553,7 @@ def request_changes(
             UPDATE tasks
                SET status = ?,
                    assignee = COALESCE(?, assignee),
-                   current_step_key = 'development',
+                   current_step_key = 'in-dev',
                    claim_lock = NULL,
                    claim_expires = NULL,
                    worker_pid = NULL, worker_started_at = NULL,
@@ -3620,7 +3620,7 @@ def approve_for_merge(
         cur = conn.execute(
             """
             UPDATE tasks
-               SET status = ?, assignee = ?, current_step_key = 'merge',
+               SET status = ?, assignee = ?, current_step_key = 'in-dev-review',
                    claim_lock = NULL, claim_expires = NULL,
                    worker_pid = NULL, worker_started_at = NULL
              WHERE id = ? AND status = 'running' AND current_run_id = ?
