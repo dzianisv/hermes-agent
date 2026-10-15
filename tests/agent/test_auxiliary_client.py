@@ -3599,11 +3599,47 @@ class TestCodexAuxiliaryAdapterTimeout:
         assert fake_client.responses.kwargs["stream"] is True
         assert response.choices[0].message.content == "summary"
 
-    def test_enforces_total_timeout_while_stream_keeps_emitting_events(self):
+    def test_enforces_total_timeout_while_stream_keeps_emitting_events(self, monkeypatch):
+        """Was a real-wall-clock race (12 runs -> ~50% fail rate in a broad ``-k`` sweep,
+        same rate on both sides of an unrelated keepalive change): under GIL/thread
+        contention from sibling tests, ``time.sleep(0.03)`` x5 plus the guard's real
+        ``threading.Timer`` watchdog could blow past a hand-tuned ``< 0.14s`` wall-clock
+        budget even though the guard enforced the timeout correctly. Widening the margin
+        would hide real regressions, not fix the race — so this drives the guard with an
+        injected fake clock and a synchronous stand-in for ``threading.Timer`` instead:
+        the deadline math (``time.monotonic()`` reads inside the guard) is exercised for
+        real, but elapsed time is simulated in fixed 0.03s ticks per stream event and the
+        watchdog thread never actually runs, so the outcome no longer depends on wall
+        clock or thread scheduling.
+        """
+        fake_now = [0.0]
+
+        def fake_monotonic():
+            return fake_now[0]
+
+        monkeypatch.setattr("agent.auxiliary_client.time.monotonic", fake_monotonic)
+
+        class _NonFiringTimer:
+            """Stand-in for ``threading.Timer``: never runs a real thread. The total
+            timeout is still enforced because ``_CodexStreamGuard.check_cancelled()``
+            re-checks the deadline against the (fake) clock after every stream event."""
+
+            def __init__(self, delay, fn):
+                self.delay = delay
+                self.fn = fn
+
+            def start(self):
+                pass
+
+            def cancel(self):
+                pass
+
+        monkeypatch.setattr("agent.auxiliary_client.threading.Timer", _NonFiringTimer)
+
         class _SlowAliveCreateStream:
             def __iter__(self):
                 for _ in range(50):
-                    time.sleep(0.03)
+                    fake_now[0] += 0.03
                     yield SimpleNamespace(type="response.in_progress")
 
             def close(self): pass
@@ -3615,15 +3651,17 @@ class TestCodexAuxiliaryAdapterTimeout:
         fake_client = SimpleNamespace(responses=FakeResponses(), close=lambda: None)
         adapter = _CodexCompletionsAdapter(fake_client, "gpt-5.5")
 
-        started = time.monotonic()
         with pytest.raises(TimeoutError):
             adapter.create(
                 messages=[{"role": "user", "content": "summarize this"}],
                 timeout=0.05,
             )
 
-        # The stream would keep emitting for ~1.5s; the 0.05s total timeout must cut it off.
-        assert time.monotonic() - started < 1.0
+        # The guard must have actually noticed the deadline via the (fake) clock, not
+        # merely raised because the generator was exhausted. It fires well before the
+        # loop would drain all 50 events (simulated 1.5s), so the total_timeout=0.05s
+        # cutoff is what triggered it, not stream exhaustion.
+        assert 0.05 <= fake_now[0] < 1.0
 
     def test_no_progress_timeout_kwarg_overrides_default_window(self):
         """#108104: an explicit ``no_progress_timeout`` kwarg (the task-scoped
