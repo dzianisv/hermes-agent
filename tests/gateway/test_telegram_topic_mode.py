@@ -830,3 +830,36 @@ def test_get_telegram_topic_binding_by_session_returns_binding(tmp_path):
 # Test for session-split thread_id recovery (issue #27166)
 # ---------------------------------------------------------------------------
 
+
+
+@pytest.mark.asyncio
+async def test_handoff_away_from_topic_releases_topic_binding(tmp_path):
+    """#36: a session handed off from a Telegram topic to Slack must not be re-attached to the
+    topic by its durable binding, or the two chats share one session and one turn lease."""
+    session_db = SessionDB(db_path=tmp_path / "state.db")
+    session_db.enable_telegram_topic_mode(chat_id="208214988", user_id="208214988")
+    session_db.create_session(session_id="moved", source="telegram", user_id="208214988")
+    topic_source = _make_source(thread_id="648763")
+    topic_key = build_session_key(topic_source)
+    session_db.bind_telegram_topic(chat_id="208214988", thread_id="648763", user_id="208214988",
+                                   session_key=topic_key, session_id="moved")
+    runner = _make_runner(session_db=session_db)
+    runner.config.platforms[Platform.SLACK] = PlatformConfig(enabled=True, token="***")
+    runner.config.platforms[Platform.SLACK].home_channel = HomeChannel(
+        platform=Platform.SLACK, chat_id="C0C9B7N2GHE", name="agentpod")
+    slack = MagicMock()
+    slack.create_handoff_thread = AsyncMock(return_value="1791789833.956769")
+    slack.send = AsyncMock(return_value=SimpleNamespace(success=True))
+    slack.scope_id_for_chat = lambda _c: "T0AAEBU7831"
+    runner.adapters[Platform.SLACK] = slack
+    runner._handle_message = AsyncMock(return_value=None)
+    runner.session_store.list_sessions = MagicMock(return_value=[])
+
+    await runner._process_handoff({"id": "moved", "title": "w", "handoff_platform": "slack"})
+
+    assert session_db.get_telegram_topic_binding(chat_id="208214988", thread_id="648763") is None
+    assert session_db.is_telegram_topic_mode_enabled(chat_id="208214988", user_id="208214988")  # handoff ≠ topic deleted
+    snapshot = runner.session_store.get_or_create_session(topic_source)
+    runner.session_store.switch_session.reset_mock()
+    await runner._hmwa_heal_telegram_topic_binding(topic_source, snapshot, topic_key)
+    assert all(c.args[1] != "moved" for c in runner.session_store.switch_session.call_args_list)
