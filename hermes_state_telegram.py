@@ -263,7 +263,9 @@ class SessionTelegramTopicsMixin:
                     """, (str(session_id),))
         return dict(row) if row else None
 
-    def delete_telegram_topic_binding(self, *, chat_id: str, thread_id: str, profile_name: str = "default") -> int:
+    def delete_telegram_topic_binding(
+        self, *, chat_id: str, thread_id: str, profile_name: str = "default", disable_mode_when_empty: bool = True,
+    ) -> int:
         """Remove the binding row for one (chat, thread) pair. Called when the Bot API confirms
         a topic was deleted externally (``Thread not found`` after the same-thread retry
         failed); otherwise ``gateway.run._recover_telegram_topic_thread_id`` keeps
@@ -289,8 +291,8 @@ class SessionTelegramTopicsMixin:
                     """, (profile_name, chat_id, thread_id)).rowcount or 0
             except sqlite3.OperationalError:
                 return 0
-            if not deleted:
-                return 0
+            if not deleted or not disable_mode_when_empty:  # a handoff moves a session, the topic still exists
+                return deleted
             # Last binding gone → disable topic mode in the same transaction (no
             # read-after-prune race). telegram_dm_topic_mode absent — binding prune still stands.
             with contextlib.suppress(sqlite3.OperationalError):
