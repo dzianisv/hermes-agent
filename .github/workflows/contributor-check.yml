@@ -2,6 +2,15 @@ name: Contributor Attribution Check
 
 on:
   workflow_call:
+    inputs:
+      comparison_base:
+        description: >-
+          Commit-ish whose reachable history is not checked. Defaults to
+          origin/main. A pinned dependency snapshot passes the exact commit it
+          was cut from, so only the commits added on top of it are checked.
+        type: string
+        required: false
+        default: origin/main
     outputs:
       review_status:
         description: "JSON array of review status objects"
@@ -23,9 +32,16 @@ jobs:
 
       - name: Check for unmapped contributor emails
         id: check-emails
+        env:
+          ATTRIBUTION_BASE: ${{ inputs.comparison_base }}
         run: |
-          # Get the merge base between this PR and main
-          MERGE_BASE=$(git merge-base origin/main HEAD)
+          # Get the merge base between this branch and the comparison base
+          # (origin/main unless the caller passes another one). An unresolvable
+          # base fails the check instead of skipping it.
+          MERGE_BASE=$(git merge-base -- "$ATTRIBUTION_BASE" HEAD) || {
+            echo "::error::No merge base between '${ATTRIBUTION_BASE}' and HEAD; refusing to skip the attribution check."
+            exit 1
+          }
 
           # Find any new author emails in this PR's commits
           NEW_EMAILS=$(git log ${MERGE_BASE}..HEAD --format='%ae' --no-merges | sort -u)

@@ -153,6 +153,14 @@ jobs:
     needs: detect
     if: needs.detect.outputs.python == 'true'
     uses: ./.github/workflows/contributor-check.yml
+    with:
+      # A push to this fork's reserved dependency-snapshot namespace is checked
+      # against the pin it was cut from, because origin/main is the wrong
+      # baseline for a branch that does not descend from it. Every commit added
+      # after the pin is still checked; the pin's own history is not
+      # re-attributed here. PRs, main, other branches and other repositories
+      # keep the origin/main baseline.
+      comparison_base: ${{ github.event_name == 'push' && github.repository == 'dzianisv/hermes-agent' && startsWith(github.ref, 'refs/heads/agentpod/dependency-ci/') && '47fc6a99ddfc2272e31308d312e0fd01f264b961' || 'origin/main' }}
 
   uv-lockfile:
     name: Check uv.lock

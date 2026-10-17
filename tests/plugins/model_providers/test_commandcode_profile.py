@@ -255,7 +255,9 @@ class TestCommandCodeFetchModelsPickerContract:
         assert profile is not None
         assert "base_url" in inspect.signature(profile.fetch_models).parameters
 
-    def test_resolve_provider_full(self):
+    def test_resolve_provider_full(
+        self, monkeypatch, commandcode_profile, commandcode_anthropic_profile,
+    ):
         """Both profiles must resolve through the model-switch path.
 
         Regression: ``resolve_provider_full`` only knew models.dev + overlay
@@ -265,14 +267,42 @@ class TestCommandCodeFetchModelsPickerContract:
         """
         from hermes_cli.providers import resolve_provider_full
 
+        monkeypatch.setattr(
+            "hermes_cli.providers._models_dev_info",
+            lambda canonical, allow_network=True: None,
+        )
         chat = resolve_provider_full("commandcode", {}, [])
         assert chat is not None and chat.id == "commandcode"
         assert chat.transport == "openai_chat"
+        assert chat.source == "plugin-profile"
+        assert chat.api_key_env_vars == tuple(commandcode_profile.env_vars)
         assert "COMMANDCODE_API_KEY" in chat.api_key_env_vars
 
         anth = resolve_provider_full("commandcode-anthropic", {}, [])
         assert anth is not None and anth.id == "commandcode-anthropic"
         assert anth.transport == "anthropic_messages"
+        assert anth.source == "plugin-profile"
+        assert anth.api_key_env_vars == tuple(commandcode_anthropic_profile.env_vars)
+
+    def test_catalog_still_precedes_plugin_profile(self, monkeypatch, commandcode_profile):
+        from types import SimpleNamespace
+
+        from hermes_cli.providers import resolve_provider_full
+
+        catalog = SimpleNamespace(
+            name="Catalog CommandCode", env=("CATALOG_TEST_API_KEY",),
+            api="https://catalog.example.invalid/v1", doc="",
+        )
+        monkeypatch.setattr(
+            "hermes_cli.providers._models_dev_info",
+            lambda canonical, allow_network=True: catalog if canonical == "commandcode" else None,
+        )
+        chat = resolve_provider_full("commandcode", {}, [])
+        assert chat is not None and chat.id == commandcode_profile.name
+        assert chat.source == "models.dev"
+        assert chat.transport == "openai_chat"
+        assert chat.api_key_env_vars == catalog.env
+        assert chat.base_url == catalog.api
 
 
 # ── base_url endpoint override ───────────────────────────────────────────────
