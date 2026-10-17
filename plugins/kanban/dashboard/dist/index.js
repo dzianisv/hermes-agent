@@ -143,6 +143,9 @@
     blocked: "confirmBlocked",
   };
 
+  // "stage" when the board renders one column per configured kanban stage.
+  let boardColumnMode = "status";
+
   function getColumnLabel(t, status) {
     return tx(t, "columnLabels." + status, FALLBACK_COLUMN_LABEL[status] || status);
   }
@@ -847,7 +850,11 @@
     //           — ignored when count >  1 (bulk endpoint uses selectedIds)
     //   summary — completion summary string, or null/undefined to skip
     const performMoveTask = useCallback(function (taskId, newStatus, count, summary) {
-      const patch = { status: newStatus };
+      // Stage-column boards (kanban.stages configured) move cards between
+      // stages; the server hands off to the stage owner and sets the status.
+      const stageMode = boardColumnMode === "stage";
+      const patch = stageMode ? { stage: newStatus } : { status: newStatus };
+      const movedFields = stageMode ? { current_step_key: newStatus } : { status: newStatus };
       const finalPatch = summary
         ? Object.assign({}, patch, { result: summary, summary: summary })
         : patch;
@@ -859,7 +866,7 @@
           const columns = b.columns.map(function (col) {
             const kept = [];
             for (const tk of col.tasks) {
-              if (selectedIds.has(tk.id)) moved.push(Object.assign({}, tk, { status: newStatus }));
+              if (selectedIds.has(tk.id)) moved.push(Object.assign({}, tk, movedFields));
               else kept.push(tk);
             }
             return Object.assign({}, col, { tasks: kept });
@@ -897,7 +904,7 @@
         let moved = null;
         const columns = b.columns.map(function (col) {
           const next = col.tasks.filter(function (tk) {
-            if (tk.id === taskId) { moved = Object.assign({}, tk, { status: newStatus }); return false; }
+            if (tk.id === taskId) { moved = Object.assign({}, tk, movedFields); return false; }
             return true;
           });
           return Object.assign({}, col, { tasks: next });
@@ -2939,8 +2946,10 @@
       onMouseDown: handleMouseDown,
     },
       props.board.columns.map(function (col) {
+        boardColumnMode = props.board.column_mode || "status";
         return h(Column, {
           key: col.name,
+          stageMode: props.board.column_mode === "stage",
           column: col,
           boardMeta: props.boardMeta,
           laneByProfile: props.laneByProfile,
@@ -3090,6 +3099,7 @@
                       draggingSource: props.draggingTaskId && props.selectedIds.has(props.draggingTaskId) && props.selectedIds.size > 1 && props.selectedIds.has(tk.id),
                       toggleSelected: props.toggleSelected,
                       toggleRange: props.toggleRange,
+                      stageMode: props.stageMode,
                       onOpen: props.onOpen,
                     });
                   }),
@@ -3104,6 +3114,7 @@
                   draggingSource: props.draggingTaskId && props.selectedIds.has(props.draggingTaskId) && props.selectedIds.size > 1 && props.selectedIds.has(tk.id),
                   toggleSelected: props.toggleSelected,
                   toggleRange: props.toggleRange,
+                  stageMode: props.stageMode,
                   onOpen: props.onOpen,
                 });
               }),
@@ -3227,6 +3238,12 @@
             ),
             h("span", { className: "hermes-kanban-card-id",
                         title: `Task id: ${t.id}. Use this id with kanban_show, /kanban show, or hermes kanban show.` }, t.id),
+            props.stageMode && t.status
+              ? h("span", {
+                  className: cn("hermes-kanban-status-badge", "hermes-kanban-status-badge--" + t.status),
+                  title: `Status: ${t.status}`,
+                }, t.status)
+              : null,
             t.warnings && t.warnings.count > 0
               ? h("span", {
                   className: cn(

@@ -635,7 +635,7 @@ def test_bulk_status_done_forwards_completion_summary(client):
             assert task.status == "done"
             assert task.result == "DECIDED: ship it"
             assert run.summary == "DECIDED: ship it"
-            assert run.metadata == {"source": "dashboard"}
+            assert run.metadata["source"] == "dashboard"  # _end_run also records exit_reason
     finally:
         conn.close()
 
@@ -1068,3 +1068,43 @@ def test_touch_card_tap_opens_instead_of_dragging():
 # ---------------------------------------------------------------------------
 # Diagnostic severity colours follow the dashboard theme
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# kanban.stages configured -> one board column per stage
+# ---------------------------------------------------------------------------
+
+_STAGES = [
+    {"key": "todo", "owner": "pl", "status": "todo"},
+    {"key": "ready", "owner": "pl", "status": "todo"},
+    {"key": "in-dev", "owner": "eng", "status": "ready"},
+    {"key": "in-dev-review", "owner": "rev", "status": "review"},
+    {"key": "done", "owner": None, "status": "done"},
+]
+
+
+def test_board_stage_columns(client, monkeypatch):
+    from hermes_cli import kanban_stages
+    monkeypatch.setattr(kanban_stages, "load_stages", lambda raw=None: kanban_stages._parse(_STAGES))
+    with kbc.connect() as conn:
+        a = kb.create_task(conn, title="no stage")
+        b = kb.create_task(conn, title="in dev")
+        conn.execute("UPDATE tasks SET current_step_key='in-dev', status='blocked' WHERE id=?", (b,))
+        c = kb.create_task(conn, title="review no key")
+        conn.execute("UPDATE tasks SET status='review' WHERE id=?", (c,))
+        conn.commit()
+    data = client.get("/api/plugins/kanban/board").json()
+    assert data["column_mode"] == "stage"
+    assert [c["name"] for c in data["columns"]] == [s["key"] for s in _STAGES]
+    where = {t["id"]: col["name"] for col in data["columns"] for t in col["tasks"]}
+    assert where[b] == "in-dev" and where[c] == "in-dev-review"
+    assert where[a] in ("todo", "ready")
+    r = client.patch(f"/api/plugins/kanban/tasks/{a}", json={"stage": "in-dev-review"})
+    assert r.status_code == 200, r.text
+    assert r.json()["task"]["current_step_key"] == "in-dev-review"
+    assert r.json()["task"]["assignee"] == "rev"
+
+
+def test_board_status_columns_without_stages(client):
+    data = client.get("/api/plugins/kanban/board").json()
+    assert data["column_mode"] == "status"
