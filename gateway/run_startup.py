@@ -1830,6 +1830,10 @@ class GatewayStartupMixin:
         switched = await self.async_session_store.switch_session(session_key, cli_session_id)
         if switched is None:
             raise RuntimeError(f"could not switch session key {session_key} → {cli_session_id}")
+        # A handoff moves the session: unbind the source lane(s) so two chats never share it (#36).
+        dropped = await self.async_session_store.drop_other_routes(cli_session_id, session_key)
+        if dropped:
+            logger.info("Handoff: unbound %d prior routing key(s) from %s", len(dropped), cli_session_id)
         # Evict the cached AIAgent (rebuild against the CLI session_id, like /resume) and clear stale
         # running-agent state so the synthetic turn isn't queued behind it.
         self._evict_cached_agent(session_key)

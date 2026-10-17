@@ -84,6 +84,7 @@ def _make_multiplex_runner():
         _store=store,
         get_or_create_session=store.get_or_create_session,
         switch_session=store.switch_session,
+        drop_other_routes=AsyncMock(return_value=[]),
     )
     runner._evict_cached_agent = MagicMock()
     runner._release_running_agent_state = MagicMock()
