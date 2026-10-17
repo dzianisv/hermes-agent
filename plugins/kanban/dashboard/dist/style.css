@@ -1609,3 +1609,14 @@
 .hermes-kanban-trash-label {
   font-weight: 500;
 }
+
+/* Status badge on cards when the board is laid out by kanban stage. */
+.hermes-kanban-status-badge {
+  font-size: 0.65rem; line-height: 1; padding: 2px 6px; border-radius: 9999px;
+  border: 1px solid currentColor; opacity: 0.8; text-transform: lowercase; white-space: nowrap;
+}
+.hermes-kanban-status-badge--running { color: #22c55e; opacity: 1; }
+.hermes-kanban-status-badge--blocked { color: #ef4444; opacity: 1; }
+.hermes-kanban-status-badge--review { color: #a855f7; }
+.hermes-kanban-status-badge--ready { color: #3b82f6; }
+.hermes-kanban-status-badge--done { color: #6b7280; }

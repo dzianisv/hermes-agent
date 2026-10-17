@@ -168,6 +168,24 @@ def _errors_to_500(prefix: str) -> Iterator[None]:
 # sync with kanban_db.VALID_STATUSES — a status missing here gets mis-bucketed into ``todo``.
 BOARD_COLUMNS: list[str] = ["triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done"]
 
+# Statuses with no stage of their own fall back to the stage where the work sits.
+_STATUS_STAGE_ALIASES: dict[str, tuple[str, ...]] = {
+    "triage": ("todo",), "running": ("in-dev", "ready"), "blocked": ("in-dev", "ready"),
+    "review": ("in-dev-review",), "archived": ("done",)}
+
+
+def _stage_column(task, stage_keys: list[str], stage_by_status: dict[str, str]) -> str:
+    """Stage column for ``task``: its ``current_step_key`` when configured (done
+    status always lands in a ``done`` stage), else a status-derived stage."""
+    if task.status == "done" and "done" in stage_keys:
+        return "done"
+    if task.current_step_key in stage_keys:
+        return task.current_step_key
+    for cand in (task.status, *_STATUS_STAGE_ALIASES.get(task.status, ())):
+        if cand in stage_keys:
+            return cand
+    return stage_by_status.get(task.status, stage_keys[0])
+
 _CARD_SUMMARY_PREVIEW_CHARS = 200
 
 
@@ -303,8 +321,20 @@ def get_board(
             p["done"] += row["cstatus"] == "done"
         diagnostics_per_task = _compute_task_diagnostics(conn, task_ids=None)
         latest_event_id = conn.execute("SELECT COALESCE(MAX(id), 0) AS m FROM task_events").fetchone()["m"]
-        columns: dict[str, list[dict]] = {c: [] for c in BOARD_COLUMNS}
-        if include_archived:
+        # Configured kanban.stages turn the board into one column per stage
+        # (status shows as a card badge); without stages keep status columns.
+        try:
+            from hermes_cli import kanban_stages
+            configured = kanban_stages.load_stages()
+        except Exception:
+            configured = []
+        stage_keys = [s.key for s in configured]
+        stage_by_status: dict[str, str] = {}
+        for s in configured:
+            stage_by_status.setdefault(s.status, s.key)
+        column_mode = "stage" if stage_keys else "status"
+        columns: dict[str, list[dict]] = {c: [] for c in (stage_keys or BOARD_COLUMNS)}
+        if include_archived and column_mode == "status":
             columns["archived"] = []
         # One window-function query for latest summaries (avoids N+1); cards get a
         # truncated preview, the full text comes from /tasks/:id.
@@ -316,13 +346,17 @@ def get_board(
             d["comment_count"] = comment_counts.get(t.id, 0)
             d["progress"] = progress.get(t.id)  # None when the task has no children
             _attach_diagnostics(d, diagnostics_per_task.get(t.id))
-            columns[t.status if t.status in columns else "todo"].append(d)
+            if column_mode == "stage":
+                columns[_stage_column(t, stage_keys, stage_by_status)].append(d)
+            else:
+                columns[t.status if t.status in columns else "todo"].append(d)
 
         # Queue lanes keep the list_tasks dispatch order; the done column is
         # history, so order it newest-completed-first. Two stable sorts compose
         # into the "completed_at DESC NULLS LAST, id DESC" SQL key.
-        columns["done"].sort(key=lambda d: d["id"], reverse=True)
-        columns["done"].sort(key=lambda d: (d["completed_at"] is None, -(d["completed_at"] or 0)))
+        if "done" in columns:
+            columns["done"].sort(key=lambda d: d["id"], reverse=True)
+            columns["done"].sort(key=lambda d: (d["completed_at"] is None, -(d["completed_at"] or 0)))
 
         # Queue columns keep list_tasks' dispatch order (priority DESC, created_at ASC).
         tenants = [r["tenant"] for r in conn.execute("SELECT DISTINCT tenant FROM tasks WHERE tenant IS NOT NULL ORDER BY tenant")]
@@ -330,6 +364,7 @@ def get_board(
             "SELECT DISTINCT assignee FROM tasks WHERE assignee IS NOT NULL AND status != 'archived' ORDER BY assignee")]
         return {
             "columns": [{"name": name, "tasks": columns[name]} for name in columns], "tenants": tenants,
+            "column_mode": column_mode,
             "assignees": assignees, "latest_event_id": int(latest_event_id), "now": int(time.time())}
 
 
@@ -508,6 +543,8 @@ def remove_attachment(attachment_id: int, board: Optional[str] = Query(None)):
 
 class UpdateTaskBody(BaseModel):
     status: Optional[str] = None
+    # Move to a configured kanban stage (stage-column board drag/drop).
+    stage: Optional[str] = None
     assignee: Optional[str] = None
     priority: Optional[int] = None
     title: Optional[str] = None
@@ -530,6 +567,7 @@ class UpdateTaskBody(BaseModel):
 class BulkTaskBody(BaseModel):
     ids: list[str]
     status: Optional[str] = None
+    stage: Optional[str] = None
     assignee: Optional[str] = None  # "" or None = unassign
     priority: Optional[int] = None
     archive: bool = False
@@ -665,6 +703,23 @@ def _patch_title_body(conn, task_id: str, payload: UpdateTaskBody, board: Option
         conn, task_id, [f for f in ("title", "body") if getattr(payload, f) is not None], board=board)
 
 
+def _move_stage(conn, task_id: str, key: str, payload) -> None:
+    """Stage move: owner handoff + stage status via kanban_stages; a ``done``
+    stage completes the task through the normal done path."""
+    with _map_errors(400, ImportError, ValueError):
+        from hermes_cli import kanban_stages
+        stage = kanban_stages.get_stage(key)
+    with _map_errors(409, RuntimeError):
+        kanban_stages.move_to_stage(conn, task_id, key, author="dashboard")
+    if stage.status == "done":
+        row = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if row and row["status"] != "done":
+            # Best effort: statuses complete_task refuses (e.g. todo) keep the done stage key.
+            kanban_db.complete_task(
+                conn, task_id, result=getattr(payload, "result", None),
+                summary=getattr(payload, "summary", None), force=True)
+
+
 @router.patch("/tasks/{task_id}")
 def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Query(None)):
     with _board_conn(board) as (board, conn):
@@ -675,6 +730,8 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
         if payload.assignee is not None and not review_assignee_deferred:
             with _map_errors(409, RuntimeError):
                 _require_ok(kanban_db.assign_task(conn, task_id, payload.assignee or None))
+        if payload.stage is not None:
+            _move_stage(conn, task_id, payload.stage, payload)
         if payload.status is not None:
             _patch_status(conn, task_id, payload, review_assignee_deferred)
         for wanted, apply, _refused in _OVERRIDE_OPS:
@@ -806,6 +863,11 @@ def _bulk_apply_one(conn, tid: str, payload: BulkTaskBody, board: Optional[str],
     remaining ops — except a rejected status verb (``_StatusRejected`` propagates)."""
     if payload.archive and not kanban_db.archive_task(conn, tid):
         entry.update(ok=False, error="archive refused")
+    if payload.stage is not None and not payload.archive:
+        try:
+            _move_stage(conn, tid, payload.stage, payload)
+        except HTTPException as e:
+            entry.update(ok=False, error=str(e.detail))
     if payload.status is not None and not payload.archive:
         s = payload.status
         if not _apply_status(conn, tid, s, payload, f"unknown status {s!r}"):
