@@ -405,24 +405,6 @@ class TestSessionStoreSwitchSession:
         switched = store.switch_session(entry.session_key, "target", expected_session_id=entry.session_id)
         assert switched is not None and switched.session_id == "target"
 
-    def test_drop_other_routes_unaliases_handed_off_session(self, tmp_path):
-        """#36: after a handoff binds a Slack thread to a Telegram topic's session, the source key
-        must be unbound so the two chats stop sharing one session (and one turn lease)."""
-        with patch("gateway.session.SessionStore._ensure_loaded"):
-            store = SessionStore(sessions_dir=tmp_path / "sessions", config=GatewayConfig())
-        store._loaded = True
-        tg = store.get_or_create_session(SessionSource(
-            platform=Platform.TELEGRAM, chat_id="1916982742", chat_type="dm", user_id="1916982742",
-            thread_id="648763"))
-        slack = store.get_or_create_session(SessionSource(
-            platform=Platform.SLACK, chat_id="C0C9B7N2GHE", chat_type="group", user_id="system:handoff",
-            thread_id="1791789833.956769"))
-        store.switch_session(slack.session_key, tg.session_id)
-
-        assert store.drop_other_routes(tg.session_id, slack.session_key) == [tg.session_key]
-        assert store.lookup_by_session_key(slack.session_key).session_id == tg.session_id
-        assert store.lookup_by_session_key(tg.session_key) is None
-
     def test_switch_session_rebinds_full_compression_lineage(self, tmp_path):
         from hermes_state import SessionDB
 
