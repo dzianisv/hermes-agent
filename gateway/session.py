@@ -1193,22 +1193,6 @@ class SessionStore(
                 self._save()
         return len(dropped)
 
-    def drop_other_routes(self, session_id: str, keep_key: str) -> List[str]:
-        """Unbind every routing key except ``keep_key`` that points at ``session_id``.
-
-        A handoff MOVES a session to a new lane; leaving the source key bound aliases two chats onto
-        one transcript, so their turns contend for one turn lease (#36). The next message on a
-        dropped key starts its own session. The session row itself is left open.
-        """
-        with self._lock:
-            self._ensure_loaded_locked()
-            dropped = [k for k, e in self._entries.items() if e.session_id == session_id and k != keep_key]
-            for key in dropped:
-                self._entries.pop(key, None)
-            if dropped:
-                self._save()
-        return dropped
-
     # Compression repoint is store bookkeeping, not user activity — leave ``updated_at`` alone so a
     # background compression on an idle session cannot make it look fresh to the
     # restart-resume freshness gate (#85709).
