@@ -656,6 +656,28 @@ def _persist_system_prompt(agent, failure_message: str, *, persist_tools: bool =
         logger.warning(failure_message, agent.session_id, exc)
 
 
+def _skills_changed_since_stored(agent, stored_prompt: str) -> list[str]:
+    """Skills the model can use now whose entry the stored prompt's index lacks or lists differently (sorted).
+
+    A continuing session reuses its stored prompt forever, so a skill installed after the session
+    started (or before its first index existed), or a same-named one that a higher-precedence source has
+    since replaced, is never offered to the model. A removed skill does not count, so it does not churn the prefix
+    cache, and once the rebuilt prompt is stored this is empty again. The current index comes from
+    ``_skills_prompt`` (skill-tool eligibility, disabled skills, platform filters), so a session with skills
+    tools off never refreshes. A probe failure keeps the stored prompt and is retried next turn."""
+    try:
+        from agent.prompt_builder import skills_index_changes
+        from agent.system_prompt import _skills_prompt
+        return skills_index_changes(stored_prompt, _skills_prompt(agent))
+    except Exception as exc:
+        logger.warning(
+            "Skills-index check failed for session %s: %s: %.200s. Reusing the stored system prompt; "
+            "the check re-runs next turn.",
+            agent.session_id, type(exc).__name__, exc,
+        )
+        return []
+
+
 def _restore_or_build_system_prompt(agent, system_message, conversation_history):
     """Restore the cached system prompt from the session DB or build it fresh.
 
@@ -680,13 +702,22 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
             )
 
     if stored_prompt and _stored_prompt_matches_runtime(agent, stored_prompt):
-        if _bot_chat_prompt_stale(agent, stored_prompt):
-            logger.info(
-                "Bot Chat capability epoch changed for session %s; rebuilding system prompt to "
-                "adopt the new capability surface (one-time prefix-cache break).",
-                agent.session_id,
-            )
-            agent._session_title_hint = "Bot Chat"
+        bot_chat_stale = _bot_chat_prompt_stale(agent, stored_prompt)
+        changed_skills = [] if bot_chat_stale else _skills_changed_since_stored(agent, stored_prompt)
+        if bot_chat_stale or changed_skills:
+            if bot_chat_stale:
+                logger.info(
+                    "Bot Chat capability epoch changed for session %s; rebuilding system prompt to "
+                    "adopt the new capability surface (one-time prefix-cache break).",
+                    agent.session_id,
+                )
+                agent._session_title_hint = "Bot Chat"
+            else:
+                logger.info(
+                    "Skills added or changed since session %s stored its system prompt (%s%s); rebuilding to "
+                    "adopt them (one-time prefix-cache break).",
+                    agent.session_id, ", ".join(changed_skills[:5]), ", ..." if len(changed_skills) > 5 else "",
+                )
             # The skills index cache (LRU + disk snapshot) does not watch the skills
             # dir; a capability refresh must rebuild THROUGH it or new skills are lost.
             try:
@@ -700,7 +731,7 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
             # once per capability change). on_session_start not re-fired: continuation.
             _persist_system_prompt(
                 agent,
-                "Session DB update_system_prompt failed after Bot Chat capability refresh "
+                "Session DB update_system_prompt failed after system-prompt capability refresh "
                 "(session=%s): %s. The refresh will re-fire next turn.",
             )
             return

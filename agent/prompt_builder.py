@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import queue
+import re
 import sys
 import threading
 from collections import OrderedDict
@@ -1333,6 +1334,15 @@ def _label_visible_entries(visible_entries: list[dict], skills_by_category: dict
         skills_by_category.setdefault(category, []).append((fm, desc))
 
 
+# Last guidance before the index. Shared with ``skills_index_entries`` so the renderer and the reader of a stored
+# prompt agree on which ``<available_skills>`` block is the real one.
+_SKILLS_INDEX_LEAD_IN = (
+    "After difficult/iterative tasks, offer to save as a skill. If a skill you loaded was missing steps, "
+    "had wrong commands, or needed pitfalls you discovered, update it before finishing.\n"
+    "\n"
+)
+
+
 def _render_skills_index(
     skills_by_category: dict[str, list[tuple[str, str]]], category_descriptions: dict[str, str],
     compact_categories: "frozenset[str] | None", available_tools: "set[str] | None",
@@ -1382,14 +1392,60 @@ def _render_skills_index(
         "code review, planning, and testing — load them even for tasks you already know how to do, because "
         "the skill defines how it should be done here.\n"
         "If a skill has issues, fix it with skill_manage(action='patch').\n"
-        "After difficult/iterative tasks, offer to save as a skill. If a skill you loaded was missing steps, "
-        "had wrong commands, or needed pitfalls you discovered, update it before finishing.\n"
-        "\n"
-        "<available_skills>\n"
+        + _SKILLS_INDEX_LEAD_IN
+        + "<available_skills>\n"
         + "\n".join(index_lines) + "\n"
         "</available_skills>\n\n"
         "Only proceed without loading a skill if genuinely none are relevant to the task."
         + hidden_note
+    )
+
+
+_SKILL_INDEX_ENTRY = re.compile(r"^ {4}- (\S+?)(?:: (.*))?$")
+_SKILL_INDEX_NAMES_ONLY = re.compile(r"^ {2}\S.* \[names only\]: (.+)$")
+
+
+def _owned_skills_index(prompt: str) -> str:
+    """Body of the last renderer-owned ``<available_skills>`` block in *prompt*; "" when there is none.
+
+    The caller's system message, context files and memory can quote the same tag, so a bare tag does not
+    identify the index: the opener must carry the renderer's own lead-in."""
+    from agent.oneshot_footprint import ONESHOT_SKILLS_LOAD_GUIDANCE
+    openers = (_SKILLS_INDEX_LEAD_IN + "<available_skills>\n", ONESHOT_SKILLS_LOAD_GUIDANCE + "\n<available_skills>\n")
+    starts = [at + len(opener) for opener in openers if (at := prompt.rfind(opener)) >= 0]
+    if not starts:
+        return ""
+    end = prompt.find("\n</available_skills>", max(starts))
+    return prompt[max(starts):end] if end >= 0 else ""
+
+
+def skills_index_entries(prompt: str) -> dict[str, set]:
+    """``{skill name: {description, ...}}`` listed by the renderer-owned index in *prompt* ({} without one).
+
+    A name in a ``[names only]`` category carries ``None`` in its set: listed, but with no description.
+    Reads ``_render_skills_index`` output, so a stored prompt and a fresh build go through one parser."""
+    entries: dict[str, set] = {}
+    for line in _owned_skills_index(prompt).splitlines():
+        if entry := _SKILL_INDEX_ENTRY.match(line):
+            entries.setdefault(entry[1], set()).add(entry[2] or "")
+        elif demoted := _SKILL_INDEX_NAMES_ONLY.match(line):
+            for name in (n.strip() for n in demoted[1].split(",") if n.strip()):
+                entries.setdefault(name, set()).add(None)
+    return entries
+
+
+def skills_index_changes(stored_prompt: str, current_index: str) -> list[str]:
+    """Skills whose model-visible entry in *current_index* is new or different from the stored prompt's index (sorted).
+
+    "Different" is the rendered description, which carries the source tag, so a newly installed higher-precedence
+    skill that replaces a same-named one shows up. Removals alone are not changes. Entries a ``[names only]``
+    category lists without a description compare by name."""
+    stored, current = skills_index_entries(stored_prompt), skills_index_entries(current_index)
+    return sorted(
+        name for name, descriptions in current.items()
+        if name not in stored or (
+            None not in (descriptions | stored[name]) and not (descriptions <= stored[name])
+        )
     )
 
 
@@ -1413,6 +1469,10 @@ def _build_skills_system_prompt_inner(
         tuple(sorted(str(ts) for ts in (available_toolsets or set()))),
         _platform_hint, tuple(sorted(disabled)), tuple(sorted(compact_categories or ())),
         _oneshot_prompt_variant(),
+        # The LRU does not watch the skill roots: without their file signatures a skill installed under a running
+        # gateway stays out of every index it builds until the process restarts. One manifest per root, in scan order.
+        tuple(tuple(sorted((rel, tuple(sig)) for rel, sig in _build_skills_manifest(root).items()))
+              for root in (skills_dir, *external_dirs, *project_dirs)),
     )
     with _SKILLS_PROMPT_CACHE_LOCK:
         cached = _SKILLS_PROMPT_CACHE.get(cache_key)
