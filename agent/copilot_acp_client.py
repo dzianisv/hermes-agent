@@ -216,6 +216,28 @@ def _model_selection_request(session: dict[str, Any], requested_model: str) -> t
     return None if available and requested_model not in available else ("session/set_model", {"sessionId": session_id, "modelId": requested_model})
 
 
+def _reasoning_selection_request(session, effort):
+    """Select only an advertised ACP thinking level; unset preserves the default."""
+    if effort is None:
+        return None
+    option = next((o for o in session.get("configOptions", []) if isinstance(o, dict)
+                   and "thought_level" in (o.get("category"), o.get("id"))), None)
+    if option is None:
+        return None
+    from agent.reasoning_effort import clamp_effort
+
+    supported = _enabled_id_list(option.get("options"), "value")
+    value = str(effort).strip().lower()
+    if value == "none" and "off" in supported:
+        value = "off"
+    elif value != "none":
+        value = clamp_effort(value, supported)
+    if value not in supported:
+        raise ValueError(f"ACP reasoning effort {effort!r} is not supported: {supported}")
+    return "session/set_config_option", {"sessionId": session["sessionId"],
+        "configId": option["id"], "value": value}
+
+
 def _format_messages_as_prompt(
     messages: list[dict[str, Any]], model: str | None = None, tools: list[dict[str, Any]] | None = None, tool_choice: Any = None,
 ) -> str:
@@ -359,10 +381,13 @@ class CopilotACPClient:
 
     def _create_chat_completion(
         self, *, model: str | None = None, messages: list[dict[str, Any]] | None = None, timeout: float | None = None,
-        tools: list[dict[str, Any]] | None = None, tool_choice: Any = None, stream: bool = False, **_: Any,
+        tools: list[dict[str, Any]] | None = None, tool_choice: Any = None, stream: bool = False,
+        reasoning_effort: str | None = None, **_: Any,
     ) -> Any:
         prompt_text = _format_messages_as_prompt(messages or [], model=model, tools=tools, tool_choice=tool_choice)
-        response_text, reasoning = self._run_prompt(prompt_text, timeout_seconds=_effective_timeout(timeout), model=model)
+        reasoning_kwargs = {"reasoning_effort": reasoning_effort} if reasoning_effort is not None else {}
+        response_text, reasoning = self._run_prompt(
+            prompt_text, timeout_seconds=_effective_timeout(timeout), model=model, **reasoning_kwargs)
         tool_calls, cleaned_text = _extract_tool_calls_from_text(response_text)
         message = SimpleNamespace(
             content=cleaned_text, tool_calls=tool_calls, reasoning=reasoning or None, reasoning_content=reasoning or None,
@@ -498,7 +523,8 @@ class CopilotACPClient:
         with self._session(timeout_seconds, allow_file_requests=False) as (session, _):
             return _session_model_ids(session)
 
-    def _run_prompt(self, prompt_text: str, *, timeout_seconds: float, model: str | None = None) -> tuple[str, str]:
+    def _run_prompt(self, prompt_text: str, *, timeout_seconds: float, model: str | None = None,
+                    reasoning_effort: str | None = None) -> tuple[str, str]:
         # The CLI's `--model` spawn flag is deliberately NOT used: `copilot --acp` validates it (unknown id
         # aborts the spawn) but ignores it for the session; the model is applied after session/new instead.
         requested_model = str(model or "").strip()
@@ -507,11 +533,15 @@ class CopilotACPClient:
             if requested_model and requested_model != "copilot-acp":
                 try:
                     if (selection := _model_selection_request(session, requested_model)) is not None:
-                        _request(*selection)
+                        selected = _request(*selection)
+                        if isinstance(selected, dict) and "configOptions" in selected:
+                            session = {**session, "configOptions": selected["configOptions"]}
                     else:
                         logger.warning("Copilot ACP does not offer model %r; using the session default.", requested_model)
                 except Exception as exc:
                     logger.warning("Copilot ACP model selection for %r failed; continuing with the session default: %s", requested_model, exc)
+            if selection := _reasoning_selection_request(session, reasoning_effort):
+                _request(*selection)
             text_parts: list[str] = []
             reasoning_parts: list[str] = []
             prompt = {"sessionId": session_id, "prompt": [{"type": "text", "text": prompt_text}]}

@@ -393,6 +393,60 @@ def test_model_selection_skips_provider_virtual_slug():
     ) is None
 
 
+def test_pi_reasoning_reaches_advertised_option_after_model_selection(tmp_path):
+    from contextlib import contextmanager
+    from providers import get_provider_profile
+    from agent.transports.chat_completions import ChatCompletionsTransport
+
+    profile = get_provider_profile("pi-acp")
+    client = CopilotACPClient(acp_cwd=str(tmp_path))
+    calls = []
+    session = {"sessionId": "s1", "configOptions": [
+        {"id": "model", "options": [{"value": "openai-codex/gpt-6.1-sol"}]},
+        {"id": "thought_level", "options": [{"value": "medium"}]},
+    ]}
+
+    @contextmanager
+    def session_context(timeout):
+        def request(method, params, **kwargs):
+            calls.append((method, params))
+            if params.get("configId") == "model":
+                return {"configOptions": [{"id": "thought_level", "options": [
+                    {"value": "high"}, {"value": "xhigh"}]}]}
+            if method == "session/prompt":
+                kwargs["text_parts"].append("ok")
+            return {}
+        yield session, request
+
+    kwargs = ChatCompletionsTransport().build_kwargs(
+        model="openai-codex/gpt-6.1-sol", messages=[{"role": "user", "content": "hi"}],
+        provider_profile=profile, reasoning_config={"effort": "xhigh"}, supports_reasoning=True)
+    with patch.object(client, "_session", session_context):
+        assert client.chat.completions.create(**kwargs).choices[0].message.content == "ok"
+    assert [(method, params.get("configId"), params.get("value")) for method, params in calls] == [
+        ("session/set_config_option", "model", "openai-codex/gpt-6.1-sol"),
+        ("session/set_config_option", "thought_level", "xhigh"),
+        ("session/prompt", None, None)]
+
+
+def test_pi_reasoning_disabled_and_unset_contract():
+    from providers import get_provider_profile
+    from agent.copilot_acp_client import _reasoning_selection_request
+
+    profile = get_provider_profile("pi-acp")
+    assert profile.build_api_kwargs_extras(reasoning_config=None) == ({}, {})
+    assert profile.build_api_kwargs_extras(reasoning_config={"enabled": False}) == ({}, {"reasoning_effort": "none"})
+    session = {"sessionId": "s1", "configOptions": [{"id": "thought_level",
+        "options": [{"value": "off"}, {"value": "low"}, {"value": "high"}]}]}
+    assert _reasoning_selection_request(session, None) is None
+    assert _reasoning_selection_request(session, "none")[1]["value"] == "off"
+    assert _reasoning_selection_request(session, "xhigh")[1]["value"] == "high"
+    session["configOptions"][0]["options"] = [{"value": "high"}]
+    with pytest.raises(ValueError, match="reasoning"):
+        _reasoning_selection_request(session, "none")
+    assert _reasoning_selection_request({"sessionId": "s1"}, "high") is None
+
+
 def test_run_prompt_receives_picker_model():
     # _create_chat_completion must forward `model` into _run_prompt — the
     # original wiring dropped it, reducing the selection to prompt text.

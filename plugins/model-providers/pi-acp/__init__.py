@@ -19,6 +19,12 @@ class PiACPProfile(ProviderProfile):
 
         return CopilotACPClient(**client_kwargs)
 
+    def build_api_kwargs_extras(self, *, reasoning_config=None, **context):
+        if not isinstance(reasoning_config, dict):
+            return {}, {}
+        effort = "none" if reasoning_config.get("enabled") is False else reasoning_config.get("effort")
+        return {}, {"reasoning_effort": effort} if effort else {}
+
     def fetch_models(
         self, *, api_key: str | None = None, base_url: str | None = None, timeout: float = 15.0
     ) -> list[str] | None:
