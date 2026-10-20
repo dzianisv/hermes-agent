@@ -163,46 +163,69 @@ def _pi_terminal_provider_error(
 ) -> str | None:
     """Recover only an unambiguous, current pi error for this exact prompt.
 
-    ACP and pi session ids differ. Cwd/mtime alone can select a concurrent task,
-    so also require the session header and last user prompt to match; multiple
-    files written during the turn are deliberately inconclusive.
+    ACP and pi session ids differ, and one cwd directory holds every pi session of
+    that working tree, so the session of THIS turn is identified by content: the
+    session header cwd, the last user prompt, a terminal error record, and that
+    record's timestamp inside the turn window. Several sessions may record the same
+    failure (a busy cron lane, a retried job) — one distinct cause is still one cause.
+    Two DIFFERENT causes mean this turn's cause is not certain, so nothing is claimed.
     """
     slug = "--" + re.sub(r"[/\\:]", "-", cwd.lstrip("/\\")) + "--"
     directory = Path(home) / ".pi" / "agent" / "sessions" / slug
+    expected_prompt = [{"type": "text", "text": prompt_text}]
+    now_ms = time.time() * 1000
+    turn_started_ms = turn_started * 1000
     try:
-        candidates = [path for path in directory.glob("*.jsonl")
-                      if turn_started <= path.stat().st_mtime <= time.time()]
-        if len(candidates) != 1:
-            return None
+        candidates = []
+        for path in directory.glob("*.jsonl"):
+            try:
+                mtime_ms = path.stat().st_mtime * 1000
+            except OSError:
+                continue
+            if turn_started_ms <= mtime_ms <= now_ms:
+                candidates.append(path)
+    except OSError:
+        return None
+    errors: set[str] = set()
+    for path in candidates:
         header = None
-        last_user = last_message = None
-        with candidates[0].open(encoding="utf-8") as session_file:
-            for line in session_file:
-                record = json.loads(line)
-                if not isinstance(record, dict):
-                    return None
-                if header is None:
-                    header = record
-                if record.get("type") == "message":
-                    last_message = record.get("message")
-                    if not isinstance(last_message, dict):
-                        return None
-                    if last_message.get("role") == "user":
-                        last_user = last_message.get("content")
-        expected_prompt = [{"type": "text", "text": prompt_text}]
+        last_user = None
+        last_message = None
+        try:
+            with path.open(encoding="utf-8") as session_file:
+                for line in session_file:
+                    record = json.loads(line)
+                    if not isinstance(record, dict):
+                        raise ValueError("malformed pi session record")
+                    if header is None:
+                        header = record
+                    if record.get("type") == "message":
+                        message = record.get("message")
+                        if not isinstance(message, dict):
+                            raise ValueError("malformed pi message")
+                        if message.get("role") == "user":
+                            last_user = message.get("content")
+                        else:
+                            last_message = message
+        except (OSError, ValueError):
+            # A truncated or unreadable file proves nothing; keep scanning the rest.
+            continue
         if (not header or header.get("type") != "session" or header.get("cwd") != cwd
                 or last_user not in (prompt_text, expected_prompt)
                 or not last_message or last_message.get("role") != "assistant"
                 or last_message.get("stopReason") != "error"):
-            return None
+            continue
         timestamp = last_message.get("timestamp")
-        if not isinstance(timestamp, (int, float)) or timestamp < turn_started * 1000:
-            return None
+        if not isinstance(timestamp, (int, float)) or timestamp < turn_started_ms:
+            continue
         error = last_message.get("errorMessage")
-        return error.strip() if isinstance(error, str) and error.strip() else None
-    except (OSError, ValueError):
-        # Missing, partial or unreadable logs cannot prove a provider failure.
+        if isinstance(error, str) and error.strip():
+            errors.add(error.strip())
+    if not errors:
         return None
+    if len(errors) == 1:
+        return next(iter(errors))
+    return None
 
 
 def _jsonrpc_result(message_id: Any, result: Any) -> dict[str, Any]:
