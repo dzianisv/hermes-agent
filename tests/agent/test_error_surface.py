@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 
+from agent.error_classifier import ProviderCauseError
 from agent.error_surface import (
     LAYER_AUTH,
     LAYER_BILLING,
@@ -231,11 +232,12 @@ def test_exception_never_raises_on_weird_input():
     build_error_surface_from_exception(Hostile("x"))
 
 
-def test_connection_error_carrying_a_provider_cause_keeps_the_cause():
-    """A builtin ConnectionError raised to carry a provider cause must not be filed
-    as a local gateway failure: the quota/auth diagnosis is the whole point of it."""
+def test_provider_cause_error_keeps_the_cause():
+    """A ProviderCauseError deliberately carries a provider cause (the pi-acp
+    adapter recovering a terminal provider error). It must not be filed as a
+    local gateway failure: the quota/auth diagnosis is the whole point of it."""
     surface = build_error_surface_from_exception(
-        ConnectionError("pi-acp provider failed: Codex error: The usage limit has been reached"),
+        ProviderCauseError("pi-acp provider failed: Codex error: The usage limit has been reached"),
         provider="openai-codex", model="gpt-6.1-sol",
     )
     assert surface["layer"] == LAYER_BILLING
@@ -243,10 +245,17 @@ def test_connection_error_carrying_a_provider_cause_keeps_the_cause():
     assert "The usage limit has been reached" in surface["message"]
 
 
-def test_plain_connection_error_stays_a_gateway_failure():
-    """Transport noise is not a provider verdict — it keeps the gateway layer."""
+@pytest.mark.parametrize("message", [
+    "Connection refused",
+    "Connection timed out",
+    "HTTP 401 Unauthorized",
+    "429 Too Many Requests",
+])
+def test_plain_connection_error_stays_a_gateway_failure(message):
+    """Only the deliberate ProviderCauseError changes: every other builtin
+    ConnectionError keeps the gateway layer it always had."""
     surface = build_error_surface_from_exception(
-        ConnectionError("Connection refused"), provider="openai-codex", model="gpt-6.1-sol",
+        ConnectionError(message), provider="openai-codex", model="gpt-6.1-sol",
     )
     assert surface["layer"] == LAYER_GATEWAY
     assert surface["code"] == "ConnectionError"

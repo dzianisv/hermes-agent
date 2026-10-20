@@ -31,6 +31,19 @@ PROVIDER_STREAM_EMPTY_FRAME_ERROR_CODE = "provider_stream_empty_frame"
 
 # ── Error taxonomy ──────────────────────────────────────────────────────
 
+class ProviderCauseError(ConnectionError):
+    """A transport error that deliberately carries a provider verdict.
+
+    Raised when an adapter recovers a provider-side failure that the transport
+    swallowed (the pi-acp adapter surfacing a terminal pi error) and that cause
+    IS the diagnosis — a quota wall, a revoked grant — rather than a network
+    blink. It stays a ``ConnectionError`` so every existing
+    ``except ConnectionError`` keeps catching it, and it is its own type so the
+    error surface can route it through the classifier instead of filing it as
+    a local gateway failure that drops the cause.
+    """
+
+
 class FailoverReason(enum.Enum):
     """Why an API call failed — determines recovery strategy."""
     auth = "auth"                        # Transient auth (401/403) — refresh/rotate

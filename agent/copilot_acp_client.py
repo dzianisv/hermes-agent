@@ -31,6 +31,7 @@ from agent.acp_openai_bridge import (
 from agent.file_safety import (
     get_nt_namespace_error, get_read_block_error, get_write_denied_error, is_write_approval_required)
 from agent.redact import redact_sensitive_text
+from agent.error_classifier import ProviderCauseError
 from tools.environments.local import hermes_subprocess_env
 
 ACP_MARKER_BASE_URL = "acp://copilot"
@@ -626,7 +627,7 @@ class CopilotACPClient:
                 error = _pi_terminal_provider_error(
                     pi_cwd, home=pi_home, turn_started=turn_started, prompt_text=prompt_text)
                 if error:
-                    raise ConnectionError(f"pi-acp provider failed: {error}")
+                    raise ProviderCauseError(f"pi-acp provider failed: {error}")
             return response_text, "".join(reasoning_parts)
 
     def _handle_server_message(

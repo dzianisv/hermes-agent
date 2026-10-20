@@ -19,6 +19,8 @@ from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
+from agent.error_classifier import ProviderCauseError
+
 LAYER_PROVIDER = "provider"
 LAYER_ENDPOINT = "endpoint"
 LAYER_STREAMING = "streaming"
@@ -134,27 +136,6 @@ def _disk_full(candidate: Any) -> bool:
 _TRANSPORT_VERDICTS = frozenset({"timeout", "ssl_cert_verification", "unknown"})
 
 
-def _carries_provider_verdict(exc: Exception, provider: str, model: str, api_key: Any) -> bool:
-    """True when a builtin ``ConnectionError`` names a provider-side failure.
-
-    A plain ``ConnectionError`` carries no SDK module and no ``status_code``, so
-    the api-like gate below files it under the gateway layer and drops whatever
-    the message said. Some callers raise it deliberately to carry a provider
-    cause (the pi-acp adapter recovering a terminal provider error), and that
-    cause is the whole diagnosis — a quota wall or a revoked grant is not a
-    network blink. The classifier already reads the cause out of the message;
-    this only asks whether the verdict is the provider's, so transport noise
-    keeps the gateway meaning it always had.
-    """
-    try:
-        from agent.error_classifier import classify_api_error
-
-        classified = classify_api_error(exc, provider=provider, model=model, api_key=api_key)
-        return classified.reason.value not in _TRANSPORT_VERDICTS
-    except Exception:  # pragma: no cover - defensive: classification is advisory
-        return False
-
-
 def _result_layer(reason: str, error_text: str, provider: str) -> str:
     if reason in _REASON_TO_LAYER:
         return _REASON_TO_LAYER[reason]
@@ -224,14 +205,13 @@ def build_error_surface_from_exception(
         if _disk_full(exc):
             return _surface(LAYER_DISK, "disk_full", False, provider, model)
         api_like = (type(exc).__module__ or "").split(".")[0] in _API_EXC_MODULE_PREFIXES or hasattr(exc, "status_code")
-        provider_cause_exc = False
-        if not api_like and isinstance(exc, ConnectionError):
-            # A builtin ConnectionError raised to carry a provider cause (the
-            # pi-acp adapter recovering a terminal provider error) must not be
-            # filed as a local gateway failure: that drops the quota/auth
-            # diagnosis the user needs. Transport noise keeps the gateway layer.
-            provider_cause_exc = _carries_provider_verdict(exc, provider, model, api_key)
-            api_like = provider_cause_exc
+        provider_cause_exc = isinstance(exc, ProviderCauseError)
+        if provider_cause_exc:
+            # A ProviderCauseError deliberately carries a provider verdict (the
+            # pi-acp adapter recovering a terminal provider error). It has no SDK
+            # module and no status_code, so the api-like gate would file it as a
+            # local gateway failure and drop the quota/auth diagnosis.
+            api_like = True
         if not api_like or not isinstance(exc, Exception):
             return _surface(LAYER_GATEWAY, type(exc).__name__, True, provider, model)
 
