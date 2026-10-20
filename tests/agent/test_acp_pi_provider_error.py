@@ -57,9 +57,37 @@ for line in sys.stdin:
         if scenario == "old-error":
             records.append({"type": "message", "message": {
                 "role": "assistant", "content": [], "stopReason": "stop"}})
-        for name in (["one", "two"] if scenario == "ambiguous" else ["one"]):
-            path = directory / (name + ".jsonl")
-            path.write_text("".join(json.dumps(r) + "\\n" for r in records))
+        if scenario == "ambiguous":
+            # Two different errors
+            path1 = directory / "one.jsonl"
+            path1.write_text("".join(json.dumps(r) + "\\n" for r in records))
+            records[-1]["message"]["errorMessage"] = "OpenAI API error (503): upstream high demand"
+            path2 = directory / "two.jsonl"
+            path2.write_text("".join(json.dumps(r) + "\\n" for r in records))
+        elif scenario == "multi-same-error":
+            # Two identical errors
+            path1 = directory / "one.jsonl"
+            path1.write_text("".join(json.dumps(r) + "\\n" for r in records))
+            path2 = directory / "two.jsonl"
+            path2.write_text("".join(json.dumps(r) + "\\n" for r in records))
+        elif scenario == "unrelated-file":
+            # Normal one + one with different prompt
+            path1 = directory / "one.jsonl"
+            path1.write_text("".join(json.dumps(r) + "\\n" for r in records))
+            records[1]["message"]["content"] = [{"type": "text", "text": "a different task"}]
+            path2 = directory / "two.jsonl"
+            path2.write_text("".join(json.dumps(r) + "\\n" for r in records))
+        elif scenario == "corrupt-file":
+            # Normal one + one unparsable
+            path1 = directory / "one.jsonl"
+            path1.write_text("".join(json.dumps(r) + "\\n" for r in records))
+            path2 = directory / "two.jsonl"
+            path2.write_text("not json\\n")
+        else:
+            # Original scenarios
+            for name in (["one", "two"] if scenario == "ambiguous" else ["one"]):
+                path = directory / (name + ".jsonl")
+                path.write_text("".join(json.dumps(r) + "\\n" for r in records))
             if scenario == "stale":
                 os.utime(path, (1, 1))
             if scenario == "malformed":
@@ -103,3 +131,21 @@ def test_empty_or_uncorrelated_turn_stays_empty(pi_client, scenario, base_url):
     assert not choice.message.tool_calls
     assert choice.finish_reason == "stop"
     assert completion.usage.total_tokens == 0
+
+
+def test_same_cause_in_several_sessions_is_still_one_cause(pi_client):
+    with pytest.raises(ConnectionError, match=ERROR):
+        pi_client("multi-same-error").chat.completions.create(
+            messages=[{"role": "user", "content": "hi"}])
+
+
+def test_unrelated_session_file_does_not_hide_the_failure(pi_client):
+    with pytest.raises(ConnectionError, match=ERROR):
+        pi_client("unrelated-file").chat.completions.create(
+            messages=[{"role": "user", "content": "hi"}])
+
+
+def test_corrupt_session_file_is_skipped_not_fatal(pi_client):
+    with pytest.raises(ConnectionError, match=ERROR):
+        pi_client("corrupt-file").chat.completions.create(
+            messages=[{"role": "user", "content": "hi"}])
