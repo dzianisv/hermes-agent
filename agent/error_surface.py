@@ -131,11 +131,6 @@ def _disk_full(candidate: Any) -> bool:
         return False
 
 
-# Verdicts that are the transport's, not the provider's: a connection error
-# that means "the network blinked" must not be read as the provider refusing.
-_TRANSPORT_VERDICTS = frozenset({"timeout", "ssl_cert_verification", "unknown"})
-
-
 def _result_layer(reason: str, error_text: str, provider: str) -> str:
     if reason in _REASON_TO_LAYER:
         return _REASON_TO_LAYER[reason]
