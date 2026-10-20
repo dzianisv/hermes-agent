@@ -538,8 +538,6 @@ class GatewaySessionCommandsMixin:
             # Context lives in the server-side thread of the LIVE cached agent; a temporary agent
             # has none (and finally-eviction would destroy the real context).
             return await self._compress_codex_app_server_session(session_key, session_entry.session_id)
-        if not runtime_kwargs.get("api_key"):
-            return t("gateway.compress.no_provider")
         # FULL transcript (tool results included), like auto-compress: user/assistant-only starves
         # tool-result pruning and can trip the protect-first/last early-return.
         msgs = [m for m in history if m.get("role") in {"user", "assistant", "tool"}]
@@ -599,7 +597,38 @@ class GatewaySessionCommandsMixin:
         _checkpoint_required = _is_truthy(
             ((_load_cfg() or {}).get("compression") or {}).get("checkpoint_required"),
             default=False)
-        tmp_agent = AIAgent(**runtime_kwargs, model=model, max_iterations=4, quiet_mode=True,
+        # Build a clean runtime for the compression agent: strip the main model's provider
+        # credentials that would fail validation. Compression uses auxiliary.compression
+        # provider (configured in config.yaml) which has its own credentials.
+        compression_runtime = {k: v for k, v in runtime_kwargs.items()
+                               if k not in ("provider", "api_key", "base_url", "api_mode", "requested_provider", "credential_pool", "model")}
+        # Use the auxiliary compression provider's config (provider, model, base_url, api_key, api_mode)
+        aux_cfg = ((_load_cfg() or {}).get("auxiliary") or {}).get("compression") or {}
+        compression_model = str(aux_cfg.get("model") or "").strip()
+        compression_provider = str(aux_cfg.get("provider") or "").strip()
+        compression_base_url = str(aux_cfg.get("base_url") or "").strip()
+        compression_api_key = str(aux_cfg.get("api_key") or "").strip()
+        compression_api_mode = str(aux_cfg.get("api_mode") or "").strip()
+        # Resolve api_key from environment if it's a key_env reference
+        if not compression_api_key and aux_cfg.get("key_env"):
+            import os
+            compression_api_key = os.environ.get(aux_cfg["key_env"], "")
+        if not compression_api_key and aux_cfg.get("api_key_env"):
+            import os
+            compression_api_key = os.environ.get(aux_cfg["api_key_env"], "")
+        # Pass the auxiliary compression provider's credentials explicitly
+        if compression_provider:
+            compression_runtime["provider"] = compression_provider
+        # Note: model is passed as a separate kwarg to AIAgent, not in compression_runtime
+        if compression_base_url:
+            compression_runtime["base_url"] = compression_base_url
+        if compression_api_key:
+            compression_runtime["api_key"] = compression_api_key
+        if compression_api_mode:
+            compression_runtime["api_mode"] = compression_api_mode
+        # Use the auxiliary compression model, falling back to the main model
+        final_model = compression_model or model
+        tmp_agent = AIAgent(**compression_runtime, model=final_model, max_iterations=4, quiet_mode=True,
                             skip_memory=not _checkpoint_required, enabled_toolsets=["memory"],
                             session_id=session_id,
                             session_db=getattr(self._session_db, "_db", self._session_db))

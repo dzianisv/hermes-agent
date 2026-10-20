@@ -790,6 +790,9 @@ class GatewayAdapterLifecycleMixin:
         self.adapters[platform] = adapter
         self._sync_voice_mode_state_to_adapter(adapter)
         self._bind_voice_input_callback(adapter)
+        # Wire the message handler and other callbacks that are required for inbound processing.
+        # This was previously only done on reconnect; do it on initial connect too.
+        self._wire_adapter_handlers(adapter)
 
     def _schedule_planned_restart_replay(self) -> None:
         """Replay the owed planned-restart notice after a reconnect, in the background: notification delivery
