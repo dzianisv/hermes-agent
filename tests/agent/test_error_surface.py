@@ -224,11 +224,32 @@ def test_exception_auth_status_routes_to_auth_layer():
 def test_exception_never_raises_on_weird_input():
     class Hostile(Exception):
         @property
-        def status_code(self):  # pragma: no cover - exercised via classifier
+        def status_code(self):  # pragma: no cover — exercised via classifier
             raise RuntimeError("hostile attribute")
 
     # Must not raise, whatever it returns.
     build_error_surface_from_exception(Hostile("x"))
+
+
+def test_connection_error_carrying_a_provider_cause_keeps_the_cause():
+    """A builtin ConnectionError raised to carry a provider cause must not be filed
+    as a local gateway failure: the quota/auth diagnosis is the whole point of it."""
+    surface = build_error_surface_from_exception(
+        ConnectionError("pi-acp provider failed: Codex error: The usage limit has been reached"),
+        provider="openai-codex", model="gpt-6.1-sol",
+    )
+    assert surface["layer"] == LAYER_BILLING
+    assert surface["retryable"] is False
+    assert "The usage limit has been reached" in surface["message"]
+
+
+def test_plain_connection_error_stays_a_gateway_failure():
+    """Transport noise is not a provider verdict — it keeps the gateway layer."""
+    surface = build_error_surface_from_exception(
+        ConnectionError("Connection refused"), provider="openai-codex", model="gpt-6.1-sol",
+    )
+    assert surface["layer"] == LAYER_GATEWAY
+    assert surface["code"] == "ConnectionError"
 
 
 # ── Nous free tier ────────────────────────────────────────────────────────
