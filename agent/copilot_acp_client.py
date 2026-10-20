@@ -158,6 +158,53 @@ def _strip_adapter_retry_status(text_parts: list[str]) -> str:
         "(connection error swallowed by the adapter): " + raw.strip()[:200])
 
 
+def _pi_terminal_provider_error(
+    cwd: str, *, home: str, turn_started: float, prompt_text: str,
+) -> str | None:
+    """Recover only an unambiguous, current pi error for this exact prompt.
+
+    ACP and pi session ids differ. Cwd/mtime alone can select a concurrent task,
+    so also require the session header and last user prompt to match; multiple
+    files written during the turn are deliberately inconclusive.
+    """
+    slug = "--" + re.sub(r"[/\\:]", "-", cwd.lstrip("/\\")) + "--"
+    directory = Path(home) / ".pi" / "agent" / "sessions" / slug
+    try:
+        candidates = [path for path in directory.glob("*.jsonl")
+                      if turn_started <= path.stat().st_mtime <= time.time()]
+        if len(candidates) != 1:
+            return None
+        header = None
+        last_user = last_message = None
+        with candidates[0].open(encoding="utf-8") as session_file:
+            for line in session_file:
+                record = json.loads(line)
+                if not isinstance(record, dict):
+                    return None
+                if header is None:
+                    header = record
+                if record.get("type") == "message":
+                    last_message = record.get("message")
+                    if not isinstance(last_message, dict):
+                        return None
+                    if last_message.get("role") == "user":
+                        last_user = last_message.get("content")
+        expected_prompt = [{"type": "text", "text": prompt_text}]
+        if (not header or header.get("type") != "session" or header.get("cwd") != cwd
+                or last_user not in (prompt_text, expected_prompt)
+                or not last_message or last_message.get("role") != "assistant"
+                or last_message.get("stopReason") != "error"):
+            return None
+        timestamp = last_message.get("timestamp")
+        if not isinstance(timestamp, (int, float)) or timestamp < turn_started * 1000:
+            return None
+        error = last_message.get("errorMessage")
+        return error.strip() if isinstance(error, str) and error.strip() else None
+    except (OSError, ValueError):
+        # Missing, partial or unreadable logs cannot prove a provider failure.
+        return None
+
+
 def _jsonrpc_result(message_id: Any, result: Any) -> dict[str, Any]:
     return {"jsonrpc": "2.0", "id": message_id, "result": result}
 
@@ -528,6 +575,11 @@ class CopilotACPClient:
         # The CLI's `--model` spawn flag is deliberately NOT used: `copilot --acp` validates it (unknown id
         # aborts the spawn) but ignores it for the session; the model is applied after session/new instead.
         requested_model = str(model or "").strip()
+        is_pi = self.base_url == "acp://pi" or Path(self._acp_command).name in {"pi-acp", "pi-acp.cmd", "pi-acp.exe"}
+        turn_started = time.time()
+        # Keep correlation data local: this client can serve concurrent sessions.
+        pi_cwd = self._current_acp_cwd() if is_pi else ""
+        pi_home = _build_subprocess_env()["HOME"] if is_pi else ""
         with self._session(timeout_seconds) as (session, _request):
             session_id = str(session.get("sessionId") or "").strip()
             if requested_model and requested_model != "copilot-acp":
@@ -546,7 +598,13 @@ class CopilotACPClient:
             reasoning_parts: list[str] = []
             prompt = {"sessionId": session_id, "prompt": [{"type": "text", "text": prompt_text}]}
             _request("session/prompt", prompt, text_parts=text_parts, reasoning_parts=reasoning_parts)
-            return _strip_adapter_retry_status(text_parts), "".join(reasoning_parts)
+            response_text = _strip_adapter_retry_status(text_parts)
+            if is_pi and not response_text.strip():
+                error = _pi_terminal_provider_error(
+                    pi_cwd, home=pi_home, turn_started=turn_started, prompt_text=prompt_text)
+                if error:
+                    raise ConnectionError(f"pi-acp provider failed: {error}")
+            return response_text, "".join(reasoning_parts)
 
     def _handle_server_message(
         self, msg: dict[str, Any], *, process: subprocess.Popen[str], cwd: str, text_parts: list[str] | None, reasoning_parts: list[str] | None,
