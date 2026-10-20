@@ -15,8 +15,8 @@ from hermes_cli import kanban_stages as kst
 
 STAGES = [
     {"key": "todo", "owner": "product-lead-agentpod", "status": "todo"},
-    {"key": "design", "owner": "architect-critic-fable", "status": "ready"},
-    {"key": "critic", "owner": "architect-critic-astra", "status": "ready"},
+    {"key": "design", "owner": "swe-architect", "status": "ready"},
+    {"key": "critic", "owner": "swe-architect-reviewer", "status": "ready"},
     {"key": "development", "owner": "software-engineer", "status": "ready"},
     {"key": "review", "owner": "reviewer", "status": "review"},
     {"key": "ready-for-merge", "owner": "software-engineer", "status": "ready"},
@@ -79,7 +79,7 @@ def test_step_reassigns_owner_and_status(kanban_home, capsys):
     assert _run(["step", tid, "design", "--note", "spec it"]) == 0
     out = _show(tid, capsys)
     t = out["task"]
-    assert (t["current_step_key"], t["assignee"], t["status"]) == ("design", "architect-critic-fable", "ready")
+    assert (t["current_step_key"], t["assignee"], t["status"]) == ("design", "swe-architect", "ready")
     assert not any(c["body"].startswith("STAGE:") for c in out["comments"])
     assert any(e["kind"] == "stage_changed" and e["payload"]["to"] == "design"
                and e["payload"].get("note") == "spec it" for e in out["events"])
@@ -97,7 +97,7 @@ def test_step_next_advances(kanban_home, capsys):
     assert _run(["step", tid, "design"]) == 0
     assert _run(["step", tid, "--next"]) == 0
     t = _show(tid, capsys)["task"]
-    assert (t["current_step_key"], t["assignee"], t["status"]) == ("critic", "architect-critic-astra", "ready")
+    assert (t["current_step_key"], t["assignee"], t["status"]) == ("critic", "swe-architect-reviewer", "ready")
 
 
 def test_step_next_from_no_stage_starts_at_first(kanban_home, capsys):
@@ -119,7 +119,7 @@ def test_step_keep_status_leaves_parked_card_parked(kanban_home, capsys):
     tid = _create(capsys)
     assert _run(["step", tid, "design", "--keep-status"]) == 0
     t = _show(tid, capsys)["task"]
-    assert (t["current_step_key"], t["assignee"], t["status"]) == ("design", "architect-critic-fable", "triage")
+    assert (t["current_step_key"], t["assignee"], t["status"]) == ("design", "swe-architect", "triage")
 
 
 def test_step_refuses_claimed_running_task(kanban_home, capsys):

@@ -154,12 +154,12 @@ def test_two_no_progress_runs_go_to_architect(conn):
     _blocked_run(conn, tid, "c1")
     assert kwo.no_progress_streak(conn, tid, "c1") == 1
     assert kwo.no_progress_guard(conn, tid, "software-engineer", None, head_fn=head_fn,
-                                 architect="architect-critic-fable", limit=2) is None
+                                 architect="swe-architect", limit=2) is None
     _blocked_run(conn, tid, "c1")
     assert kwo.no_progress_guard(conn, tid, "software-engineer", None, head_fn=head_fn,
-                                 architect="architect-critic-fable", limit=2) == "no_progress_respec"
+                                 architect="swe-architect", limit=2) == "no_progress_respec"
     t = kb.get_task(conn, tid)
-    assert t.assignee == "architect-critic-fable"
+    assert t.assignee == "swe-architect"
     assert any("[no-progress]" in c.body for c in kb.list_comments(conn, tid))
     # Streak resets after re-spec: the next implementer run starts clean.
     assert kwo.no_progress_streak(conn, tid, "c1") == 0
@@ -186,7 +186,7 @@ def test_dispatcher_skips_parked_and_respecs(conn, monkeypatch):
     """End to end through dispatch_once: a parked card is never spawned; two
     no-progress runs re-route the next spawn to the architect."""
     monkeypatch.setattr(kb, "_profile_exists_fn", lambda: None)
-    monkeypatch.setattr(kwo, "respec_assignee", lambda: "architect-critic-fable")
+    monkeypatch.setattr(kwo, "respec_assignee", lambda: "swe-architect")
     monkeypatch.setattr(kwo, "default_head", lambda _ws: None)
     monkeypatch.setattr(kwo, "default_status", lambda h, c: "same")
     spawned = []
@@ -203,4 +203,4 @@ def test_dispatcher_skips_parked_and_respecs(conn, monkeypatch):
         kb.unblock_task(conn, other)
     res = kb.dispatch_once(conn, spawn_fn=lambda t, ws, b=None: spawned.append((t.id, t.assignee)) or None)
     assert (other, "no_progress_respec") in res.respawn_guarded
-    assert kb.get_task(conn, other).assignee == "architect-critic-fable"
+    assert kb.get_task(conn, other).assignee == "swe-architect"

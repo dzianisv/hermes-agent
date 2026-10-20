@@ -611,11 +611,11 @@ class GatewaySessionCommandsMixin:
         compression_api_mode = str(aux_cfg.get("api_mode") or "").strip()
         # Resolve api_key from environment if it's a key_env reference
         if not compression_api_key and aux_cfg.get("key_env"):
-            import os
-            compression_api_key = os.environ.get(aux_cfg["key_env"], "")
+            from hermes_cli.config import get_env_value_prefer_dotenv
+            compression_api_key = get_env_value_prefer_dotenv(aux_cfg["key_env"]) or ""
         if not compression_api_key and aux_cfg.get("api_key_env"):
-            import os
-            compression_api_key = os.environ.get(aux_cfg["api_key_env"], "")
+            from hermes_cli.config import get_env_value_prefer_dotenv
+            compression_api_key = get_env_value_prefer_dotenv(aux_cfg["api_key_env"]) or ""
         # Pass the auxiliary compression provider's credentials explicitly
         if compression_provider:
             compression_runtime["provider"] = compression_provider
