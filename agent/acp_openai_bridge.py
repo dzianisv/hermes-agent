@@ -21,6 +21,10 @@ TOOL_CALL_BLOCK_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DO
 TOOL_CALL_JSON_RE = re.compile(
     r"\{\s*\"id\"\s*:\s*\"[^\"]+\"\s*,\s*\"type\"\s*:\s*\"function\"\s*,\s*\"function\"\s*:\s*\{.*?\}\s*\}", re.DOTALL
 )
+# Locates a ``{"calls": [...]}`` object (the shape some models emit instead of the documented
+# envelope). The object's real end is resolved by ``_json_object_end`` — a regex cannot balance the
+# nested braces of an ``arguments`` payload, so the match alone would truncate it.
+TOOL_CALL_ARRAY_RE = re.compile(r"\{\s*\"calls\"\s*:\s*\[.*?\]\s*(?:\}|,)", re.DOTALL)
 
 TOOL_CALL_CONTRACT = (
     "Available tools (OpenAI function schema). "
@@ -29,7 +33,8 @@ TOOL_CALL_CONTRACT = (
 )
 
 __all__ = [
-    "TOOL_CALL_BLOCK_RE", "TOOL_CALL_JSON_RE", "TOOL_CALL_CONTRACT", "StreamChunks", "build_openai_tool_call",
+    "TOOL_CALL_BLOCK_RE", "TOOL_CALL_JSON_RE", "TOOL_CALL_ARRAY_RE", "TOOL_CALL_CONTRACT", "StreamChunks",
+    "build_openai_tool_call",
     "tool_specs_from_openai_tools", "render_tool_bridge_sections", "extract_tool_calls_from_text",
     "completion_to_stream_chunks",
 ]
@@ -133,20 +138,118 @@ def _parse_tool_call(raw_json: str, ordinal: int) -> ChatCompletionMessageToolCa
     return build_openai_tool_call(call_id=call_id, name=fn_name, arguments=fn_args)
 
 
+def _json_object_end(text: str, start: int) -> int | None:
+    """Index just past the JSON object opening at ``start``; None when the braces never balance."""
+    depth = 0
+    in_string = False
+    escaped = False
+    for index in range(start, len(text)):
+        char = text[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char in "{[":
+            depth += 1
+        elif char in "}]":
+            depth -= 1
+            if depth == 0:
+                return index + 1
+    return None
+
+
+def _calls_array_spans(text: str) -> list[tuple[int, int, str]]:
+    """``(start, end, raw)`` of every ``{"calls": [...]}`` object in ``text``; non-objects are skipped."""
+    spans: list[tuple[int, int, str]] = []
+    for match in TOOL_CALL_ARRAY_RE.finditer(text):
+        start = match.start()
+        end = _json_object_end(text, start)
+        if end is None:
+            continue
+        raw = text[start:end]
+        try:
+            obj = json.loads(raw)
+        except Exception:
+            continue
+        if isinstance(obj, dict) and isinstance(obj.get("calls"), list):
+            spans.append((start, end, raw))
+    return spans
+
+
+def _parse_calls_array(raw_json: str, start_ordinal: int) -> list[ChatCompletionMessageToolCall]:
+    """``{"calls": [...]}`` → tool calls; malformed input yields ``[]`` instead of raising.
+
+    Entries are either ``{"name": ..., "arguments": ...}`` or the OpenAI shape
+    ``{"type": "function", "function": {"name": ..., "arguments": ...}}``. A missing/blank id is
+    synthesised as ``acp_call_<start_ordinal + index>``.
+    """
+    try:
+        obj = json.loads(raw_json)
+    except Exception:
+        return []
+    if not isinstance(obj, dict):
+        return []
+    entries = obj.get("calls")
+    if not isinstance(entries, list):
+        return []
+    calls: list[ChatCompletionMessageToolCall] = []
+    for offset, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            continue
+        fn = entry.get("function")
+        if not isinstance(fn, dict):
+            fn = entry
+        name = fn.get("name")
+        if not isinstance(name, str) or not name.strip():
+            continue
+        fn_args = fn.get("arguments", "{}")
+        if not isinstance(fn_args, str):
+            try:
+                fn_args = json.dumps(fn_args, ensure_ascii=False)
+            except Exception:
+                fn_args = "{}"
+        call_id = entry.get("id")
+        if not isinstance(call_id, str) or not call_id.strip():
+            call_id = f"acp_call_{start_ordinal + offset}"
+        calls.append(build_openai_tool_call(call_id=call_id, name=name.strip(), arguments=fn_args))
+    return calls
+
+
 def extract_tool_calls_from_text(text: str) -> tuple[list[ChatCompletionMessageToolCall], str]:
-    """Pull ``<tool_call>`` blocks out of an ACP response → ``(tool_calls, cleaned_text)`` with the consumed blocks
-    removed so the assistant message doesn't show raw JSON. Bare-JSON fallback runs only when no XML block parsed."""
+    """Pull tool calls out of an ACP response → ``(tool_calls, cleaned_text)`` with the consumed call JSON
+    removed so the assistant message doesn't show raw JSON.
+
+    Three shapes are recognised: the ``<tool_call>`` envelope, the bare OpenAI object, and the
+    ``{"calls": [...]}`` array some models emit. Bare-JSON fallback runs only when no XML block parsed."""
     if not isinstance(text, str) or not text.strip():
         return [], ""
     extracted: list[ChatCompletionMessageToolCall] = []
     consumed_spans: list[tuple[int, int]] = []
+
+    # The calls array is read first: an OpenAI-shaped entry inside one would otherwise be counted
+    # twice (here and by the bare-JSON fallback).
+    array_spans = _calls_array_spans(text)
+    for start, end, raw in array_spans:
+        extracted.extend(_parse_calls_array(raw, len(extracted) + 1))
+        consumed_spans.append((start, end))
+
     for pattern, group in ((TOOL_CALL_BLOCK_RE, 1), (TOOL_CALL_JSON_RE, 0)):
+        matched = False
         for m in pattern.finditer(text):
+            if any(start <= m.start() and m.end() <= end for start, end, _ in array_spans):
+                continue
             call = _parse_tool_call(m.group(group), len(extracted) + 1)
             if call is not None:
                 extracted.append(call)
+                matched = True
             consumed_spans.append((m.start(), m.end()))
-        if extracted:
+        if matched:
             break
     if not consumed_spans:
         return extracted, text.strip()

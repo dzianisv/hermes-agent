@@ -130,6 +130,42 @@ def test_malformed_and_empty_input_never_raises():
     assert cleaned == "hi"
 
 
+def test_calls_array_in_prose_is_parsed_and_stripped():
+    """Some models emit {"calls": [...]} instead of the documented envelope. The call must still be
+    executed, and the raw JSON must not reach the user as prose."""
+    text = ('Doing it now. {"calls": [{"name": "kanban_assign", '
+            '"arguments": {"task_id": "t_ed511c9d", "agent": "Turing"}}, '
+            '{"name": "another_tool", "arguments": {"x": 1}}]} Thanks!')
+    calls, cleaned = extract_tool_calls_from_text(text)
+    assert [c.function.name for c in calls] == ["kanban_assign", "another_tool"]
+    assert json.loads(calls[0].function.arguments) == {"task_id": "t_ed511c9d", "agent": "Turing"}
+    assert json.loads(calls[1].function.arguments) == {"x": 1}
+    assert [c.id for c in calls] == ["acp_call_1", "acp_call_2"]
+    # The user must not see the raw JSON.
+    assert "calls" not in cleaned
+    assert cleaned == "Doing it now.\nThanks!"
+
+
+def test_calls_array_inside_the_tool_call_envelope_is_parsed():
+    text = ('<tool_call>{"calls": [{"name": "kanban_assign", "arguments": {"task_id": "t1"}}, '
+            '{"name": "another_tool", "arguments": {}}]}</tool_call>')
+    calls, cleaned = extract_tool_calls_from_text(text)
+    assert [c.function.name for c in calls] == ["kanban_assign", "another_tool"]
+    assert json.loads(calls[0].function.arguments) == {"task_id": "t1"}
+    assert cleaned == ""
+
+
+def test_malformed_calls_arrays_never_raise():
+    # A non-list "calls" is not the tool shape: nothing is executed and the text is left alone.
+    calls, cleaned = extract_tool_calls_from_text('{"calls": "notalist"}')
+    assert calls == []
+    assert cleaned == '{"calls": "notalist"}'
+    # An empty array is a well-formed call envelope with no calls in it.
+    calls, cleaned = extract_tool_calls_from_text('{"calls": []}')
+    assert calls == []
+    assert cleaned == ""
+
+
 # ── streaming shape ──────────────────────────────────────────────────────────
 
 
