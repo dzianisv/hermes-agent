@@ -22,9 +22,10 @@ TOOL_CALL_JSON_RE = re.compile(
     r"\{\s*\"id\"\s*:\s*\"[^\"]+\"\s*,\s*\"type\"\s*:\s*\"function\"\s*,\s*\"function\"\s*:\s*\{.*?\}\s*\}", re.DOTALL
 )
 # Locates a ``{"calls": [...]}`` object (the shape some models emit instead of the documented
-# envelope). The object's real end is resolved by ``_json_object_end`` — a regex cannot balance the
-# nested braces of an ``arguments`` payload, so the match alone would truncate it.
-TOOL_CALL_ARRAY_RE = re.compile(r"\{\s*\"calls\"\s*:\s*\[.*?\]\s*(?:\}|,)", re.DOTALL)
+# envelope). The key may sit anywhere in the object, so this regex only PROPOSES the key; the
+# enclosing object is resolved by ``_key_owners`` and its real end by ``_json_object_end`` — a regex
+# cannot balance the nested braces of an ``arguments`` payload, so a match alone would truncate it.
+TOOL_CALL_ARRAY_RE = re.compile(r"\"calls\"\s*:\s*\[")
 
 TOOL_CALL_CONTRACT = (
     "Available tools (OpenAI function schema). "
@@ -164,21 +165,81 @@ def _json_object_end(text: str, start: int) -> int | None:
     return None
 
 
+def _string_end(text: str, start: int) -> int | None:
+    """Index just past the string token opening at ``start``; None when the string never closes."""
+    index = start + 1
+    length = len(text)
+    while index < length:
+        char = text[index]
+        if char == "\\":
+            index += 2
+            continue
+        if char == '"':
+            return index + 1
+        index += 1
+    return None
+
+
+def _key_owners(text: str) -> dict[int, int]:
+    """Map of key-token start offset → start offset of the object that holds the key.
+
+    One string-aware pass with an open-brace stack: a key is a string token followed by ``:`` and
+    the stack says which object it belongs to. A key that is not the FIRST one of its object
+    resolves to that same object, which is what the ``{"calls": [...]}`` shape needs — the object
+    is found through its key, not through the key's position. Keys outside any object are dropped:
+    there is no object to validate them against.
+    """
+    owners: dict[int, int] = {}
+    stack: list[int] = []
+    index = 0
+    length = len(text)
+    while index < length:
+        char = text[index]
+        if char == '"':
+            end = _string_end(text, index)
+            if end is None:
+                break
+            after = end
+            while after < length and text[after].isspace():
+                after += 1
+            if after < length and text[after] == ":" and stack:
+                owners[index] = stack[-1]
+            index = end
+            continue
+        if char == "{":
+            stack.append(index)
+        elif char == "}" and stack:
+            stack.pop()
+        index += 1
+    return owners
+
+
 def _calls_array_spans(text: str) -> list[tuple[int, int, str]]:
-    """``(start, end, raw)`` of every ``{"calls": [...]}`` object in ``text``; non-objects are skipped."""
+    """``(start, end, raw)`` of every object holding a ``"calls"`` list; anything else is skipped.
+
+    ``"calls"`` may be ANY key of the object, not only its first one: the candidate key comes from
+    ``TOOL_CALL_ARRAY_RE``, the enclosing object from ``_key_owners``, and ``json.loads`` decides
+    whether the object really is a calls envelope.
+    """
+    owners = _key_owners(text)
     spans: list[tuple[int, int, str]] = []
+    seen: set[int] = set()
     for match in TOOL_CALL_ARRAY_RE.finditer(text):
-        start = match.start()
-        end = _json_object_end(text, start)
+        owner = owners.get(match.start())
+        if owner is None or owner in seen:
+            continue
+        seen.add(owner)
+        end = _json_object_end(text, owner)
         if end is None:
             continue
-        raw = text[start:end]
+        raw = text[owner:end]
         try:
             obj = json.loads(raw)
         except Exception:
             continue
         if isinstance(obj, dict) and isinstance(obj.get("calls"), list):
-            spans.append((start, end, raw))
+            spans.append((owner, end, raw))
+    spans.sort()
     return spans
 
 
@@ -226,7 +287,8 @@ def extract_tool_calls_from_text(text: str) -> tuple[list[ChatCompletionMessageT
     removed so the assistant message doesn't show raw JSON.
 
     Three shapes are recognised: the ``<tool_call>`` envelope, the bare OpenAI object, and the
-    ``{"calls": [...]}`` array some models emit. Bare-JSON fallback runs only when no XML block parsed."""
+    ``{"calls": [...]}`` array some models emit — in that array ``"calls"`` may be any key of the
+    object, not only its first one. Bare-JSON fallback runs only when no XML block parsed."""
     if not isinstance(text, str) or not text.strip():
         return [], ""
     extracted: list[ChatCompletionMessageToolCall] = []

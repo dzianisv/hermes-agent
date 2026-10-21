@@ -237,3 +237,92 @@ def test_copilot_prompt_still_carries_the_contract_and_the_tools():
     assert '"name": "memory"' in prompt
     assert '"name": "read_file"' in prompt  # copilot forwards everything
     assert "hi" in prompt
+
+
+# ── the "calls" key may be ANY key of the object ─────────────────────────────
+
+
+def test_calls_array_with_non_first_key_is_parsed_and_stripped():
+    """Regression: "calls" is not always the FIRST key of the object. A locator anchored on
+    "{" + "calls" cannot see a sibling key in front, so the whole call stayed invisible — no
+    tool ran and the raw JSON reached the user as prose (the original incident's symptom)."""
+    text = 'Here you go: {"thought":"ok","calls":[{"name":"kanban_assign","arguments":{"task_id":"t_1"}}]}'
+    calls, cleaned = extract_tool_calls_from_text(text)
+    assert len(calls) == 1
+    assert calls[0].function.name == "kanban_assign"
+    assert json.loads(calls[0].function.arguments) == {"task_id": "t_1"}
+    # The user must not see the raw JSON.
+    assert '"calls"' not in cleaned
+    assert cleaned == "Here you go:"
+
+
+def test_calls_array_is_found_whatever_the_key_order():
+    """The envelope is found through its "calls" key, not through the key's position."""
+    entry = '{"name": "a", "arguments": {"x": 1}}'
+    cases = {
+        "first": '{"calls": [%s]}' % entry,
+        "second": '{"thought": "ok", "calls": [%s]}' % entry,
+        "third": '{"a": 1, "b": 2, "calls": [%s]}' % entry,
+        "spaced": '{ "calls" : [ %s ] }' % entry,
+        "sibling after": '{"calls": [%s], "other": 1}' % entry,
+        "nested": '{"outer": {"calls": [%s]}}' % entry,
+    }
+    for label, text in cases.items():
+        calls, cleaned = extract_tool_calls_from_text(text)
+        assert [c.function.name for c in calls] == ["a"], label
+        assert json.loads(calls[0].function.arguments) == {"x": 1}, label
+        assert '"calls"' not in cleaned, label
+    # A bare array is not the object shape: nothing runs and the text is left alone.
+    calls, cleaned = extract_tool_calls_from_text("[%s]" % entry)
+    assert calls == []
+    assert cleaned == "[%s]" % entry
+
+
+def test_a_calls_key_that_is_not_a_list_is_left_alone():
+    """Only a LIST is the tool shape — a "calls" string is prose, wherever the key sits."""
+    text = '{"thought": "ok", "calls": "notalist"}'
+    calls, cleaned = extract_tool_calls_from_text(text)
+    assert calls == []
+    assert cleaned == text
+
+
+def test_malformed_calls_objects_never_raise():
+    """A malformed envelope yields no call and no exception — bad model JSON must never take
+    the whole turn down."""
+    for text in (
+        '{"calls":',
+        '{"calls":"notalist"}',
+        '{"calls":[]}',
+        '{"calls":[null]}',
+        '{"calls":[{}]}',
+        '{"calls":[{"name":""}]}',
+        '{"calls":[{"name":"a"}',  # unterminated
+        "x" * 5000,  # long non-JSON text
+    ):
+        calls, _cleaned = extract_tool_calls_from_text(text)
+        assert isinstance(calls, list), text
+
+
+def test_calls_array_with_two_thousand_entries_is_handled():
+    entries = [{"name": "tool_%d" % i, "arguments": {"i": i}} for i in range(2000)]
+    calls, cleaned = extract_tool_calls_from_text(json.dumps({"calls": entries}))
+    assert len(calls) == 2000
+    assert calls[0].function.name == "tool_0"
+    assert calls[-1].function.name == "tool_1999"
+    assert cleaned == ""
+
+
+def test_adjacent_call_shapes_are_not_double_counted():
+    calls_obj = '{"calls": [{"name": "a", "arguments": {"x": 1}}]}'
+    bare = '{"id": "c9", "type": "function", "function": {"name": "b", "arguments": "{}"}}'
+    # A calls object plus a separate bare OpenAI object: two calls, not three.
+    calls, _ = extract_tool_calls_from_text("%s and %s" % (calls_obj, bare))
+    assert sorted(c.function.name for c in calls) == ["a", "b"]
+    # A calls object plus a tool_call envelope: two calls.
+    calls, _ = extract_tool_calls_from_text("%s <tool_call>%s</tool_call>" % (calls_obj, bare))
+    assert sorted(c.function.name for c in calls) == ["a", "b"]
+    # A calls object holding an OpenAI-shaped entry: exactly one call.
+    calls, _ = extract_tool_calls_from_text(
+        '{"calls": [{"id": "c1", "type": "function", "function": {"name": "b", "arguments": "{}"}}]}'
+    )
+    assert [c.function.name for c in calls] == ["b"]
