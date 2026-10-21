@@ -2173,6 +2173,21 @@ def _claim_is_live(claim: Any, now: datetime, ttl_seconds: float) -> bool:
     return not _claim_owner_is_dead(claim)
 
 
+def fire_claim_is_live(job_id: Any) -> bool:
+    """True when *job_id* currently holds a live fire claim — a run of it is in flight.
+
+    Read from the store under ``_jobs_lock()`` so the answer reflects the file, not a
+    scan-time snapshot. The fire claim is the durable cross-process counterpart of the
+    in-process running set: the running job heartbeats it every 60s
+    (``heartbeat_fire_claim``), ``mark_job_run`` clears it when the run ends, and a claim
+    whose owner is provably dead expires immediately (``_claim_owner_is_dead``).
+    """
+    def apply(jobs, _i, job):
+        return _claim_is_live(job.get("fire_claim"), _hermes_now(), FIRE_CLAIM_TTL_SECONDS)
+
+    return bool(_with_job(job_id, apply, False))
+
+
 _REARM_RECURRING_ERROR = (
     "Cannot re-arm recurring jobs: re-arm is one-shot-only; use plain resume or cron run."
 )

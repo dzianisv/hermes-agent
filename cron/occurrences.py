@@ -77,10 +77,11 @@ def pending_slot_stamp(next_run, now):
 def unclaimed_pending_slot(job, now):
     """Stored instant of a slot the dispatcher never claimed, or None.
 
-    None for non-recurring jobs and malformed stamps (never a fire) and for a job still in this
-    process's running set (its queued worker will claim and clear the slot itself). A stamp by
-    THIS process on a job not running here is orphaned (dispatch refused). A stamp by another
-    process is honoured while that owner may still be alive within the fire-claim lease — a
+    None for non-recurring jobs and malformed stamps (never a fire), for a job still in this
+    process's running set (its queued worker will claim and clear the slot itself), and for a job
+    whose own fire claim is live (a run of it is in flight in ANOTHER process sharing this store).
+    A stamp by THIS process on a job not running here is orphaned (dispatch refused). A stamp by
+    another process is honoured while that owner may still be alive within the fire-claim lease — a
     second live gateway on the same store is mid-dispatch, not dead."""
     from cron.constants import FIRE_CLAIM_TTL_SECONDS
     from cron.jobs import _claim_is_live, _job_running_in_this_process, _machine_id
@@ -96,6 +97,19 @@ def unclaimed_pending_slot(job, now):
     except ValueError:
         return None
     if _job_running_in_this_process(str(job.get("id", ""))):
+        return None
+    # A run of THIS job is in flight. The in-process running set above only sees THIS
+    # process; the job's own fire claim is the durable cross-process "a run is happening
+    # right now" marker — the running job heartbeats it every 60s (heartbeat_fire_claim),
+    # mark_job_run clears it when the run ends, and a claim whose owner is provably dead
+    # expires at once (_claim_owner_is_dead). Restoring the slot while that claim is live
+    # makes the job due again on EVERY tick: the tick re-dispatches it, the live claim
+    # refuses it, and the refusal is recorded as a failed execution row ("Fire claim
+    # lost") — one bogus row per tick for as long as the run lasts, plus a dispatch record
+    # whose lateness grows with every tick ("catch-up after missed fire … 51m late"). The
+    # in-flight run re-anchors next_run_at when it completes, so the occurrence is not lost
+    # by not restoring it here.
+    if _claim_is_live(job.get("fire_claim"), now, FIRE_CLAIM_TTL_SECONDS):
         return None
     if pending.get("by") != _machine_id() and _claim_is_live(pending, now, FIRE_CLAIM_TTL_SECONDS):
         return None

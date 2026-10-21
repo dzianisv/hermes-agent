@@ -536,8 +536,9 @@ def _resolve_job_reasoning_config(job: dict, cfg: dict, model: str) -> dict | No
 
 from cron.jobs import (
     _ensure_cron_dir, advance_next_runs, claim_dispatch, claim_job_for_fire, fire_claim_fence,
-    clear_run_claim, get_due_jobs, heartbeat_fire_claim, heartbeat_run_claim, mark_job_run,
-    save_job_output, self_removal_delivery_allowed, self_removal_delivery_scope, use_cron_store)
+    fire_claim_is_live, clear_run_claim, get_due_jobs, heartbeat_fire_claim, heartbeat_run_claim,
+    mark_job_run, save_job_output, self_removal_delivery_allowed, self_removal_delivery_scope,
+    use_cron_store)
 from cron.executions import (
     _TERMINAL_STATES, HANDOFF_ADOPTION_GRACE_SECONDS, create_execution, finish_execution,
     get_execution, mark_execution_handoff_pending, mark_execution_running,
@@ -4099,6 +4100,17 @@ def _submit_with_guard(job: dict, pool: concurrent.futures.ThreadPoolExecutor, p
     # ``ctx.run``, where the per-profile cron scope is not bound, so releasing without it would
     # discard the LAUNCH home's key and leak every secondary profile's claim.
     _claim_home = _get_hermes_home()
+    # Cross-process in-flight guard: the fire claim is the durable "a run of this job is in
+    # flight" marker — the in-process dedup above only sees THIS process, while a second
+    # gateway on the same store (or an external worker) holds the run in another process. A
+    # live claim there means the dispatch below would lose the claim inside the worker and
+    # record a bogus failed execution row ("Fire claim lost") for a job that is healthy and
+    # running. Skip exactly like the in-process dedup above, BEFORE the execution row is
+    # created.
+    if fire_claim_is_live(job_id):
+        release_running_job(job_id, home=_claim_home)
+        logger.info("Job '%s' already running elsewhere (live fire claim) — skipping", job_label)
+        return None
     # Record the attempt before dispatch; recovery marks abandoned rows unknown (no retry).
     try:
         execution = create_execution(
