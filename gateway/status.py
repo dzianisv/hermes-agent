@@ -588,6 +588,27 @@ def command_line_runs_inline_source(tokens: list[str]) -> bool:
     return inline_source_flag_index(tokens) is not None
 
 
+def _command_line_is_hermes_bootstrap_gateway(command: str) -> bool:
+    """True when *command* is the hermes_bootstrap launcher directly running the gateway.
+
+    ``python -I -c <bootstrap> gateway run …``: the bootstrap imports
+    ``hermes_bootstrap`` and invokes ``hermes_cli.main`` itself, so the argv after
+    ``-c`` is this process's OWN gateway command. The detached restart watcher
+    (#107002), by contrast, only carries a later ``gateway …`` spawn as inline
+    data and must stay hidden from the identity matcher.
+    """
+    command_lc = command.lower().replace("\\", "/")
+    return (
+        "import hermes_bootstrap" in command_lc
+        and (
+            "from hermes_cli.main import main" in command_lc
+            or 'runpy.run_module("hermes_cli.main"' in command_lc
+            or "runpy.run_module('hermes_cli.main'" in command_lc
+        )
+        and re.search(r"(^|\s)-c(\s|$)", command_lc) is not None
+    )
+
+
 def _gateway_command_subcommand(command: str | None) -> str | None:
     """Hermes gateway lifecycle subcommand from a command line, or None. No loose substring matches
     (``"gateway" in cmdline`` also matched ``gateway status`` / ``python -m tui_gateway``): needs a
@@ -609,7 +630,14 @@ def _gateway_command_subcommand(command: str | None) -> str | None:
     # ``python -c <src> … -m hermes_cli.main gateway run``: the trailing argv belongs to the program
     # the inline source will spawn later, not to this process (#107002). Case-preserving tokens:
     # the operand-taking ``-X``/``-W``/``-Q`` must not be conflated with ``-q``/``-b``.
-    if command_line_runs_inline_source(cased_tokens):
+    # The hermes_bootstrap launcher (launchd / store-Python installs) runs the gateway ITSELF:
+    # ``python -I -c <bootstrap> gateway run …`` — its inline source is the launcher, which imports
+    # hermes_bootstrap and calls hermes_cli.main, so the argv after -c is this process's own
+    # identity, not data for a later spawn. Don't let the guard hide a live bootstrap gateway.
+    if (
+        not _command_line_is_hermes_bootstrap_gateway(command)
+        and command_line_runs_inline_source(cased_tokens)
+    ):
         return None
     # The launchd job's osascript wrapper (gateway_launchd.launchd_program_arguments) carries the gateway argv
     # inside one AppleScript string; the gateway itself is its child and is matched on its own command line.
