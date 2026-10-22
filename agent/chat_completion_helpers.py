@@ -2073,8 +2073,34 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None, reset_a
     if switch_deferred_by_reset(agent, reason, reset_at):
         return False
     cooldown_seconds = _arm_rate_limit_cooldown(agent, reason, reset_at=reset_at)
+    # The primary model just failed — record it so dynamic ranking deprioritizes
+    # a repeatedly-failing model and adapts to appearing/disappearing models.
+    try:
+        from agent.openrouter_free_fallback import record_model_failure
+        record_model_failure(str(getattr(agent, "model", "") or ""))
+    except Exception:
+        pass
     while True:
         if agent._fallback_index >= len(agent._fallback_chain):
+            # Chain exhausted — try to replenish with dynamically discovered free
+            # OpenRouter models before declaring fallback dead. Controlled by
+            # config.yaml ``openrouter_free_fallback.enabled``.
+            try:
+                from agent.openrouter_free_fallback import prime_agent_free_fallback
+                primary_model = str(getattr(agent, "model", "") or "")
+                primary_provider = str(getattr(agent, "provider", "") or "")
+                added = prime_agent_free_fallback(
+                    agent, primary_model, primary_provider,
+                    static_chain=list(getattr(agent, "_fallback_chain", None) or []),
+                )
+                if added:
+                    logger.info(
+                        "Fallback chain replenished with %d free OpenRouter models "
+                        "after exhaustion (primary=%s/%s)", added, primary_provider, primary_model,
+                    )
+                    continue  # re-enter the loop to walk the new entries
+            except Exception:
+                logger.debug("OpenRouter free-fallback replenishment failed", exc_info=True)
             return _fallback_chain_exhausted(agent, reason)
         fb = agent._fallback_chain[agent._fallback_index]
         agent._fallback_index += 1
@@ -2106,6 +2132,11 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None, reset_a
             if fb_client is None:
                 logger.warning("Fallback to %s failed: provider not configured", fb_provider)
                 unavailable.add(fb_key)
+                try:
+                    from agent.openrouter_free_fallback import record_model_failure
+                    record_model_failure(fb_model)
+                except Exception:
+                    pass
                 continue
             if fb_provider == "moa":
                 # A MoA entry means the preset itself, exactly like ``provider: moa`` in config or
@@ -2184,6 +2215,13 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None, reset_a
             from agent.native_compaction import resolve_native_compaction_capabilities
             agent.runtime_capabilities = resolve_native_compaction_capabilities(
                 model=agent.model, base_url=agent.base_url, provider=fb_provider, is_codex_backend=fb_provider == "openai-codex")
+            # Fallback successfully activated — record success so dynamic ranking
+            # keeps this model preferred over untested alternatives.
+            try:
+                from agent.openrouter_free_fallback import record_model_success
+                record_model_success(fb_model)
+            except Exception:
+                pass
             return True
         except Exception as e:
             if fb_provider == "nous":

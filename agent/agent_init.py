@@ -38,6 +38,7 @@ from agent.tool_guardrails import (
     ToolCallGuardrailConfig, ToolCallGuardrailController
 )
 from hermes_cli.config import DEFAULT_CONFIG, cfg_get
+from agent.openrouter_free_fallback import prime_agent_free_fallback
 from hermes_cli.route_identity import normalize_route_base_url
 from hermes_cli.timeouts import get_provider_request_timeout
 from hermes_constants import get_hermes_home
@@ -1073,7 +1074,8 @@ def _init_fallback_chain(agent, fallback_model):
     sync_credential_pool_entry_id(agent)
 
     # Ordered backups tried when the primary is exhausted (legacy single-dict or list).
-    agent._fallback_chain = _fallback_entries(fallback_model)
+    static_chain = _fallback_entries(fallback_model)
+    agent._fallback_chain = static_chain
     agent._fallback_index = 0
     agent._fallback_activated = getattr(agent, "_fallback_activated", False)
     # Legacy attribute kept for backward compat (tests, external callers)
@@ -1085,6 +1087,36 @@ def _init_fallback_chain(agent, fallback_model):
             print(f"🔄 Fallback model: {labels[0]}")
         else:
             print(f"🔄 Fallback chain ({len(chain)} providers): " + " → ".join(labels))
+
+    # Automated OpenRouter free-model fallback: after the static chain is loaded,
+    # append discovered free models from OpenRouter's live /api/v1/models catalog.
+    # These serve as additional fallback candidates when the static chain is
+    # exhausted. Controlled by config.yaml ``openrouter_free_fallback.enabled``.
+    try:
+        primary_model = str(getattr(agent, "model", "") or "")
+        primary_provider = str(getattr(agent, "provider", "") or "")
+        max_entries = _read_free_fallback_max_entries()
+        added = prime_agent_free_fallback(
+            agent, primary_model, primary_provider,
+            static_chain=static_chain, max_entries=max_entries,
+        )
+        if added and not agent.quiet_mode:
+            print(f"🆓 OpenRouter free fallback: +{added} models from live catalog")
+    except Exception:
+        logger.debug("OpenRouter free-fallback priming failed; static chain unchanged", exc_info=True)
+
+
+def _read_free_fallback_max_entries() -> int:
+    """Read ``openrouter_free_fallback.max_entries`` from config, fail-open to default."""
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config() or {}
+        block = cfg.get("openrouter_free_fallback")
+        if isinstance(block, dict):
+            return int(block.get("max_entries", 6))
+    except Exception:
+        pass
+    return 6
 
 
 def _load_tools(agent, enabled_toolsets, disabled_toolsets):
