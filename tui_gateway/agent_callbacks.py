@@ -125,6 +125,10 @@ def _agent_cbs(sid: str) -> dict:
             method, sid, {k: v for k, v in (("start", start), ("count", count)) if v is not None},
             timeout=timeout)
 
+    def status_callback(kind, text=None):
+        # Legacy text-only and native (kind, text) producers share the classified sink.
+        _agent_status_update(sid, kind, text)
+
     callbacks = {
         "tool_start_callback": lambda tc_id, name, args: _on_tool_start(sid, tc_id, name, args),
         "tool_complete_callback": lambda tc_id, name, args, result: _on_tool_complete(sid, tc_id, name, args, result),
@@ -138,7 +142,7 @@ def _agent_cbs(sid: str) -> dict:
         "reaction_callback": lambda kind: _emit("reaction", sid, {"kind": kind}),
         "reasoning_callback": lambda text: _emit(
             "reasoning.delta", sid, {"text": text, **({"verbose": True} if _session_verbose(sid) else {})}),
-        "status_callback": lambda kind, text=None: _agent_status_update(sid, kind, text),
+        "status_callback": status_callback,
         # Credits/notice spine: AgentNotice → notification.show; recovery → notification.clear.
         "notice_callback": lambda n: _agent_notice_update(sid, n),
         "notice_clear_callback": lambda key: _emit("notification.clear", sid, {"key": key}),

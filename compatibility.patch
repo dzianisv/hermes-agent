@@ -1,0 +1,115 @@
+diff --git a/run_agent.py b/run_agent.py
+--- a/run_agent.py
++++ b/run_agent.py
+@@ -644,7 +644,12 @@
+         return model.lower().rsplit("/", 1)[-1].startswith("gpt-5")  # strip vendor prefix ("openai/gpt-5.4")
+ 
+     @staticmethod
+-    def _provider_model_requires_responses_api(model: str, *, provider: Optional[str] = None) -> bool:
++    def _provider_model_requires_responses_api(
++        model: str,
++        *,
++        provider: Optional[str] = None,
++        api_key: Optional[str] = None,
++    ) -> bool:
+         """Return True when this provider/model pair should use Responses API."""
+         from hermes_cli.providers import is_actual_route
+         normalized_provider = (provider or "").strip().lower()
+diff --git a/tui_gateway/agent_callbacks.py b/tui_gateway/agent_callbacks.py
+--- a/tui_gateway/agent_callbacks.py
++++ b/tui_gateway/agent_callbacks.py
+@@ -150,6 +150,10 @@
+             method, sid, {k: v for k, v in (("start", start), ("count", count)) if v is not None},
+             timeout=timeout)
+ 
++    def status_callback(kind, text=None):
++        # Legacy text-only and native (kind, text) producers share the classified sink.
++        _agent_status_update(sid, kind, text)
++
+     callbacks = {
+         "tool_start_callback": lambda tc_id, name, args: _on_tool_start(sid, tc_id, name, args),
+         "tool_complete_callback": lambda tc_id, name, args, result: _on_tool_complete(sid, tc_id, name, args, result),
+@@ -162,7 +166,7 @@
+         # Affection reaction (ily / <3 / good bot) → hearts; core-detected so TUI/desktop share it.
+         "reaction_callback": lambda kind: _emit("reaction", sid, {"kind": kind}),
+         "reasoning_callback": lambda text: _emit_reasoning_delta(sid, text),
+-        "status_callback": lambda kind, text=None: _agent_status_update(sid, kind, text),
++        "status_callback": status_callback,
+         # Credits/notice spine: AgentNotice → notification.show; recovery → notification.clear.
+         "notice_callback": lambda n: _agent_notice_update(sid, n),
+         "notice_clear_callback": lambda key: _emit("notification.clear", sid, {"key": key}),
+diff --git a/tests/agent/test_provider_responses_api_contract.py b/tests/agent/test_provider_responses_api_contract.py
+new file mode 100644
+--- /dev/null
++++ b/tests/agent/test_provider_responses_api_contract.py
+@@ -0,0 +1,16 @@
++"""Routing callers may supply credentials without changing non-Copilot decisions."""
++import pytest
++
++from run_agent import AIAgent
++
++
++@pytest.mark.parametrize("api_key", [None, "test-routing-key"])
++@pytest.mark.parametrize("model, provider, expected", [
++    ("gpt-5", "openrouter", True),
++    ("gpt-4o", "openrouter", False),
++    ("gpt-5", "custom", False),
++])
++def test_responses_routing_accepts_api_key_keyword(model, provider, expected, api_key):
++    route = AIAgent._provider_model_requires_responses_api
++    assert route(model, provider=provider, api_key=api_key) is expected
++    assert route(model, provider=provider) is expected
+diff --git a/tests/tui_gateway/test_status_callback_contract.py b/tests/tui_gateway/test_status_callback_contract.py
+new file mode 100644
+--- /dev/null
++++ b/tests/tui_gateway/test_status_callback_contract.py
+@@ -0,0 +1,49 @@
++"""Both native status callback shapes reach the real presentation and stream sinks."""
++import json
++from types import SimpleNamespace
++
++import pytest
++
++from gateway.warning_notifications import ProviderRetryText
++from tui_gateway import server
++
++
++@pytest.mark.parametrize("text_only", [False, True])
++@pytest.mark.parametrize("policy", ["show", "retry_only", "all_warnings"])
++def test_status_callback_shapes_preserve_retry_policy_and_stream(tmp_path, monkeypatch, text_only, policy):
++    config = {"display": {
++        "suppress_provider_retry_notifications": policy == "retry_only",
++        "suppress_warning_notifications": policy == "all_warnings",
++    }}
++    (tmp_path / "config.yaml").write_text(json.dumps(config))
++    frames = []
++    monkeypatch.setattr(server, "write_json", lambda frame: frames.append(frame) or True)
++    monkeypatch.setitem(server._sessions, "status-contract", {
++        "agent": SimpleNamespace(_notification_config=config),
++        "profile_home": str(tmp_path),
++    })
++    callback = server._agent_cbs("status-contract")["status_callback"]
++
++    def emit(kind, message):
++        if text_only:
++            callback(message)
++        else:
++            callback(kind, message)
++
++    retry = ProviderRetryText("Provider recovery countdown")
++    emit("warn", retry)
++    # The same words without a producer marker are ordinary requested progress.
++    emit("info", str(retry))
++    callback("warn", "Database incident")
++    callback("info", "Requested result")
++
++    events = [frame["params"] for frame in frames]
++    assert all(event["type"] == "status.update" for event in events)
++    expected = []
++    if policy == "show":
++        expected.append({"kind": "status" if text_only else "warn", "text": str(retry)})
++    expected.append({"kind": "status" if text_only else "info", "text": str(retry)})
++    if policy != "all_warnings":
++        expected.append({"kind": "warn", "text": "Database incident"})
++    expected.append({"kind": "info", "text": "Requested result"})
++    assert [event["payload"] for event in events] == expected
