@@ -296,6 +296,7 @@ def settle_unrecovered_error(
         is_local_validation_error
         or shrink_spent
         or reasoning_spent
+        or (classified.reason == FailoverReason.rate_limit and not classified.retryable)
         or (
             not classified.retryable
             and not classified.should_compress
