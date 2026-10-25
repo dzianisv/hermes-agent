@@ -331,8 +331,6 @@ def fetch_free_openrouter_models(
             continue
         if not _model_supports_tools(model):
             continue
-        if is_model_suppressed(mid):
-            continue
         if mid in free_models:
             continue
         free_models.append(mid)
@@ -350,7 +348,7 @@ def fetch_free_openrouter_models(
     free_models.sort(key=sort_key)
 
     entries: List[Dict[str, Any]] = [
-        {"provider": "openrouter", "model": mid} for mid in free_models[:max_entries]
+        {"provider": "openrouter", "model": mid} for mid in free_models
     ]
 
     _free_model_cache = (now, entries)
@@ -359,7 +357,7 @@ def fetch_free_openrouter_models(
         len(entries), priority_model,
         sum(1 for mid in free_models if is_model_suppressed(mid)),
     )
-    return entries
+    return [entry for entry in entries if not is_model_suppressed(entry["model"])][:max_entries]
 
 
 def build_dynamic_fallback_chain(
