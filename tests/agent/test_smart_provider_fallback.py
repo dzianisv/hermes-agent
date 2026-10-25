@@ -118,7 +118,8 @@ def test_profile_and_credential_isolation(tmp_path, monkeypatch):
     assert smart._path("account-a") == a
 
 
-def test_catalog_unavailable_never_guesses(monkeypatch):
+@pytest.mark.parametrize("status", [200, 401, 403, 429, 503])
+def test_catalog_unavailable_never_guesses(monkeypatch, status):
     import hermes_cli.auth_codex as auth
     monkeypatch.setattr(auth, "resolve_codex_runtime_credentials", lambda: {})
     assert smart.codex_models() == []
@@ -128,7 +129,7 @@ def test_catalog_unavailable_never_guesses(monkeypatch):
     monkeypatch.setattr(metadata, "_codex_catalog_probe_allowed", lambda *a: True)
     calls = []
     monkeypatch.setattr(metadata, "fetch_codex_catalog_entries", lambda *a, **kw: (
-        calls.append(True) or [], 503))
+        calls.append(True) or [], status))
     smart._codex_cache.clear()
     assert smart.codex_models() == []
     assert smart.codex_models() == []
