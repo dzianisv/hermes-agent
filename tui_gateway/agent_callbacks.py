@@ -78,7 +78,7 @@ def _mirror_subagent_to_child(event_type: str, payload: dict) -> None:
             _child_mirrors.pop(child_key, None)
 
 
-def _agent_presentation_enabled(sid: str, *, diagnostic: bool) -> bool:
+def _agent_presentation_enabled(sid: str, *, diagnostic: bool, message=None) -> bool:
     from gateway.warning_notifications import warning_notifications_enabled
     with _sessions_lock:
         session = _sessions.get(sid)
@@ -90,19 +90,20 @@ def _agent_presentation_enabled(sid: str, *, diagnostic: bool) -> bool:
         return True
     with _session_profile_runtime_scope(session or {}):
         # Sole TUI policy read for agent callbacks; sinks below call this instead of re-deriving it.
-        return warning_notifications_enabled("tui", getattr((session or {}).get("agent"), "_notification_config", None))
+        return warning_notifications_enabled("tui", getattr((session or {}).get("agent"), "_notification_config", None), message=message)
 
 
 def _agent_status_update(sid: str, kind: str, text: str | None = None) -> None:
     from gateway.warning_notifications import is_warning_status
-    if not _agent_presentation_enabled(sid, diagnostic=is_warning_status(kind, text if text is not None else kind)):
+    message = text if text is not None else kind
+    if not _agent_presentation_enabled(sid, diagnostic=is_warning_status(kind, message), message=message):
         return
     _status_update(sid, str(kind), None if text is None else str(text))
 
 
 def _agent_thinking_update(sid: str, text: str) -> None:
     from gateway.warning_notifications import DiagnosticText
-    if not _agent_presentation_enabled(sid, diagnostic=isinstance(text, DiagnosticText)):
+    if not _agent_presentation_enabled(sid, diagnostic=isinstance(text, DiagnosticText), message=text):
         return
     _emit("thinking.delta", sid, {"text": text})
 
@@ -490,7 +491,7 @@ def _restart_status_factory(parent: str, progress):
     def _restart_status(kind, text=None):
         from gateway.warning_notifications import is_warning_status
         message = text if text is not None else kind
-        if is_warning_status(kind, message) and not _agent_presentation_enabled(parent, diagnostic=True):
+        if is_warning_status(kind, message) and not _agent_presentation_enabled(parent, diagnostic=True, message=message):
             return
         progress(message)
     return _restart_status

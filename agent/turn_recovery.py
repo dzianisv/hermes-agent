@@ -65,7 +65,7 @@ def _plines(agent: Any, *lines: str) -> None:
 def _blines(agent: Any, *lines: str) -> None:
     """``_buffer_vprint`` each line (surfaces only if every retry+fallback exhausts)."""
     for line in lines:
-        agent._buffer_vprint(line)
+        agent._buffer_vprint(line, provider_retry=True)
 
 
 def _image_error_max_dimension(error: Exception) -> Optional[int]:
@@ -1444,20 +1444,18 @@ def compute_error_backoff(
             f"(attempt {retry_count + 1}/{max_retries}){_policy_note}..."
         )
         if _backoff_policy == "zai_coding_overload_long":
-            agent._emit_diagnostic_status(_rate_limit_status)
+            agent._emit_diagnostic_status(_rate_limit_status, provider_retry=True)
         else:
-            agent._buffer_diagnostic_status(_rate_limit_status)
+            agent._buffer_diagnostic_status(_rate_limit_status, provider_retry=True)
     else:
         _retry_status = (
             f"⏳ Retrying in {wait_time:.1f}s (attempt {retry_count}/{max_retries})..."
         )
         if _retry_after is not None and _retry_after > 60:
-            # A 5xx Retry-After can now reach the 600s cap; buffering that wait
-            # would leave the user silent for minutes, so surface long provider
-            # cooldowns immediately (mirrors the zai_coding_overload_long path).
-            agent._emit_diagnostic_status(_retry_status)
+            # Long cooldowns surface immediately unless provider-progress presentation is muted.
+            agent._emit_diagnostic_status(_retry_status, provider_retry=True)
         else:
-            agent._buffer_diagnostic_status(_retry_status)
+            agent._buffer_diagnostic_status(_retry_status, provider_retry=True)
     # The buffered line only replays if every retry fails; the live status
     # line is the one thing the user sees meanwhile. Name the wait there so a
     # 60s backoff after a 5xx is not an anonymous spinner — this is transient
@@ -1467,7 +1465,8 @@ def compute_error_backoff(
     # can learn whether to sit it out or switch models.
     _live_reason = f"{_wait_reason.lower()} — resets in {_reset}," if _reset else "waiting on provider —"
     agent._emit_diagnostic_wait(
-        f"⏳ {_live_reason} retrying in {wait_time:.0f}s (attempt {retry_count}/{max_retries})"
+        f"⏳ {_live_reason} retrying in {wait_time:.0f}s (attempt {retry_count}/{max_retries})",
+        provider_retry=True,
     )
     logger.warning(
         "Retrying API call in %ss (attempt %s/%s) %s policy=%s error=%s",
@@ -1719,7 +1718,8 @@ def activate_codex_app_server_fallback(agent: Any, result: Dict[str, Any]) -> bo
     if classified.reason not in _RATE_LIMIT_REASONS:
         return False
     agent._buffer_diagnostic_status(
-        _eager_fallback_status(classified, classified.reason == FailoverReason.upstream_rate_limit, False))
+        _eager_fallback_status(classified, classified.reason == FailoverReason.upstream_rate_limit, False),
+        provider_retry=True)
     return bool(agent._try_activate_fallback(reason=classified.reason))
 
 
@@ -1905,7 +1905,7 @@ def route_classified_error(
             False if _is_upstream else _ra()._pool_may_recover_from_rate_limit(agent._credential_pool)
         )
         if not pool_may_recover:
-            agent._buffer_diagnostic_status(_eager_fallback_status(classified, _is_upstream, _is_transport_failure))
+            agent._buffer_diagnostic_status(_eager_fallback_status(classified, _is_upstream, _is_transport_failure), provider_retry=True)
             reset_at = error_context.get("reset_at") if isinstance(error_context, dict) else None
             if agent._try_activate_fallback(reason=classified.reason, reset_at=reset_at):
                 return _fallback_break()
@@ -1920,7 +1920,7 @@ def route_classified_error(
         _retry.auth_failover_attempted = True
         agent._buffer_diagnostic_status(
             "🔐 Authentication failed and could not be refreshed — "
-            "switching to fallback provider..."
+            "switching to fallback provider...", provider_retry=True,
         )
         if agent._try_activate_fallback(reason=classified.reason):
             return _fallback_break()

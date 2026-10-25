@@ -57,7 +57,7 @@ class CLIStreamMixin:
             self._spinner_text = text or ""
             self._tool_start_time = 0.0  # clear tool timer when switching to thinking
             self._invalidate()
-        render_notification(show, platform="cli", diagnostic=isinstance(text, DiagnosticText),
+        render_notification(show, platform="cli", diagnostic=isinstance(text, DiagnosticText), message=text,
                             user_config=getattr(getattr(self, "agent", None), "_notification_config", None))
 
     def _on_notice(self, notice) -> None:

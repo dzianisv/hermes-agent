@@ -901,6 +901,8 @@ DEFAULT_CONFIG = {
         # Engine warning/failure notifications stay visible unless an operator opts in.
         # Does not suppress task results, manual commands, or existing logs.
         "suppress_warning_notifications": False,
+        # Only automatic provider retry/fallback progress; terminal failures and other warnings stay visible.
+        "suppress_provider_retry_notifications": False,
         # Codex Responses commentary channel: true delivers completed commentary as mid-turn interim
         # updates; false routes it to reasoning (visible only with show_reasoning).
         "show_commentary": True,

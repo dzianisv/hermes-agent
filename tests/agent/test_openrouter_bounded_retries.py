@@ -26,7 +26,7 @@ def _agent(monkeypatch, tmp_path, server, *, budget, pool=False, fallback=True):
     monkeypatch.setenv("HERMES_HOME", str(home))
     (home / "config.yaml").write_text(json.dumps({
         "agent": {"api_max_retries": budget, "auto_recovery_cycles": 0},
-        "display": {"suppress_warning_notifications": True},
+        "display": {"suppress_provider_retry_notifications": True},
         "fallback": {"min_switch_reset_seconds": 120},
         "openrouter_free_fallback": {"enabled": False},
         "auxiliary": {"title_generation": {"enabled": False}},

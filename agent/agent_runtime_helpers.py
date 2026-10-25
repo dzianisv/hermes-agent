@@ -1340,7 +1340,8 @@ def restore_primary_runtime(agent) -> bool:
             with contextlib.suppress(Exception):
                 agent._emit_diagnostic_status(
                     f"✅ Primary model restored: {agent.model} via {agent.provider}; "
-                    f"fallback {previous_model} via {previous_provider} is no longer active."
+                    f"fallback {previous_model} via {previous_provider} is no longer active.",
+                    provider_retry=True,
                 )
         return True
     except Exception as e:
