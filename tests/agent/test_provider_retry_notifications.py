@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 from types import SimpleNamespace
@@ -117,7 +118,12 @@ def test_narrow_policy_uses_owner_snapshot_at_real_surface(tmp_path, monkeypatch
                     controls = []
                     monkeypatch.setattr(server_requests, "send", lambda method, *a, **k: controls.append(method) or {"answer": "yes"})
                     monkeypatch.setattr(server_requests, "send_async", lambda method, *a, **k: controls.append(method))
-                    assert callbacks["clarify_callback"]("Continue?", ["yes", "no"]) == "yes"
+                    clarify = callbacks["clarify_callback"]
+                    if len(inspect.signature(clarify).parameters) == 1:
+                        assert clarify([{"qid": "q1", "question": "Continue?", "choices": ["yes", "no"],
+                                         "multi_select": False}]) == {"answer": "yes"}
+                    else:
+                        assert clarify("Continue?", ["yes", "no"]) == "yes"
                     server._emit_approval_request("retry-owner", {"command": "test-command"})
                     assert controls == ["clarify", "approval"]
             assert "observed Provider switched successfully" in caplog.text
