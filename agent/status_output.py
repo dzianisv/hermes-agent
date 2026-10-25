@@ -22,7 +22,7 @@ class StatusOutputMixin:
         routes through ``self._print_fn`` so the CLI can inject an ANSI-aware renderer."""
         if getattr(self, "_mute_notification_reply", False):
             return
-        if diagnostic and not self._warning_presentation_enabled():
+        if diagnostic and not self._warning_presentation_enabled(args[0] if args else None):
             return
         try:
             (self._print_fn or print)(*args, **kwargs)
@@ -34,7 +34,7 @@ class StatusOutputMixin:
         the main response; ``force=True`` bypasses both. ``suppress_status_output`` (``hermes chat -q``) wins."""
         if getattr(self, "suppress_status_output", False):
             return
-        if diagnostic and not self._warning_presentation_enabled():
+        if diagnostic and not self._warning_presentation_enabled(args[0] if args else None):
             return
         if force or not (getattr(self, "_mute_post_response", False) or (self._has_stream_consumers() and not self._executing_tools)):
             self._safe_print(*args, **kwargs)
@@ -75,27 +75,28 @@ class StatusOutputMixin:
         """Print to the CLI (``_vprint(force=True)``) and forward to ``status_callback(kind, message)``. Never raises."""
         from gateway.warning_notifications import is_warning_status
         try:
-            if not is_warning_status(kind, message) or self._warning_presentation_enabled():
+            if not is_warning_status(kind, message) or self._warning_presentation_enabled(message):
                 self._vprint(f"{self.log_prefix}{message}", force=True)
         except Exception:
             pass
         self._call_callback("status_callback", kind, message, origin=origin)
 
-    def _warning_presentation_enabled(self) -> bool:
+    def _warning_presentation_enabled(self, message=None) -> bool:
         from gateway.warning_notifications import warning_notifications_enabled
         try:
             return warning_notifications_enabled(
                 getattr(self, "_notification_platform", getattr(self, "platform", "cli")),
-                getattr(self, "_notification_config", None),
+                getattr(self, "_notification_config", None), message=message,
             )
         except Exception:
             # A presentation preference must never turn a recoverable notice into a failed turn.
             return True
 
-    def _emit_diagnostic_status(self, message: str) -> None:
+    def _emit_diagnostic_status(self, message: str, *, provider_retry: bool = False) -> None:
         """A diagnostic on the lifecycle rail, without changing legacy formatting."""
-        from gateway.warning_notifications import DiagnosticText
-        self._emit_status(DiagnosticText(message))
+        from gateway.warning_notifications import DiagnosticText, ProviderRetryText
+        marker = ProviderRetryText if provider_retry else DiagnosticText
+        self._emit_status(message if isinstance(message, marker) else marker(message))
 
     def _emit_status(self, message: str) -> None:
         """Emit a lifecycle status message (CLI + gateway ``status_callback``)."""
@@ -182,9 +183,10 @@ class StatusOutputMixin:
         self._touch_activity(text)
         self._call_callback("thinking_callback", text, origin="_emit_wait_notice")
 
-    def _emit_diagnostic_wait(self, text: str) -> None:
-        from gateway.warning_notifications import DiagnosticText
-        self._emit_wait_notice(DiagnosticText(text))
+    def _emit_diagnostic_wait(self, text: str, *, provider_retry: bool = False) -> None:
+        from gateway.warning_notifications import DiagnosticText, ProviderRetryText
+        marker = ProviderRetryText if provider_retry else DiagnosticText
+        self._emit_wait_notice(text if isinstance(text, marker) else marker(text))
 
     # ── Buffered retry/fallback status: shown only when every retry/fallback is exhausted, dropped on
     # success. Backend logs are unaffected (every site still logs). ──
@@ -203,12 +205,14 @@ class StatusOutputMixin:
     def _buffer_status(self, message: str) -> None:
         self._buffer_retry_message("status", message)
 
-    def _buffer_diagnostic_status(self, message: str) -> None:
-        from gateway.warning_notifications import DiagnosticText
-        self._buffer_status(DiagnosticText(message))
+    def _buffer_diagnostic_status(self, message: str, *, provider_retry: bool = False) -> None:
+        from gateway.warning_notifications import DiagnosticText, ProviderRetryText
+        marker = ProviderRetryText if provider_retry else DiagnosticText
+        self._buffer_status(message if isinstance(message, marker) else marker(message))
 
-    def _buffer_vprint(self, message: str) -> None:
-        self._buffer_retry_message("vprint", message)
+    def _buffer_vprint(self, message: str, *, provider_retry: bool = False) -> None:
+        from gateway.warning_notifications import ProviderRetryText
+        self._buffer_retry_message("vprint", ProviderRetryText(message) if provider_retry else message)
 
     def _clear_status_buffer(self) -> None:
         """Drop buffered retry messages — call on successful recovery."""
@@ -217,9 +221,8 @@ class StatusOutputMixin:
             buf.clear()
 
     def _emit_pending_fallback_notice(self) -> None:
-        """Surface the one-shot fallback-switch notice on successful recovery: a provider switch is durable
-        state operators must see, unlike the retry chatter ``_clear_status_buffer`` drops. Emitted once, then
-        cleared; on terminal failure the buffered switch line is flushed instead (``_flush_status_buffer``)."""
+        """Emit the successful provider switch once, retaining observer callbacks even when its
+        presentation is muted. On terminal failure the buffered switch line is flushed instead."""
         notice = getattr(self, "_pending_fallback_notice", None)
         if not notice:
             return
@@ -227,7 +230,7 @@ class StatusOutputMixin:
         self._pending_fallback_notice = None
         for item in notice if isinstance(notice, list) else [notice]:
             try:
-                self._emit_diagnostic_status(item)
+                self._emit_diagnostic_status(item, provider_retry=True)
             except Exception:
                 # One surface failure must not hide later switches from the same chain.
                 continue
@@ -248,7 +251,7 @@ class StatusOutputMixin:
                 if kind in replay:
                     replay[kind](msg)
                 else:
-                    if self._warning_presentation_enabled():
+                    if self._warning_presentation_enabled(msg):
                         self._vprint(f"{self.log_prefix}{msg}", force=True)
             except Exception:
                 pass

@@ -644,7 +644,12 @@ class AIAgent(
         return model.lower().rsplit("/", 1)[-1].startswith("gpt-5")  # strip vendor prefix ("openai/gpt-5.4")
 
     @staticmethod
-    def _provider_model_requires_responses_api(model: str, *, provider: Optional[str] = None) -> bool:
+    def _provider_model_requires_responses_api(
+        model: str,
+        *,
+        provider: Optional[str] = None,
+        api_key: Optional[str] = None,
+    ) -> bool:
         """Return True when this provider/model pair should use Responses API."""
         from hermes_cli.providers import is_actual_route
         normalized_provider = (provider or "").strip().lower()

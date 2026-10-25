@@ -296,6 +296,7 @@ def settle_unrecovered_error(
         is_local_validation_error
         or shrink_spent
         or reasoning_spent
+        or (classified.reason == FailoverReason.rate_limit and not classified.retryable)
         or (
             not classified.retryable
             and not classified.should_compress
@@ -336,7 +337,7 @@ def settle_unrecovered_error(
             # before a silent abort.
             if agent._has_pending_fallback():
                 _label = _NONRETRYABLE_LABELS.get(classified.reason, f"Non-retryable error (HTTP {status_code})")
-                agent._buffer_diagnostic_status(f"⚠️ {_label} — trying fallback...")
+                agent._buffer_diagnostic_status(f"⚠️ {_label} — trying fallback...", provider_retry=True)
             reset_at = error_context.get("reset_at") if isinstance(error_context, dict) else None
             if agent._try_activate_fallback(reason=classified.reason, reset_at=reset_at):
                 # Direct ``return _verdict("break")`` is load-bearing: the restart handler
@@ -375,7 +376,7 @@ def settle_unrecovered_error(
             agent._fallback_activated = False
             return _verdict("continue")
         if agent._has_pending_fallback():
-            agent._buffer_diagnostic_status(f"⚠️ Max retries ({max_retries}) exhausted — trying fallback...")
+            agent._buffer_diagnostic_status(f"⚠️ Max retries ({max_retries}) exhausted — trying fallback...", provider_retry=True)
         reset_at = error_context.get("reset_at") if isinstance(error_context, dict) else None
         if agent._try_activate_fallback(reason=classified.reason, reset_at=reset_at):
             # Direct ``return _verdict("break")`` is load-bearing: the restart handler

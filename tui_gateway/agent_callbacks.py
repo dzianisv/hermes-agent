@@ -92,7 +92,7 @@ def _mirror_subagent_to_child(event_type: str, payload: dict, profile_home) -> N
             _child_mirrors.pop(key, None)
 
 
-def _agent_presentation_enabled(sid: str, *, diagnostic: bool) -> bool:
+def _agent_presentation_enabled(sid: str, *, diagnostic: bool, message=None) -> bool:
     from gateway.warning_notifications import warning_notifications_enabled
     with _sessions_lock:
         session = _sessions.get(sid)
@@ -104,12 +104,13 @@ def _agent_presentation_enabled(sid: str, *, diagnostic: bool) -> bool:
         return True
     with _session_profile_runtime_scope(session or {}):
         # Sole TUI policy read for agent callbacks; sinks below call this instead of re-deriving it.
-        return warning_notifications_enabled("tui", getattr((session or {}).get("agent"), "_notification_config", None))
+        return warning_notifications_enabled("tui", getattr((session or {}).get("agent"), "_notification_config", None), message=message)
 
 
 def _agent_status_update(sid: str, kind: str, text: str | None = None) -> None:
     from gateway.warning_notifications import is_warning_status
-    if not _agent_presentation_enabled(sid, diagnostic=is_warning_status(kind, text if text is not None else kind)):
+    message = text if text is not None else kind
+    if not _agent_presentation_enabled(sid, diagnostic=is_warning_status(kind, message), message=message):
         return
     _status_update(sid, str(kind), None if text is None else str(text))
 
@@ -118,7 +119,7 @@ def _agent_thinking_update(sid: str, text: str) -> None:
     from gateway.warning_notifications import DiagnosticText
     # Wait notices and the quiet spinner share this callback with diagnostics.
     # They are not reasoning blocks; display.show_reasoning must not swallow them.
-    if not _agent_presentation_enabled(sid, diagnostic=isinstance(text, DiagnosticText)):
+    if not _agent_presentation_enabled(sid, diagnostic=isinstance(text, DiagnosticText), message=text):
         return
     _emit("thinking.delta", sid, {"text": text})
 
@@ -149,6 +150,10 @@ def _agent_cbs(sid: str) -> dict:
             method, sid, {k: v for k, v in (("start", start), ("count", count)) if v is not None},
             timeout=timeout)
 
+    def status_callback(kind, text=None):
+        # Legacy text-only and native (kind, text) producers share the classified sink.
+        _agent_status_update(sid, kind, text)
+
     callbacks = {
         "tool_start_callback": lambda tc_id, name, args: _on_tool_start(sid, tc_id, name, args),
         "tool_complete_callback": lambda tc_id, name, args, result: _on_tool_complete(sid, tc_id, name, args, result),
@@ -161,7 +166,7 @@ def _agent_cbs(sid: str) -> dict:
         # Affection reaction (ily / <3 / good bot) → hearts; core-detected so TUI/desktop share it.
         "reaction_callback": lambda kind: _emit("reaction", sid, {"kind": kind}),
         "reasoning_callback": lambda text: _emit_reasoning_delta(sid, text),
-        "status_callback": lambda kind, text=None: _agent_status_update(sid, kind, text),
+        "status_callback": status_callback,
         # Credits/notice spine: AgentNotice → notification.show; recovery → notification.clear.
         "notice_callback": lambda n: _agent_notice_update(sid, n),
         "notice_clear_callback": lambda key: _emit("notification.clear", sid, {"key": key}),
@@ -525,7 +530,7 @@ def _restart_status_factory(parent: str, progress):
     def _restart_status(kind, text=None):
         from gateway.warning_notifications import is_warning_status
         message = text if text is not None else kind
-        if is_warning_status(kind, message) and not _agent_presentation_enabled(parent, diagnostic=True):
+        if is_warning_status(kind, message) and not _agent_presentation_enabled(parent, diagnostic=True, message=message):
             return
         progress(message)
     return _restart_status

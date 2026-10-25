@@ -905,6 +905,35 @@ display:
       long_running_notifications: false
 ```
 
+### Quiet provider retries (without hiding operational warnings)
+
+To hide automatic provider retry/fallback progress only:
+
+```yaml
+display:
+  suppress_provider_retry_notifications: true
+  platforms:
+    cli:
+      suppress_provider_retry_notifications: false
+```
+
+This hides rate-limit/fallback lines, successful provider-switch diagnostics,
+auto-recovery countdowns and long `Retry-After` notices on enabled surfaces.
+It does **not** hide final failures, requested results, approvals, clarifications,
+or unrelated warnings (including cron, watchdog and database incidents). Logs,
+observer callbacks, retries and cancellation are unchanged. The default is `false`;
+per-platform overrides win and `null` inherits, using the owning profile's policy.
+Leave `suppress_warning_notifications` off unless you also want its broader suppression.
+
+Transient OpenRouter 429s retry the same model before falling back, within
+`agent.api_max_retries` (an attempt ceiling: `6` allows six failures and five waits).
+Backoff starts at 2 seconds, doubles to a 60-second base cap, and adds positive
+jitter. `Retry-After` is a minimum for these 429s, capped at 600 seconds. Existing
+account rotation is separate; proven daily quota exhaustion rotates/falls back
+promptly instead of waiting for that spent allowance to return. Temporary transport
+outages can additionally use `agent.auto_recovery_cycles` after retries/fallbacks
+are exhausted; set it to `0` to disable that separate recovery budget.
+
 ### Warning and error notifications (opt-in suppression)
 
 Automatic warning and error notifications are shown by default. To suppress

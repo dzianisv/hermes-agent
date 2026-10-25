@@ -65,7 +65,7 @@ def _plines(agent: Any, *lines: str) -> None:
 def _blines(agent: Any, *lines: str) -> None:
     """``_buffer_vprint`` each line (surfaces only if every retry+fallback exhausts)."""
     for line in lines:
-        agent._buffer_vprint(line)
+        agent._buffer_vprint(line, provider_retry=True)
 
 
 def _image_error_max_dimension(error: Exception) -> Optional[int]:
@@ -660,8 +660,10 @@ def recover_after_classification(
             _vlines(agent, "🔐 Nous paid access verified — refreshed runtime credentials and retrying request...")
             return True, False
 
+    # A proven quota wall must rotate now, not spend the pool's one transient retry.
+    _terminal_quota = classified.reason == FailoverReason.rate_limit and not classified.retryable
     recovered_with_pool, _retry.has_retried_429 = agent._recover_with_credential_pool(
-        status_code=status_code, has_retried_429=_retry.has_retried_429,
+        status_code=status_code, has_retried_429=_retry.has_retried_429 or _terminal_quota,
         classified_reason=classified.reason, error_context=error_context,
         billing_unverified=classified.billing_unverified,
     )
@@ -1429,6 +1431,13 @@ def compute_error_backoff(
     if _retry_after is not None:
         _retry_after = min(_retry_after, RETRY_AFTER_CAP_S)
     wait_time = _retry_after if _retry_after is not None else jittered_backoff(retry_count, base_delay=2.0, max_delay=60.0)
+    if (
+        _retry_after is not None and getattr(api_error, "status_code", None) == 429
+        and (getattr(agent, "provider", "") == "openrouter" or base_url_host_matches(str(base_url), "openrouter.ai"))
+    ):
+        # Retry-After is a minimum, not a replacement for exponential backoff: a
+        # constant short header must not collapse every retry to the same delay.
+        wait_time = max(wait_time, jittered_backoff(retry_count, base_delay=2.0, max_delay=60.0))
     _backoff_policy = None
     _adaptive = is_rate_limited or is_zai_coding_overload
     if _adaptive and _retry_after is None:
@@ -1449,9 +1458,9 @@ def compute_error_backoff(
         # A 5xx Retry-After can reach the cap; buffering it would leave the user silent for minutes.
         _announce_now = _retry_after is not None and _retry_after > LIVE_RETRY_WAIT_CAP_S
     if _announce_now:
-        agent._emit_diagnostic_status(_status)
+        agent._emit_diagnostic_status(_status, provider_retry=True)
     else:
-        agent._buffer_diagnostic_status(_status)
+        agent._buffer_diagnostic_status(_status, provider_retry=True)
     # The buffered line replays only if every retry fails; the live status line is transient
     # (rewritten by the next frame, cleared on recovery), so it names the wait on every retry
     # without adding transcript chatter. The reset window belongs here too: during the wait this
@@ -1461,7 +1470,8 @@ def compute_error_backoff(
     else:
         _live_reason = "the free model is busy —" if _free_busy else "waiting on provider —"
     agent._emit_diagnostic_wait(
-        f"⏳ {_live_reason} retrying in {wait_time:.0f}s (attempt {retry_count}/{max_retries})"
+        f"⏳ {_live_reason} retrying in {wait_time:.0f}s (attempt {retry_count}/{max_retries})",
+        provider_retry=True,
     )
     logger.warning(
         "Retrying API call in %ss (attempt %s/%s) %s policy=%s error=%s",
@@ -1729,7 +1739,8 @@ def activate_codex_app_server_fallback(agent: Any, result: dict[str, Any]) -> bo
     if classified.reason not in _RATE_LIMIT_REASONS:
         return False
     agent._buffer_diagnostic_status(
-        _eager_fallback_status(classified, classified.reason == FailoverReason.upstream_rate_limit, False))
+        _eager_fallback_status(classified, classified.reason == FailoverReason.upstream_rate_limit, False),
+        provider_retry=True)
     return bool(agent._try_activate_fallback(reason=classified.reason))
 
 
@@ -1780,10 +1791,10 @@ def route_classified_error(
 ) -> ClassifiedErrorVerdict:
     """Ordered (load-bearing) recovery steps between classification and overflow handling:
     compaction-disabled overflow → terminal error (output-cap errors exempt); Anthropic
-    long-context tier 429 → cap at 200k and compress; eager fallback for rate-limit/billing
-    (immediately) and transport failures (after 1 retry) unless credential-pool rotation may
-    still recover (upstream-aggregator 429s always fall back); persistent 401/403 → fallback
-    chain once; genuine Nous 429 → cross-session breaker + re-enter the loop exactly once."""
+    long-context tier 429 → cap at 200k and compress; transient OpenRouter 429s → configured
+    same-model retry budget before fallback; other rate-limit/billing and transport failures
+    retain eager fallback unless credential-pool rotation may still recover; persistent 401/403
+    → fallback chain once; genuine Nous 429 → cross-session breaker + re-enter the loop exactly once."""
     from agent.conversation_compression import conversation_history_after_compression
     from agent.conversation_loop import _arm_fallback_restart, _ra
     from agent.model_metadata import estimate_request_tokens_rough
@@ -1873,8 +1884,8 @@ def route_classified_error(
                 return _verdict("break")
         # Compression exhausted or didn't help: fall through to normal error handling.
 
-    # Eager fallback: rate-limit/billing switch immediately (primary won't recover in
-    # the retry window); transport errors get 1 retry first.
+    # Eager fallback remains for hard limits and other providers; transient OpenRouter
+    # 429s below must spend their same-model budget. Transport errors get 1 retry first.
     is_rate_limited = classified.reason in _RATE_LIMIT_REASONS
     # Some relays wrap upstream output-cap 400s as 429 (rate_limit). Only the max_tokens
     # clamp fixes it. Parsed once; gates the eager-fallback exemption and overflow entry.
@@ -1894,10 +1905,18 @@ def route_classified_error(
     _is_zai_coding_overload = is_zai_coding_overload_error(base_url=str(base_url), model=model, error=api_error)
     if _is_zai_coding_overload:
         max_retries = max(max_retries, zai_coding_overload_retry_ceiling())
+    # OpenRouter capacity/throttle 429s can recover on this model. Let the existing
+    # interruptible exponential backoff spend the configured budget before switching.
+    # Billing, proven daily quotas and other providers keep their eager recovery paths.
+    _transient_openrouter_429 = (
+        status_code == 429 and classified.retryable
+        and (getattr(agent, "provider", "") == "openrouter" or base_url_host_matches(str(base_url), "openrouter.ai"))
+        and classified.reason in {FailoverReason.rate_limit, FailoverReason.upstream_rate_limit, FailoverReason.overloaded}
+    )
     _should_fallback = (
         (is_rate_limited and _wrapped_output_cap_budget is None)
         or (_is_transport_failure and retry_count >= 2)
-    )
+    ) and (not _transient_openrouter_429 or retry_count >= max_retries)
     if _should_fallback and agent._fallback_index < len(agent._fallback_chain):
         # No eager fallback while credential pool rotation may recover. Exception: an
         # upstream-aggregator 429 — the pool can't help, always fall back.
@@ -1907,7 +1926,7 @@ def route_classified_error(
             False if _is_upstream else _ra()._pool_may_recover_from_rate_limit(agent._credential_pool)
         )
         if not pool_may_recover:
-            agent._buffer_diagnostic_status(_eager_fallback_status(classified, _is_upstream, _is_transport_failure))
+            agent._buffer_diagnostic_status(_eager_fallback_status(classified, _is_upstream, _is_transport_failure), provider_retry=True)
             reset_at = error_context.get("reset_at") if isinstance(error_context, dict) else None
             if agent._try_activate_fallback(reason=classified.reason, reset_at=reset_at):
                 return _fallback_break()
@@ -1922,7 +1941,7 @@ def route_classified_error(
         _retry.auth_failover_attempted = True
         agent._buffer_diagnostic_status(
             "🔐 Authentication failed and could not be refreshed — "
-            "switching to fallback provider..."
+            "switching to fallback provider...", provider_retry=True,
         )
         if agent._try_activate_fallback(reason=classified.reason):
             return _fallback_break()

@@ -1004,7 +1004,7 @@ class GatewayTurnProgressMixin:
             if fut is not None and ctx._cleanup_progress:
                 fut.add_done_callback(self._track_future_cleanup_id)
         render_notification(present, platform=ctx.source.platform, user_config=ctx.user_config,
-                            diagnostic=is_warning_status(event_type, message))
+                            diagnostic=is_warning_status(event_type, message), message=message)
 
 
 def local_viewer_turn(runner) -> bool:

@@ -792,9 +792,14 @@ class OpenAICompatRoutesMixin:
             # Lifecycle/warning status (provider wait, auto-recovery countdown, fallback switch) as a
             # ``hermes.status`` event, so a client sees why the stream is silent instead of a dead socket.
             from gateway.platforms.api_server import _redact_api_error_text
-            text = _redact_api_error_text(message if message is not None else kind or "").strip()
+            from gateway.warning_notifications import is_warning_status, render_notification
+            original = message if message is not None else kind or ""
+            text = _redact_api_error_text(original).strip()
             if text:
-                stream_q.put_threadsafe(("__status__", {"kind": str(kind), "text": text}))
+                render_notification(
+                    lambda: stream_q.put_threadsafe(("__status__", {"kind": str(kind), "text": text})),
+                    platform="api_server", diagnostic=is_warning_status(kind, original), message=original,
+                    user_config=getattr(agent_ref[0], "_notification_config", None))
         agent_ref = [None]
         agent_task = asyncio.ensure_future((run_agent or self._run_agent)(
             stream_delta_callback=_on_delta, reasoning_callback=_on_reasoning, status_callback=_on_status,

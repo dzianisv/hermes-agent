@@ -93,7 +93,8 @@ def auto_recover_after_exhaustion(
     cycle = used + 1
     _retry.auto_recovery_cycles_used = cycle
     wait_s = ladder_wait_seconds(cycle, api_error)
-    notice = ladder_notice(agent, wait_s=wait_s, cycle=cycle, total=total)
+    from gateway.warning_notifications import ProviderRetryText
+    notice = ProviderRetryText(ladder_notice(agent, wait_s=wait_s, cycle=cycle, total=total))
     # Durable line on every surface (CLI print, TUI status.update, gateway bubble, api_server SSE)
     # plus the live wait line (spinner / thinking.delta / activity heartbeat).
     agent._emit_diagnostic_status(notice)

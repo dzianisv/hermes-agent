@@ -1092,6 +1092,15 @@ def _status_429(c: _Ctx) -> Verdict:
     # this handler always returns, so _by_error_code never sees the code.
     if c.code in _BILLING_ERROR_CODES:
         return _V_BILLING
+    # OpenRouter's daily free allowance cannot reopen during a transient retry budget.
+    # Keep the quota diagnosis (not billing), rotate accounts, then fail/fall back promptly.
+    if c.provider_slug == "openrouter" and any(p in c.msg for p in (
+        "free-models-per-day", "daily request limit exceeded", "daily token limit exceeded",
+        "daily quota exceeded", "daily limit exceeded",
+    )):
+        reset = _rate_limit_reset_seconds(c.msg, c.body, c.headers)
+        return _v(_R.rate_limit, retryable=False, **_ROTATE_FALLBACK,
+                  error_context={"reset_at": time.time() + reset} if reset else {})
     # Z.AI/Zhipu reuse 429 for server-wide overload: back off on the same
     # key instead of burning the pool (#14038).
     if any(p in c.msg for p in _OVERLOADED_PATTERNS):

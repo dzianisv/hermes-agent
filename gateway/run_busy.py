@@ -582,16 +582,18 @@ class GatewayBusySessionMixin:
         )
 
     async def _send_busy_drain_notice(self, event: MessageEvent, session_key: str, effective_mode: str) -> None:
-        """Busy path while the gateway is restarting/stopping: queue (if allowed) and tell the user."""
+        """Busy path while the gateway is restarting/stopping: queue (if allowed), silently.
+
+        The "Gateway is restarting" notice was removed — it was noisy on Telegram.
+        Messages are still queued when drain-queue is enabled, just silently.
+        """
         adapter = self._delivery_adapter_for(event.source)
         if not adapter:
             return
         if self._queue_during_drain_enabled(effective_mode):
             self._queue_or_replace_pending_event(session_key, event)
-            message = t("gateway.busy.drain_queued", action=self._status_action_gerund())
-        else:
-            message = t("gateway.busy.drain_rejected", action=self._status_action_gerund())
-        await self._send_busy_reply(event, adapter, message)
+        # No "gateway is restarting" reply to the user.
+        return
 
     # Bare-word approval replies → (verb, args) for the synthesized slash command. English words
     # (and the thumbs) always match; ``approval.inputs.*`` adds the active language's synonyms.
