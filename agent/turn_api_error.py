@@ -79,15 +79,17 @@ def handle_api_error(
     if agent.thinking_callback:
         agent.thinking_callback("")
 
-    _recovered, active_system_prompt = recover_before_classification(
-        agent, api_error, messages=messages, api_messages=api_messages, api_kwargs=api_kwargs,
-        active_system_prompt=active_system_prompt,
-    )
-    if _recovered:
-        return _verdict("continue")
-
     status_code = getattr(api_error, "status_code", None)
     error_context = agent._extract_api_error_context(api_error)
+    from agent.smart_provider_fallback import record_error
+    account_free_quota = record_error(agent, api_error, error_context)
+    if not account_free_quota:
+        _recovered, active_system_prompt = recover_before_classification(
+            agent, api_error, messages=messages, api_messages=api_messages, api_kwargs=api_kwargs,
+            active_system_prompt=active_system_prompt,
+        )
+        if _recovered:
+            return _verdict("continue")
 
     # Process is exiting mid-flight: retries/rotation/fallbacks are futile and the
     # retry trace spams the shell. One log line.
@@ -128,6 +130,18 @@ def handle_api_error(
         retry_count=retry_count, max_retries=max_retries, retryable=classified.retryable,
         reason=classified.reason.value,
     )
+
+    if account_free_quota:
+        if agent._try_activate_fallback(reason=classified.reason, reset_at=(error_context or {}).get("reset_at")):
+            from agent.conversation_loop import _arm_fallback_restart
+            active_system_prompt = _arm_fallback_restart(agent, api_messages, active_system_prompt, _retry)
+            retry_count = compression_attempts = 0
+            return _verdict("break")
+        return _verdict("return", {
+            "final_response": "Free-tier account quota exhausted; no eligible authenticated GPT-6+ fallback is available.",
+            "messages": messages, "api_calls": api_call_count, "completed": False, "failed": True,
+            "failure_reason": "free_account_quota", "failure_retryable": False,
+        })
 
     _recovered, recovered_with_pool = recover_after_classification(
         agent, api_error, classified, _retry, status_code=status_code, error_context=error_context,

@@ -1566,7 +1566,9 @@ def _build_api_kwargs_for_mode(agent, api_messages: list, tools_for_api: list | 
     # (memoized on the agent); anthropic/bedrock above don't use it.
     cache_scope_id = _prompt_cache_scope_for_agent(agent)
     builder = _build_codex_kwargs if agent.api_mode == "codex_responses" else _build_chat_completions_kwargs
-    return builder(agent, api_messages, tools_for_api, reasoning_config, request_overrides, cache_scope_id)
+    kwargs = builder(agent, api_messages, tools_for_api, reasoning_config, request_overrides, cache_scope_id)
+    from agent.smart_provider_fallback import constrain_request
+    return constrain_request(agent, kwargs)
 
 
 def _model_dump_safe(obj):
@@ -1759,6 +1761,9 @@ def rewrite_prompt_model_identity(agent, model: str, provider: str) -> None:
     Not persisted: the stored row keeps the primary's labels so a restored primary replays a
     byte-identical prompt (prefix cache intact). Only the LAST occurrence of each line is touched —
     earlier matches may be user content (memory snapshots, context files)."""
+    from agent.smart_provider_fallback import enabled as smart_fallback_enabled
+    if smart_fallback_enabled():
+        return  # Routing must not mutate the conversation's cached prefix.
     sp = getattr(agent, "_cached_system_prompt", None)
     if not isinstance(sp, str) or not sp:
         return
@@ -1957,6 +1962,9 @@ def _candidate_pool_exhausted(agent, fb_provider: str, fb_model: str) -> bool:
 def _should_skip_fallback_candidate(agent, fb: dict, fb_key: tuple, fb_provider: str, fb_model: str, unavailable: set) -> bool:
     """True when the entry is already unavailable, malformed, locally unusable, or resolves
     to the backend that just failed (falling back to it would loop the failure)."""
+    from agent.smart_provider_fallback import skip_candidate
+    if skip_candidate(agent, fb_provider, fb_model):
+        return True
     if fb_key in unavailable:
         logger.debug("Fallback skip: %s previously marked unavailable", fb_key)
         return True
@@ -2070,7 +2078,8 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None, reset_a
     model slug and provider in place so the retry loop continues on the new backend; client
     construction goes through resolve_provider_client (no duplicated provider→key mappings)."""
     from agent.fallback_cooldown import _arm_rate_limit_cooldown, switch_deferred_by_reset
-    if switch_deferred_by_reset(agent, reason, reset_at):
+    from agent.smart_provider_fallback import enabled as smart_fallback_enabled
+    if not smart_fallback_enabled() and switch_deferred_by_reset(agent, reason, reset_at):
         return False
     cooldown_seconds = _arm_rate_limit_cooldown(agent, reason, reset_at=reset_at)
     # The primary model just failed — record it so dynamic ranking deprioritizes
@@ -2082,6 +2091,8 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None, reset_a
         pass
     while True:
         if agent._fallback_index >= len(agent._fallback_chain):
+            if smart_fallback_enabled():
+                return _fallback_chain_exhausted(agent, reason)
             # Chain exhausted — try to replenish with dynamically discovered free
             # OpenRouter models before declaring fallback dead. Controlled by
             # config.yaml ``openrouter_free_fallback.enabled``.
@@ -2120,6 +2131,9 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None, reset_a
             # of falling through to OpenRouter defaults.
             fb_base_url_hint = (fb.get("base_url") or "").strip() or None
             fb_api_key_hint = resolve_entry_api_key(fb)
+            from agent.smart_provider_fallback import enabled as smart_enabled, _key as smart_openrouter_key
+            if smart_enabled() and fb_provider == "openrouter":
+                fb_api_key_hint = smart_openrouter_key(agent)
             fb_api_mode_explicit, fb_api_mode = _fallback_api_mode_hint(fb, fb_provider, fb_base_url_hint)
             # Ollama Cloud: OLLAMA_API_KEY from env when the entry has no key. Host match, not
             # substring — GHSA-76xc-57q6-vm5m.
@@ -2165,6 +2179,9 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None, reset_a
                     )
 
             old_model, old_provider, old_base_url = agent.model, agent.provider, agent.base_url
+            if smart_enabled() and old_provider == "openrouter" and fb_provider == "openai-codex":
+                from agent.smart_provider_fallback import block_free
+                block_free(agent, time.time() + 300)
 
             # Clear the per-config context_length override so the fallback model's own context
             # window is resolved instead of the previous model's stale value.
