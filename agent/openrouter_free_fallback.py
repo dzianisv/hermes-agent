@@ -247,7 +247,7 @@ def _model_popularity_score(model: dict) -> float:
 def _model_supports_tools(model: dict) -> bool:
     """True when the model advertises tool-calling support."""
     params = model.get("supported_parameters") if isinstance(model, dict) else None
-    return "tools" in params if isinstance(params, list) else True
+    return "tools" in params if isinstance(params, list) else False
 
 
 def _model_is_free(model: dict) -> bool:
@@ -256,8 +256,8 @@ def _model_is_free(model: dict) -> bool:
     if not isinstance(pricing, dict):
         return False
     return (
-        _safe_float(pricing.get("prompt", "0"), 0.0) == 0.0
-        and _safe_float(pricing.get("completion", "0"), 0.0) == 0.0
+        _safe_float(pricing.get("prompt"), float("nan")) == 0.0
+        and _safe_float(pricing.get("completion"), float("nan")) == 0.0
     )
 
 
@@ -292,12 +292,13 @@ def fetch_free_openrouter_models(
     if not _config_enabled():
         return []
 
+    _prune_stale_health()
     now = time.monotonic()
     cached_at, cached = _free_model_cache
     base_ttl = _config_cache_ttl()
     ttl = _adaptive_cache_ttl(base_ttl, now)
     if not force_refresh and cached and (now - cached_at) < ttl:
-        return cached[:max_entries]
+        return [entry for entry in cached if not is_model_suppressed(entry["model"])][:max_entries]
 
     priority_model = _config_priority_model()
 

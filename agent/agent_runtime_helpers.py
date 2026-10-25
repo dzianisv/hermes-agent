@@ -1428,6 +1428,13 @@ def _primary_quota_reopened_early(agent, primary_provider, primary_model, matche
 def restore_primary_runtime(agent) -> bool:
     """Restore the primary runtime at the start of a new turn so fallback stays turn-scoped
     (long-lived CLI agents and the gateway's cached agents)."""
+    from agent.smart_provider_fallback import enabled as smart_fallback_enabled
+    if smart_fallback_enabled():
+        primary = getattr(agent, "_primary_runtime", {}) or {}
+        if (primary.get("provider") != "openrouter"
+                or primary.get("model") not in getattr(agent, "_smart_free_models", set())
+                or not getattr(agent, "_smart_free_available", False)):
+            return False
     if not agent._fallback_activated:
         # Reset the index even without activation: a failed _try_activate_fallback() can strand
         # _fallback_index past the chain end and silently block future fallbacks (#20465).
