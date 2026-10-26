@@ -2050,7 +2050,7 @@ def _build_context_engine(agent, _agent_cfg, cs, _custom_providers, _effective_c
         if hasattr(_cc, _attr):
             setattr(_cc, _attr, _value)
     agent.compression_checkpoint_required = cs.checkpoint_required
-    from agent.conversation_compression import _warn_checkpoint_required_without_capable_provider
+    from agent.conversation_compression_checkpoint import _warn_checkpoint_required_without_capable_provider
     _warn_checkpoint_required_without_capable_provider(agent)
     agent.codex_app_server_auto_compaction = cs.codex_app_server_auto
     agent.codex_responses_native_compaction = cs.codex_responses_native
@@ -2373,7 +2373,8 @@ _CALLBACK_PARAMS = (
     "thinking_callback", "reasoning_callback", "clarify_callback",
     "read_terminal_callback", "read_preview_callback", "drive_preview_callback",
     "read_window_below_callback", "connection_callback", "tour_callback",
-    "step_callback", "stream_delta_callback", "interim_assistant_callback",
+    "step_callback", "stream_delta_callback", "theme_callback",
+    "setup_beat_callback", "interim_assistant_callback",
     "status_callback", "notice_callback", "notice_clear_callback",
     "event_callback", "reaction_callback", "tool_gen_callback",
 )
@@ -2397,7 +2398,9 @@ def init_agent(
     read_preview_callback: callable = None, drive_preview_callback: callable = None,
     read_window_below_callback: callable = None, connection_callback: callable = None,
     tour_callback: callable = None, step_callback: callable = None,
-    stream_delta_callback: callable = None, interim_assistant_callback: callable = None,
+    stream_delta_callback: callable = None, theme_callback: callable = None,
+    setup_beat_callback: callable = None,
+    interim_assistant_callback: callable = None,
     tool_gen_callback: callable = None, status_callback: callable = None,
     notice_callback: callable = None, notice_clear_callback: callable = None,
     event_callback: Optional[Callable[[str, dict], None]] = None,
@@ -2460,7 +2463,8 @@ def init_agent(
 
     # Platform callbacks are stored under their parameter names verbatim.
     for _cb in _CALLBACK_PARAMS:
-        setattr(agent, _cb, _params[_cb])
+        if _cb in _params:
+            setattr(agent, _cb, _params[_cb])
     agent.suppress_status_output = False
 
     _set_defaults(agent, _CONTROL_STATE)
