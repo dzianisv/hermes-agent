@@ -81,11 +81,68 @@ def _resolve_args() -> list[str]:
     return shlex.split(os.getenv("HERMES_COPILOT_ACP_ARGS", "").strip()) or ["--acp", "--stdio"]
 
 
+def _probe_acp_handshake(command: str, args: list[str]) -> bool:
+    """Probe whether ``command`` with ``args`` speaks ACP.
+
+    Spawns the CLI with its ACP args, sends an initialize request, and returns
+    True when a valid JSON-RPC response comes back. Used as a fallback for CLIs
+    whose ``--help`` is silent (e.g. pi-acp) and doesn't advertise --acp.
+    """
+    try:
+        proc = subprocess.Popen(
+            [command] + args,
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, encoding="utf-8", errors="replace",
+        )
+    except (FileNotFoundError, OSError):
+        return False
+    if proc.stdin is None or proc.stdout is None:
+        proc.kill()
+        return False
+    try:
+        init = json.dumps({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": 1,
+                "clientCapabilities": {"fs": {"readTextFile": True, "writeTextFile": True}},
+                "clientInfo": {"name": "hermes-acp-probe", "version": "0.0.0"},
+            },
+        }) + "\n"
+        try:
+            stdout, _stderr = proc.communicate(input=init, timeout=8)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()
+            return False
+        for line in stdout.splitlines():
+            if not line.strip():
+                continue
+            try:
+                msg = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(msg, dict) and msg.get("id") == 1 and ("result" in msg or "error" in msg):
+                return True
+        return False
+    finally:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
 def _acp_supported(command: str, args: list[str]) -> bool | None:
     """Tri-state ``--acp`` probe (a CLI without the flag exits 1 and the parent would wait the
     full child timeout for stdout that never arrives). True = help advertises --acp; False =
     help ran cleanly without it (caller fast-fails); None = inconclusive (binary missing /
-    --help failed → normal spawn error). Skipped when ``--acp`` is not in ``args`` (custom transport)."""
+    --help failed → normal spawn error). Skipped when ``--acp`` is not in ``args`` (custom transport).
+
+    First pass: parse ``--help`` output (stdout + stderr) for a ``--acp`` token.
+    Fallback: silent CLIs (e.g. pi-acp) whose help emits nothing at all are probed
+    with an actual ACP initialize handshake.
+    """
     if "--acp" not in args:
         return True
     if (cached := _ACP_PROBE_CACHE.get(command)) is not None:
@@ -104,9 +161,20 @@ def _acp_supported(command: str, args: list[str]) -> bool | None:
         return None
     if probe.returncode != 0:
         return None
+    haystack = probe.stdout + "\n" + probe.stderr
     # ``--acp`` as a flag token; tolerate spacing and ``[--acp]`` variants.
-    verdict = _ACP_PROBE_CACHE[command] = bool(re.search(r"(?:^|[\s\[])--acp(?:[\s=\],]|$)", probe.stdout, re.MULTILINE))
-    return verdict
+    if re.search(r"(?:^|[\s\[])--acp(?:[\s=\],]|$)", haystack, re.MULTILINE):
+        return _ACP_PROBE_CACHE.setdefault(command, True)
+    # Silent help output (e.g. pi-acp) doesn't advertise --acp but may still
+    # speak ACP when invoked with --acp --stdio. Fall back to an actual ACP
+    # handshake probe.
+    if not probe.stdout.strip() and not probe.stderr.strip():
+        verdict = _probe_acp_handshake(command, args)
+        _ACP_PROBE_CACHE[command] = verdict
+        return verdict
+    # Help ran cleanly with content but no --acp: this CLI genuinely doesn't
+    # support the ACP transport.
+    return _ACP_PROBE_CACHE.setdefault(command, False)
 
 
 def _resolve_home_dir() -> str:
