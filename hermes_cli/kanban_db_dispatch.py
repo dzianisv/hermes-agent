@@ -103,6 +103,7 @@ def is_workspace_fault(error: object) -> bool:
     """True when ``error`` describes the card's workspace/host path, not a provider."""
     return bool(_WORKSPACE_FAULT_RE.search(_kb._lossy_text(error) or ""))
 
+
 # Within this window a completed run counts as "recent proof"; don't re-spawn.
 _RESPAWN_GUARD_SUCCESS_WINDOW = 3600  # 1 hour
 
@@ -374,6 +375,12 @@ class DispatchResult:
     """Disk pressure that restricted this tick: ``"critical"`` (no new
     workers), ``"elevated"`` (at most one), ``None`` (no restriction).
     Reclaim/promotion bookkeeping still ran; deferred tasks stay queued."""
+    budget_hold: Optional[str] = None
+    """Budget hold reason when spawn was refused by a cap:
+    ``"host_max_in_progress"`` = kanban.max_in_progress / memory-derived host cap,
+    ``"board_max_in_progress"`` = per-board cap,
+    ``"max_spawn"`` = per-board spawn limit.
+    """
 
 
 _PRESSURE_SEVERITY = {"critical": 2, "elevated": 1}
@@ -401,6 +408,7 @@ def describe_suppression(results: Iterable[Optional["DispatchResult"]]) -> str:
     counts: dict[str, int] = {}
     pressure: Optional[str] = None
     disk_pressure: Optional[str] = None
+    budget_hold: Optional[str] = None
     for res in results:
         if res is None:
             continue
@@ -410,9 +418,13 @@ def describe_suppression(results: Iterable[Optional["DispatchResult"]]) -> str:
             counts["rate_limited"] = counts.get("rate_limited", 0) + len(res.rate_limited)
         if res.skipped_locked:
             counts["skipped_locked"] = counts.get("skipped_locked", 0) + 1
+        if res.budget_hold:
+            budget_hold = res.budget_hold
         pressure = _most_severe_pressure(pressure, res.memory_pressure)
         disk_pressure = _most_severe_pressure(disk_pressure, res.disk_pressure)
     parts = [f"{k}={v}" for k, v in sorted(counts.items())]
+    if budget_hold:
+        parts.append(f"budget_hold={budget_hold}")
     if pressure:
         parts.append(f"memory_pressure={pressure}")
     if disk_pressure:
@@ -3459,12 +3471,14 @@ def _tick_spawn_budget(
     # this board's running cards. Unset -> only the global caps apply.
     if board_cap is not None:
         if running_count >= board_cap:
+            result.budget_hold = "board_max_in_progress"
             return False, None
         spawn_budget = board_cap - running_count
 
     # Both ready and review loops consume from the same budget.
     if max_spawn is not None:
         if running_count >= max_spawn:
+            result.budget_hold = "max_spawn"
             return False, None
         if spawn_budget is None or spawn_budget > max_spawn - running_count:
             spawn_budget = max_spawn - running_count
@@ -3472,6 +3486,7 @@ def _tick_spawn_budget(
     if max_in_progress is not None:
         total_running = running_count + count_running_tasks_other_boards(board)
         if total_running >= max_in_progress:
+            result.budget_hold = "host_max_in_progress"
             return False, None
         remaining = max_in_progress - total_running
         if spawn_budget is None or spawn_budget > remaining:

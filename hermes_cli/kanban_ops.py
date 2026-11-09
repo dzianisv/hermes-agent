@@ -118,6 +118,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             "skipped_locked": res.skipped_locked,
             "memory_pressure": res.memory_pressure,
             "disk_pressure": res.disk_pressure,
+            "budget_hold": res.budget_hold,
         }, ascii=True)
         return 0
     print(f"Reclaimed:    {res.reclaimed}")
@@ -161,6 +162,8 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         print(f"Memory pressure {res.memory_pressure}: new workers restricted this tick")
     if res.disk_pressure:
         print(f"Disk pressure {res.disk_pressure}: new workers restricted this tick")
+    if res.budget_hold:
+        print(f"Held back (host concurrency): {res.budget_hold}")
     return 0
 
 

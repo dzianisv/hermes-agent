@@ -360,3 +360,34 @@ def test_review_budget_still_bounded_by_shared_cap(
 
     # Budget 2 total across both lanes, reservation notwithstanding.
     assert len(res.spawned) == 2
+
+
+def test_saturated_host_cap_surfaces_a_reason(
+    kanban_home, all_assignees_spawnable,
+):
+    """When host cap blocks spawn, budget_hold surfaces the reason."""
+    kb.create_board("other")
+
+    # One running worker on another board (consumes the host budget of 1)
+    with kbc.connect(board="other") as conn:
+        tid = kb.create_task(conn, title="busy", assignee="alice")
+        assert kb.claim_task(conn, tid) is not None
+
+    # One ready card on this board - should not spawn due to host cap
+    spawns: list = []
+    with kbc.connect() as conn:
+        kb.create_task(conn, title="ready", assignee="alice")
+        res = kbd.dispatch_once(
+            conn, spawn_fn=_fake_spawn_factory(spawns), max_in_progress=1,
+        )
+
+    # Nothing spawned because host cap is saturated
+    assert len(spawns) == 0
+    assert len(res.spawned) == 0
+
+    # budget_hold should name host_max_in_progress
+    assert res.budget_hold == "host_max_in_progress"
+
+    # describe_suppression should include the budget_hold
+    suppression = kbd.describe_suppression([res])
+    assert "budget_hold=" in suppression
