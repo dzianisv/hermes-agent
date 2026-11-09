@@ -12,6 +12,7 @@ interpreter before it publishes either command.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shlex
 import sys
@@ -21,6 +22,26 @@ if __name__ == "__main__":
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from pm.environments import store_root
+
+logger = logging.getLogger(__name__)
+
+
+def store_within_install_home(repo_root: Path, store: Path) -> bool:
+    """True when a durable launcher's interpreter store belongs to this checkout's home.
+
+    A source install at ``<home>/hermes-agent`` owns ``<home>/tools``. A stray
+    ``HERMES_RUNTIME_DIR`` (a test or probe temp dir) must never be baked into
+    ``<repo>/.hermes/bin``: the temp dir disappears and every CLI call then dies
+    in ``exec`` with "not found". Sealed payloads keep their own launchers, so
+    the guard applies to git checkouts only.
+    """
+    root = Path(repo_root).resolve()
+    if not (root / ".git").exists():
+        return True
+    try:
+        return Path(store).resolve().is_relative_to(root.parent.resolve())
+    except (OSError, ValueError):
+        return False
 
 
 def runtime_command(repo_root: Path, args=(), *, module: str = "hermes_cli.main",
@@ -365,7 +386,14 @@ def _publish_conveniences(root: Path, out_dir: Path, names, *, create: bool = Tr
 def stage_launcher(name: str, repo_root: Path, out_dir: Path) -> Path | None:
     """Publish one launcher bound to store Python, or refuse missing tools."""
     repo_root = Path(repo_root)
+    store = store_root(repo_root)
     store_python = resolve_store_python(repo_root)
+    if store_python is not None and not store_within_install_home(repo_root, store):
+        logger.warning(
+            "launchers: refusing to bind %s: store %s is outside the install home %s",
+            store_python, store, repo_root.resolve().parent,
+        )
+        return None
     if store_python is not None:
         path = mint_launcher(name, repo_root, out_dir, store_python, None)
         if path is not None and path.suffix == ".cmd":

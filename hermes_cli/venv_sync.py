@@ -87,6 +87,18 @@ def publish_launchers(project_root: Path, *, create: bool = True) -> None:
         log.warning("launchers: no managed interpreter under %s; %s not published",
                     root, root / ".hermes" / "bin")
         return
+    from hermes_cli._launchers import store_within_install_home
+    from pm.environments import store_root
+
+    store = store_root(root)
+    if not store_within_install_home(root, store):
+        # A transient HERMES_RUNTIME_DIR must never be baked into the durable
+        # launcher: the temp store disappears and every CLI call dies in exec.
+        log.warning(
+            "launchers: refusing to publish into %s: interpreter store %s is outside the install home %s",
+            root / ".hermes" / "bin", store, root.parent,
+        )
+        return
     written = ensure_install_launchers(root, root / ".hermes" / "bin")
     if len(written) != len(ENTRY_POINTS):
         from pm.package import InstallError
