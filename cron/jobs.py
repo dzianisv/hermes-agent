@@ -1611,6 +1611,17 @@ def _main_model_pin() -> Tuple[Optional[str], Optional[str]]:
     return (provider.lower() if provider else None), model
 
 
+def _cron_model_provider_pin() -> Optional[str]:
+    from hermes_cli.config_effective import load_user_config_effective
+
+    cfg_path = get_hermes_home() / "config.yaml"
+    cfg = {}
+    with contextlib.suppress(Exception):
+        cfg = load_user_config_effective(cfg_path) if cfg_path.exists() else {}
+    cron_cfg = cfg.get("cron") if isinstance(cfg.get("cron"), dict) else {}
+    return _normalize_job_optional_text(cron_cfg.get("model_provider"))
+
+
 def _normalize_job_optional_text(
     value: Any, *, strip_trailing_slash: bool = False
 ) -> Optional[str]:
@@ -1634,6 +1645,9 @@ def _guard_write_provider(
     existing = _normalize_job_optional_text(existing_provider)
     if existing:
         return existing
+    cron_provider = _cron_model_provider_pin()
+    if cron_provider:
+        return cron_provider
     main_provider, _main_model = _main_model_pin()
     return _normalize_job_optional_text(main_provider)
 

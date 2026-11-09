@@ -128,14 +128,22 @@ def _jobs_store(
     *,
     main_model: str = "main-model",
     main_provider: str = "openrouter",
+    cron_model_provider: str | None = None,
 ):
     """In-memory cron job store wired like the real create/update chokepoints."""
     import cron.jobs as jobs
 
-    (tmp_path / "config.yaml").write_text(
-        f"model:\n  default: {main_model}\n",
-        encoding="utf-8",
-    )
+    config_lines = [
+        "model:",
+        f"  default: {main_model}",
+        f"  provider: {main_provider}",
+    ]
+    if cron_model_provider:
+        config_lines.extend([
+            "cron:",
+            f"  model_provider: {cron_model_provider}",
+        ])
+    (tmp_path / "config.yaml").write_text("\n".join(config_lines) + "\n", encoding="utf-8")
     monkeypatch.setattr(jobs, "get_hermes_home", lambda: tmp_path, raising=True)
     state: dict[str, list[dict]] = {"jobs": []}
     monkeypatch.setattr(jobs, "load_jobs", lambda: list(state["jobs"]), raising=True)
@@ -377,6 +385,80 @@ def test_create_and_update_reject_unserved_pins_without_mutating_store(
         jobs.update_job(unpinned["id"], {"pinned": True})
     assert state["jobs"][1]["model"] is None
     assert state["jobs"][1]["provider"] is None
+
+
+def test_write_gate_uses_cron_model_provider_over_main_provider(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    # Regression: write-time validation must follow the same provider precedence as dispatch,
+    # so cron.model_provider beats the main agent's provider when a job has no stored provider.
+    jobs, state = _jobs_store(
+        monkeypatch,
+        tmp_path,
+        main_provider="openrouter",
+        cron_model_provider="nous",
+    )
+    seen_providers: list[str] = []
+
+    def _verdict(model: str, provider: str, **_kwargs):
+        seen_providers.append(provider)
+        accepted = model == "nous-only-model" and provider == "nous"
+        return {
+            "accepted": accepted,
+            "persist": accepted,
+            "recognized": True,
+            "message": f"model `{model}` is not served by {provider}",
+        }
+
+    monkeypatch.setattr("cron.model_guard.validate_requested_model", _verdict)
+    monkeypatch.setattr(
+        "cron.model_guard.fetch_api_models",
+        lambda *_args, **_kwargs: ["nous-only-model"],
+    )
+    _patch_openrouter_probe(monkeypatch)
+
+    created = jobs.create_job(prompt="good", schedule="every 1 hour", model="nous-only-model")
+
+    assert created["model"] == "nous-only-model"
+    assert state["jobs"][0]["model"] == "nous-only-model"
+    assert seen_providers == ["nous"]
+
+
+def test_write_gate_still_refuses_models_missing_from_cron_model_provider_catalog(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    jobs, state = _jobs_store(
+        monkeypatch,
+        tmp_path,
+        main_provider="openrouter",
+        cron_model_provider="nous",
+    )
+    seen_providers: list[str] = []
+
+    def _verdict(model: str, provider: str, **_kwargs):
+        seen_providers.append(provider)
+        accepted = model == "nous-only-model" and provider == "nous"
+        return {
+            "accepted": accepted,
+            "persist": accepted,
+            "recognized": True,
+            "message": f"model `{model}` is not served by {provider}",
+        }
+
+    monkeypatch.setattr("cron.model_guard.validate_requested_model", _verdict)
+    monkeypatch.setattr(
+        "cron.model_guard.fetch_api_models",
+        lambda *_args, **_kwargs: ["nous-only-model"],
+    )
+    _patch_openrouter_probe(monkeypatch)
+
+    with pytest.raises(ValueError, match="missing-from-nous"):
+        jobs.create_job(prompt="bad", schedule="every 1 hour", model="missing-from-nous")
+
+    assert state["jobs"] == []
+    assert seen_providers == ["nous"]
 
 
 def test_guard_skips_validation_when_live_catalog_warmup_fails(

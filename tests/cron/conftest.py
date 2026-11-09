@@ -52,17 +52,8 @@ def _default_cron_test_model(monkeypatch):
     yield
 
 
-@pytest.fixture(autouse=True)
-def _default_cron_test_model_guard(monkeypatch):
-    """Disable the provider-catalog model guard for the cron test area.
-
-    The guard (cron/model_guard.py) validates a resolved model against the provider's LIVE
-    catalog. Cron tests intentionally use fixture model names with a real HERMES_HOME, so
-    leaving the guard on would make them depend on the network and on today's catalog.
-    The guard's own tests (tests/cron/test_cron_model_guard.py) re-enable it explicitly.
-    """
-    monkeypatch.setenv("HERMES_CRON_MODEL_GUARD", "off")
-    yield
+# tests/conftest.py owns the suite-wide HERMES_CRON_MODEL_GUARD kill-switch so tests outside
+# tests/cron stay hermetic too. The guard's own module tests re-enable it explicitly.
 
 
 @pytest.fixture(autouse=True)

@@ -260,6 +260,9 @@ def _hermetic_environment(tmp_path, monkeypatch):
     # 2. Blank behavioral HERMES_* vars that could change test semantics.
     for name in _HERMES_BEHAVIORAL_VARS:
         monkeypatch.delenv(name, raising=False)
+    # Keep the cron model-catalog guard off by default across the WHOLE suite.
+    # Its own module tests opt back in explicitly and mock the catalog.
+    monkeypatch.setenv("HERMES_CRON_MODEL_GUARD", "off")
 
     # Honcho's fallback host/config resolution legitimately reads the user's
     # global ~/.honcho/config.json. Keep HOME stable (subprocess tests depend
