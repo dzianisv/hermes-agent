@@ -135,3 +135,21 @@ def test_live_holder_is_never_proposed_for_removal(repo: Path, quiet_probes: Non
     finally:
         holder.kill()
         holder.wait(timeout=10)
+
+
+def test_informational_git_exit_note_does_not_swallow_the_diagnosis(repo: Path, quiet_probes: None) -> None:
+    """A blocked merge exits 1, and "git exit 1 is often normal" used to suppress every hint.
+
+    Measured in a live session: the tool returned git's misleading output with no hint at all,
+    because the informational note short-circuits annotate_failure.
+    """
+    from tools.terminal_tool_result import _failure_hint
+
+    command, returncode, output = _blocked_merge(repo)
+    note = "Non-zero exit (often normal — e.g. 'git diff' returns 1 when files differ)"
+
+    hint = _failure_hint(command, returncode, output, note, cwd=str(repo))
+
+    assert hint is not None and "index.lock" in hint
+    # Other rc=1 git failures keep the informational note and gain nothing.
+    assert _failure_hint("git diff a b", 1, "diff --git a/a b/b", note, cwd=str(repo)) is None

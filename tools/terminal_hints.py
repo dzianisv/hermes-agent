@@ -88,14 +88,16 @@ def _stale_git_lock_hint(command: str, output: str, cwd: Optional[str]) -> Optio
     try:
         from hermes_cli import gitlock
 
-        named = _LOCK_FILE_IN_OUTPUT.search(output)
-        if named and os.path.isabs(named.group(1)):
-            described = gitlock.describe_lock_file(Path(named.group(1)))
-            if described:
-                return described
+        # Prefer the repo the command actually targeted: it scopes the process probe to writers of
+        # that repo, so an unrelated long-lived git daemon is not reported as a possible owner.
         repo_root = _git_repo_from_command(command) or cwd
         if repo_root:
             described = gitlock.describe_repo_lock(Path(repo_root))
+            if described:
+                return described
+        named = _LOCK_FILE_IN_OUTPUT.search(output)
+        if named and os.path.isabs(named.group(1)):
+            described = gitlock.describe_lock_file(Path(named.group(1)))
             if described:
                 return described
     except Exception:
@@ -206,6 +208,20 @@ def annotate_masked_success(command: str, output: str) -> Optional[str]:
     return next((note for rx, note in _MASKING_SHAPES if rx.search(cmd)), None)
 
 
+def annotate_stale_lock_failure(command: str, exit_code: int, output: str, *,
+                                cwd: Optional[str] = None) -> Optional[str]:
+    """Only the stale-lock rule, or None when the output is some other failure.
+
+    A separate entry point because an informational exit-code note ("git exit 1 is often normal")
+    suppresses ``annotate_failure`` — and a blocked merge exits 1 carrying git's own misleading
+    "fix conflicts" line, so without this path the model gets no correction at all.
+    """
+    if exit_code == 0:
+        return None
+    window = (output or "")[:_SCAN_CHARS]
+    return _stale_git_lock_hint(command or "", window, cwd) if window else None
+
+
 def annotate_failure(command: str, exit_code: int, output: str, *, cwd: Optional[str] = None) -> Optional[str]:
     """Return one short recovery hint for a failed command, or None (exit 0).
 
@@ -215,7 +231,7 @@ def annotate_failure(command: str, exit_code: int, output: str, *, cwd: Optional
     if exit_code == 0:
         return None
     window = (output or "")[:_SCAN_CHARS]
-    if window and (stale_lock := _stale_git_lock_hint(command or "", window, cwd)):
+    if stale_lock := annotate_stale_lock_failure(command, exit_code, window, cwd=cwd):
         return stale_lock
     for fn in _OUTPUT_HINTS if window else ():
         try:

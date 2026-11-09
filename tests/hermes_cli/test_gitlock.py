@@ -70,7 +70,7 @@ def no_git_running(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     import hermes_cli.gitlock as gitlock
 
-    monkeypatch.setattr(gitlock, "_git_proc_running", lambda: False)
+    monkeypatch.setattr(gitlock, "_git_proc_running", lambda *args: False)
 
 
 def test_clear_removes_stale_shallow_lock(repo: Path, no_git_running: None) -> None:
@@ -93,7 +93,7 @@ def test_clear_skips_sweep_while_git_running(repo: Path, monkeypatch: pytest.Mon
     """A running git process must block the sweep even for stale locks."""
     import hermes_cli.gitlock as gitlock
 
-    monkeypatch.setattr(gitlock, "_git_proc_running", lambda: True)
+    monkeypatch.setattr(gitlock, "_git_proc_running", lambda *args: True)
     _touch(repo / ".git" / "shallow.lock", STALE_LOCK_MIN_AGE_SECONDS + 60)
     removed = clear_stale_git_locks(repo)
     assert removed == []
@@ -183,4 +183,39 @@ def test_clear_refuses_a_lock_a_live_process_holds_open(repo: Path, no_git_runni
     finally:
         holder.kill()
         holder.wait(timeout=10)
+
+
+def test_git_proc_running_is_scoped_to_the_repo(repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A long-lived git daemon elsewhere must not read as a writer of this repo.
+
+    ``git credential-cache--daemon`` keeps the comm ``git`` for days; a machine-wide probe made the
+    sweep (and the lock report) skip every time it was running.
+    """
+    import hermes_cli.gitlock as gitlock
+
+    monkeypatch.setattr(gitlock, "_git_pids", lambda: (4242,))
+    monkeypatch.setattr(gitlock, "_proc_cwd", lambda _pid: "/somewhere/else")
+
+    assert gitlock._git_proc_running(repo) is False
+    # Unscoped callers keep the conservative machine-wide answer.
+    assert gitlock._git_proc_running() is True
+
+    monkeypatch.setattr(gitlock, "_proc_cwd", lambda _pid: str(repo))
+    assert gitlock._git_proc_running(repo) is True
+
+
+def test_sweep_clears_a_stale_lock_while_an_unrelated_git_process_runs(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The cleaner must still work when some other checkout's git (or a daemon) is alive."""
+    import hermes_cli.gitlock as gitlock
+
+    monkeypatch.setattr(gitlock, "_git_pids", lambda: (4242,))
+    monkeypatch.setattr(gitlock, "_proc_cwd", lambda _pid: "/somewhere/else")
+    _touch(repo / ".git" / "index.lock", STALE_LOCK_MIN_AGE_SECONDS + 60)
+
+    removed = clear_stale_git_locks(repo)
+
+    assert str(repo / ".git" / "index.lock") in removed
+    assert not (repo / ".git" / "index.lock").exists()
 
