@@ -37,6 +37,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from hermes_constants import get_hermes_home, hermes_home_key
 from cron.env_settings import cron_env_setting
+from cron.model_guard import guard_dispatch, guard_provider
 from hermes_cli._subprocess_compat import windows_hide_flags
 from hermes_cli.config import (
     load_config, load_config_readonly)
@@ -1628,6 +1629,8 @@ def _load_cron_job_config(job: dict, job_id: str, job_name: str) -> _CronJobConf
             "default with `hermes model <name>`."
         )
 
+    guard_dispatch(model, guard_provider(job, _cfg), job_id=job_id, job_name=job_name, cfg=_cfg)
+
     with contextlib.suppress(Exception):
         from hermes_constants import apply_ipv4_preference
         _net_cfg = _cfg.get("network", {})
@@ -2526,6 +2529,15 @@ def run_job(
         setup = _resolve_cron_agent_setup(job, job_id, job_name, jc)
         if setup.blocked is not None:
             return setup.blocked
+        if setup.model != jc.model:
+            final_provider = str((setup.runtime or {}).get("provider") or "").strip()
+            guard_dispatch(
+                setup.model,
+                final_provider or guard_provider(job, _cfg),
+                job_id=job_id,
+                job_name=job_name,
+                cfg=_cfg,
+            )
         model = setup.model
 
         # Open state.db only after every early-return gate has passed.
