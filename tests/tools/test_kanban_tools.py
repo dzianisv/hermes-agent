@@ -131,7 +131,10 @@ def test_complete_happy_path(worker_env):
         run = kb.latest_run(conn, worker_env)
         assert run.outcome == "completed"
         assert run.summary == "got the thing done"
-        assert run.metadata == {"files": 2}
+        assert run.metadata["files"] == 2
+        # Every closed run carries metadata.exit_reason (kanban_db._end_run), so the
+        # assertion is on the caller's keys plus that stamp, not on exact equality.
+        assert run.metadata["exit_reason"]["reason"] == "completed"
     finally:
         conn.close()
 

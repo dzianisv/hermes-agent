@@ -212,7 +212,7 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "schedule", "unblock", "promote", "reopen-done", "archive", "dispatch", "daemon", "repair",
     "heartbeat", "notify-subscribe", "notify-unsubscribe", "specify", "decompose",
     "request-review", "request-changes", "reopen-review",
-    "gc", "step", "stage",
+    "gc", "step", "stage", "respec-reset",
 })
 
 _DELEGATED_CHILD_DENIED_BOARD_ACTIONS: frozenset[str] = frozenset({
@@ -1190,10 +1190,14 @@ def _cmd_block(args: argparse.Namespace) -> int:
                 verdict = ("needs a human decision" if (landed.block_kind if landed else kind) == "needs_input"
                            else "orchestration attention needed")
                 return f"{tid} → triage (unblock loop detected — {verdict}){suffix}"
+            target = getattr(args, "next_assignee", None)
+            if target and landed is not None and landed.block_next_assignee:
+                return f"Blocked {tid} (handoff to {target} pending on the next dispatch){suffix}"
             return f"Blocked {tid}{suffix}"
 
         op = _commented(conn, reason, author, "BLOCKED", lambda tid: kb.block_task(
-            conn, tid, reason=reason, kind=kind, expected_run_id=_worker_run_id_for(tid)))
+            conn, tid, reason=reason, kind=kind, expected_run_id=_worker_run_id_for(tid),
+            next_assignee=getattr(args, "next_assignee", None)))
         return _bulk_apply(ids, op, ok_msg, lambda tid: f"cannot block {tid}")
 
 
@@ -1242,6 +1246,37 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
         op = _commented(conn, reason, author, "UNBLOCK", lambda tid: kb.unblock_task(conn, tid))
         return _bulk_apply(ids, op, lambda tid: f"Unblocked {tid}{suffix}",
                            lambda tid: f"cannot unblock {tid} (not blocked/scheduled?)")
+
+
+def _cmd_respec_reset(args: argparse.Namespace) -> int:
+    """Supported operator escape from a mis-targeted re-spec.
+
+    ``no_progress_guard`` re-specs a card after N runs with no progress. When those
+    runs failed on the HOST rather than on the card, the streak is still honest
+    bookkeeping but points at the wrong target: appending a ``no_progress_respec``
+    event resets it exactly as a real re-spec does. Before this command the only
+    escape was a hand-written board DB write.
+    """
+    from hermes_cli import kanban_wait_on as kwo
+
+    ids, rc = _require_ids(args)
+    if rc:
+        return rc
+    reason = getattr(args, "reason", None)
+    author = _profile_author()
+    as_json = bool(getattr(args, "json", False))
+    results: list[tuple[str, bool]] = []
+    with kbc.connect_closing() as conn:
+        for tid in ids:
+            results.append((tid, kwo.reset_no_progress(conn, tid, reason=reason, author=author)))
+    for tid, ok in results:
+        if as_json:
+            print(json.dumps({"task_id": tid, "reset": bool(ok)}))
+        elif ok:
+            print(f"no-progress streak reset for {tid}")
+        else:
+            print(f"cannot reset the no-progress streak of {tid} (unknown id)", file=sys.stderr)
+    return 0 if all(ok for _tid, ok in results) else 1
 
 
 def _cmd_request_review(args: argparse.Namespace) -> int:
@@ -1566,7 +1601,7 @@ _HANDLERS = {
     "attachments": _cmd_attachments, "attach-rm": _cmd_attach_rm,
     "complete": _cmd_complete, "edit": _cmd_edit, "step": _cmd_step, "stage": _cmd_stage, "stages": _cmd_stages, "set-workspace": _cmd_set_workspace,
     "block": _cmd_block,
-    "schedule": _cmd_schedule, "unblock": _cmd_unblock,
+    "schedule": _cmd_schedule, "unblock": _cmd_unblock, "respec-reset": _cmd_respec_reset,
     "request-review": _cmd_request_review, "request-changes": _cmd_request_changes,
     "reopen-review": _cmd_reopen_review, "reopen-done": _cmd_reopen_done, "promote": _cmd_promote,
     "archive": _cmd_archive, "tail": _cmd_tail, "dispatch": _cmd_dispatch,

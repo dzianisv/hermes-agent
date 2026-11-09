@@ -397,6 +397,10 @@ _SPECS = [
                   "blocked for a human; 'transient' marks a maybe-flaky failure. "
                   "Repeated same-kind re-blocks after unblock route the task to "
                   "triage to break unblock loops. Omit for a generic block."),
+        _arg("--next-assignee", dest="next_assignee", default=None,
+             help="Block for handoff: the DISPATCHER reassigns the card to this profile and "
+                  "resumes it on its next pass. Use for a re-spec handoff to another owner — "
+                  "a worker (and any shell it spawns) may not reassign a card itself."),
     ], help="Mark one or more tasks blocked"),
     _cmd("schedule", [
         _TASK_ID,
@@ -412,6 +416,16 @@ _SPECS = [
         _reason("Optional reason/note — recorded as a comment before unblocking. Quote multi-word reasons."),
         _TASK_IDS,
     ], help="Return blocked/scheduled tasks to ready, or todo while parents remain open"),
+    _cmd("respec-reset", [
+        _TASK_IDS,
+        _reason("Why the re-spec was mis-targeted (recorded on the reset event)"),
+        _json_flag(),
+    ], help="Reset the no-progress streak after a mis-targeted re-spec (operator escape)",
+       description=(
+           "Append a no_progress_respec event so the no-progress guard stops counting the "
+           "runs before it. Use when the guard re-spec'd a healthy card because its trailing "
+           "runs failed on the host (missing interpreter, broken dependency environment, "
+           "unreadable workspace) instead of on the card.")),
     _cmd("request-review", [
         _TASK_ID,
         _arg("--summary", help="What was implemented and how it was verified — shown to the reviewer."),

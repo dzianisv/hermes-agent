@@ -142,6 +142,9 @@ def test_default_fingerprints_and_passing():
 def _blocked_run(conn, tid, head):
     claimed = kb.claim_task(conn, tid)
     kwo.record_run_head(conn, claimed.current_run_id, head)
+    # A real dispatched run stamps its session id once the agent builds; the
+    # no-progress gate now requires that evidence before a run can count.
+    kb.merge_run_metadata(conn, tid, claimed.current_run_id, {"worker_session_id": "s-test"})
     assert kb.schedule_task(conn, tid, reason="CI still red",
                             expected_run_id=claimed.current_run_id)
     kb.unblock_task(conn, tid)
@@ -199,6 +202,9 @@ def test_dispatcher_skips_parked_and_respecs(conn, monkeypatch):
     other = kb.create_task(conn, title="loop", assignee="software-engineer")
     for _ in range(2):
         c = kb.claim_task(conn, other)
+        # A real dispatched run stamps its session id once the agent builds; the
+        # no-progress gate requires that evidence before a run can count.
+        kb.merge_run_metadata(conn, other, c.current_run_id, {"worker_session_id": "s-test"})
         kb.schedule_task(conn, other, reason="still red", expected_run_id=c.current_run_id)
         kb.unblock_task(conn, other)
     res = kb.dispatch_once(conn, spawn_fn=lambda t, ws, b=None: spawned.append((t.id, t.assignee)) or None)

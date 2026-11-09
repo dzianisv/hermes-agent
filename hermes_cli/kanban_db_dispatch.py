@@ -334,6 +334,9 @@ class DispatchResult:
     spawn_faults: list[str] = field(default_factory=list)
     """Task ids whose worker never started because the host could not exec it
     (missing interpreter). Requeued without spending the retry budget."""
+    handoffs_applied: list[tuple[str, str, str]] = field(default_factory=list)
+    """``(task_id, from_assignee, to_assignee)`` cards whose ``block_next_assignee``
+    handoff this tick applied (``kanban_block(next_assignee=…),``)."""
     reconciled_orphans: list[str] = field(default_factory=list)
     """``running`` cards requeued by :func:`reconcile_orphaned_running` (broken
     claim bookkeeping, dead/gone worker)."""
@@ -3854,6 +3857,15 @@ def _dispatch_once_locked(
     the PID so later ticks catch crashes before the TTL. Cap semantics:
     :func:`_tick_spawn_budget`."""
     result = DispatchResult()
+    # Block-for-handoff FIRST: a worker (and every shell it spawns) cannot mutate the
+    # board, so the reassign it asked for is applied here, before the lanes are read.
+    # Not on dry_run: the transition is real and a dry pass must write nothing.
+    if not dry_run:
+        try:
+            result.handoffs_applied.extend(
+                _kb.apply_block_handoffs(conn, profile_exists=_profile_exists_fn()))
+        except Exception as exc:  # never break dispatch
+            _kb._log.warning("kanban dispatcher: block-handoff apply failed: %s", exc)
     _run_reclaim_phase(
         conn, result, stale_timeout_seconds=stale_timeout_seconds,
         failure_limit=failure_limit, reconcile_orphans=reconcile_orphans, board=board,

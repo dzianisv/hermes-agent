@@ -16,7 +16,10 @@ the fingerprint differs from the baseline.
 
 R2 — a run that ends with no new commit, no status change and no new passing
 check is "no progress". Two such runs in a row reassign the card to the
-architect for re-spec instead of claiming it a third time.
+architect for re-spec instead of claiming it a third time. A run whose failure is
+environmental (the agent never started, or the host could not place/feed it) is
+NEUTRAL: it neither counts nor resets the streak, and repeated identical
+environmental failures are recorded once as a host incident instead of a re-spec.
 
 R3 — ``kanban.review_round_limit`` / ``active_seconds_limit`` (the run caps)
 stay as the backstop for loops these signals cannot see.
@@ -47,6 +50,34 @@ DEFAULT_NO_PROGRESS_LIMIT = 2
 
 # Outcomes that are themselves a status change on the card (progress).
 PROGRESS_OUTCOMES = frozenset({"completed", "review_requested", "approved", "changes_requested"})
+
+# Evidence that a run failed on the HOST, not on the card: the launcher could not
+# exec the pinned interpreter, the install has no committed dependency environment,
+# the card's workspace is not readable by the worker, or the harness itself could
+# not be imported. None of these say anything about the card, so they must neither
+# count as "the implementer made no progress" nor be answered with a re-spec (live:
+# 6 environmental crashes re-spec'd a healthy card at 12:10 on 2026-11-09).
+#
+# The markers are the launcher's / harness's own lines, never a bare kernel phrase
+# and never a third-party import. ``kanban_worker_exit.LAUNCHER_EXEC_FAILURE_MARKER``
+# records the regression that taught this: a broad match absorbed a REAL worker
+# crash (a worker that ran and then hit its own ``FileNotFoundError``) and retried
+# it forever. A hand-maintained list is only safe while it stays this narrow; the
+# generation-aware half of the rule is :func:`run_started_agent`, which needs no
+# list at all and covers a new host failure mode.
+_ENV_FAULT_MARKERS = (
+    "Failed to find executable",                # launcher: pinned interpreter absent
+    "executable not found",
+    "no dependency environment is committed",   # needs ``hermes pm repair``
+    "No module named hermes_cli",               # cwd-shadowed harness import
+    "No module named 'hermes_cli",
+)
+# The claim/spawn path prefixes every workspace-resolution failure with ``workspace:``.
+_ENV_FAULT_PREFIXES = ("workspace:",)
+_ENV_FAULT_RE = re.compile(
+    r"\[Errno 13\] Permission denied|not inside a git repo|not a git (?:repository|repo|work ?tree)",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -228,6 +259,161 @@ def record_run_head(conn: sqlite3.Connection, run_id: Optional[int], head: Optio
         conn.execute("UPDATE task_runs SET metadata = ? WHERE id = ?", (json.dumps(meta), run_id))
 
 
+def _row_get(row: sqlite3.Row, key: str, default=None):
+    """Tolerant column read: the streak query selects fewer columns than the
+    incident query, and a missing column must not break dispatch."""
+    try:
+        return row[key]
+    except (IndexError, KeyError):
+        return default
+
+
+def _run_text(row: sqlite3.Row) -> str:
+    """Everything a closed run recorded about WHY it failed, as one string: the
+    reaper's error plus the captured worker output and exit-reason tail."""
+    meta = _kb._json_dict(_row_get(row, "metadata"))
+    parts = [_row_get(row, "error") or "", str(meta.get("worker_output") or "")]
+    exit_reason = meta.get("exit_reason")
+    if isinstance(exit_reason, dict):
+        parts.append(str(exit_reason.get("stderr_tail") or ""))
+    return "\n".join(parts)
+
+
+def run_is_environmental(row: sqlite3.Row) -> bool:
+    """True when this run failed on the HOST before the card was worked.
+
+    A run that merely ended without progress — a normal ``blocked`` / ``crashed``
+    run with real agent output — stays the card's to fix and returns False.
+    """
+    meta = _kb._json_dict(row["metadata"])
+    if (row["outcome"] or "") == "spawn_failed":
+        return True
+    if meta.get("spawn_fault") or meta.get("env_fault"):
+        return True
+    try:
+        from hermes_cli.kanban_worker_exit import is_spawn_fault
+
+        if is_spawn_fault(meta.get("exit_reason"), _run_text(row)):
+            return True
+    except Exception:  # pragma: no cover - defensive
+        pass
+    for line in _run_text(row).splitlines():
+        line = line.strip()
+        if not line or len(line) > 400:
+            continue
+        if line.startswith(_ENV_FAULT_PREFIXES):
+            return True
+        if any(marker in line for marker in _ENV_FAULT_MARKERS):
+            return True
+        if _ENV_FAULT_RE.search(line):
+            return True
+    return False
+
+
+def _environmental_signature(row: sqlite3.Row) -> str:
+    """The matching line, whitespace-collapsed: two host faults with the same
+    signature are ONE incident, not two independent card failures."""
+    for line in _run_text(row).splitlines():
+        line = line.strip()
+        if not line or len(line) > 400:
+            continue
+        if (line.startswith(_ENV_FAULT_PREFIXES)
+                or any(marker in line for marker in _ENV_FAULT_MARKERS)
+                or _ENV_FAULT_RE.search(line)):
+            return " ".join(line.split())[:200]
+    return "environmental"
+
+
+def run_started_agent(
+    conn: sqlite3.Connection, run_id: int, meta: Optional[dict] = None,
+) -> bool:
+    """Did the worker actually run? The session id is stamped only AFTER the agent
+    builds (``kanban_worker_session``) and a heartbeat / progress note needs a live
+    worker loop, so a run with neither never reached the card — the host's problem,
+    not the card's. This is the generation-aware half of the rule: it needs no
+    hand-maintained fault list, so a NEW host failure mode is still neutral."""
+    meta = meta if isinstance(meta, dict) else _kb._json_dict(meta)
+    if str(meta.get("worker_session_id") or "").strip():
+        return True
+    if meta.get("progress_note") or meta.get("progress_at"):
+        return True
+    row = conn.execute(
+        "SELECT 1 FROM task_events WHERE run_id = ? AND kind = 'heartbeat' LIMIT 1",
+        (int(run_id),)).fetchone()
+    return row is not None
+
+
+def environmental_streak(
+    conn: sqlite3.Connection, task_id: str,
+) -> tuple[int, str, list[int]]:
+    """Trailing run of environmental failures sharing ONE signature, with that
+    signature and the run ids. Counted since the last re-spec / recorded incident
+    so an already-handled incident is never announced twice."""
+    since = conn.execute(
+        "SELECT COALESCE(MAX(created_at), 0) FROM task_events "
+        "WHERE task_id = ? AND kind IN ('no_progress_respec', 'host_incident')",
+        (task_id,)).fetchone()[0]
+    rows = conn.execute(
+        "SELECT id, outcome, error, metadata, started_at FROM task_runs "
+        "WHERE task_id = ? AND ended_at IS NOT NULL AND started_at > ? "
+        "ORDER BY started_at DESC, id DESC LIMIT 20",
+        (task_id, since)).fetchall()
+    count, signature, ids = 0, "", []
+    for row in rows:
+        if not run_is_environmental(row):
+            break
+        sig = _environmental_signature(row)
+        if count and sig != signature:
+            break
+        signature = signature or sig
+        count += 1
+        ids.append(int(row["id"]))
+    return count, signature, ids
+
+
+def record_host_incident(
+    conn: sqlite3.Connection, task_id: str, limit: int,
+) -> Optional[dict]:
+    """Repeated identical environmental failures are a HOST incident, not a card
+    defect: record ONE ``host_incident`` event plus one operator comment naming the
+    signature, and withhold the re-spec. Deduped per signature because the
+    dispatcher calls this on every tick while the host stays broken."""
+    count, signature, ids = environmental_streak(conn, task_id)
+    if not signature or count < max(1, int(limit)):
+        return None
+    previous = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'host_incident' "
+        "ORDER BY id DESC LIMIT 1", (task_id,)).fetchone()
+    if _kb._json_dict(previous["payload"] if previous else None).get("signature") == signature:
+        return None
+    payload = {"signature": signature, "count": count, "runs": ids}
+    with _kb.write_txn(conn):
+        _kb._append_event(conn, task_id, "host_incident", payload)
+    _kb.add_comment(
+        conn, task_id, author="kanban-dispatcher",
+        body=(f"BLOCKER:HARNESS infra — {count} consecutive runs failed on the HOST before "
+              f"the agent started: {signature}. Not a card defect: no re-spec, no retry "
+              f"budget spent. Fix the host (interpreter / dependency environment / workspace "
+              f"permissions), then this card can be claimed again."))
+    return payload
+
+
+def reset_no_progress(
+    conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None,
+    author: str = "operator",
+) -> bool:
+    """Operator escape from a mis-targeted re-spec (``hermes kanban respec-reset``):
+    a ``no_progress_respec`` event at/after every run resets the streak to 0 exactly
+    as a genuine re-spec does — supported, so nobody hand-writes the board DB again."""
+    if _kb.get_task(conn, task_id) is None:
+        return False
+    with _kb.write_txn(conn):
+        _kb._append_event(conn, task_id, "no_progress_respec",
+                          {"streak": 0, "reset": True, "author": author,
+                           "reason": reason or "operator reset"})
+    return True
+
+
 def no_progress_streak(conn: sqlite3.Connection, task_id: str, current_head: Optional[str]) -> int:
     """Count consecutive trailing ended runs (since the last re-spec) that made
     no progress: outcome is not a forward status change (block/park/crash do
@@ -237,7 +423,7 @@ def no_progress_streak(conn: sqlite3.Connection, task_id: str, current_head: Opt
         "SELECT COALESCE(MAX(created_at), 0) FROM task_events WHERE task_id = ? AND kind = 'no_progress_respec'",
         (task_id,)).fetchone()[0]
     runs = conn.execute(
-        "SELECT id, outcome, metadata, started_at, ended_at FROM task_runs "
+        "SELECT id, outcome, error, metadata, started_at, ended_at FROM task_runs "
         "WHERE task_id = ? AND ended_at IS NOT NULL AND started_at > ? ORDER BY started_at DESC, id DESC",
         (task_id, last_respec)).fetchall()
     passing_at = [int(r["created_at"]) for r in conn.execute(
@@ -246,7 +432,8 @@ def no_progress_streak(conn: sqlite3.Connection, task_id: str, current_head: Opt
     streak = 0
     head_after = current_head
     for r in runs:
-        head_start = _kb._json_dict(r["metadata"]).get("head_start")
+        meta = _kb._json_dict(r["metadata"])
+        head_start = meta.get("head_start")
         progressed = (
             (r["outcome"] or "") in PROGRESS_OUTCOMES
             or (head_start and head_after and head_start != head_after)
@@ -256,6 +443,15 @@ def no_progress_streak(conn: sqlite3.Connection, task_id: str, current_head: Opt
         )
         if progressed:
             break
+        # An infrastructure crash says nothing about the card: it must not count
+        # toward the streak (that is the mis-targeted re-spec this guards against)
+        # and must not reset it either (a genuine no-progress run before it stays
+        # counted). Same reasoning as ``rate_limited`` in the protocol-violation
+        # streak: neutral evidence is skipped, never scored. A progress ending is
+        # judged above, before this gate — a run cannot lose its progress by
+        # having no session stamp.
+        if run_is_environmental(r) or not run_started_agent(conn, int(r["id"]), meta):
+            continue
         streak += 1
         if head_start:
             head_after = head_start
@@ -281,6 +477,10 @@ def no_progress_guard(
         return None
     architect = architect or respec_assignee()
     if not architect or assignee == architect:
+        return None
+    if record_host_incident(conn, task_id, limit) is not None:
+        # The trailing runs never reached the card; a re-spec would be aimed at the
+        # wrong target — exactly the incident this fixes.
         return None
     streak = no_progress_streak(conn, task_id, head_fn(workspace))
     if streak < limit:

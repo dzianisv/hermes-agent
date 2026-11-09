@@ -201,6 +201,12 @@ KANBAN_BLOCK_SCHEMA = _schema(
             "'pr:<owner/repo>#<n>[@<sha>]' or 'card:<task_id>'. Use this for red/pending CI "
             "instead of blocking or completing; kind is ignored."
         )),
+        "next_assignee": _prop("string", (
+            "Hand the card to another profile instead of parking it on a human: the "
+            "DISPATCHER reassigns and resumes it on its next pass. Use this for a "
+            "re-spec/handoff to another owner — a worker, and any shell it spawns, may "
+            "not reassign a card itself."
+        )),
     },
     ["reason"],
 )

@@ -1019,6 +1019,7 @@ class Task:
     # VALID_BLOCK_KINDS or None (legacy); kept across unblock so a same-kind re-block reads as a loop.
     block_kind: Optional[str] = None
     block_recurrences: int = 0               # unblock-loop counter, see BLOCK_RECURRENCE_LIMIT
+    block_next_assignee: Optional[str] = None  # dispatcher-applied handoff target
     completion_contract: Optional[str] = None
     # Unix time a ``scheduled`` card auto-wakes (promote_due_scheduled); NULL = manual unblock.
     scheduled_wake_at: Optional[int] = None
@@ -1062,6 +1063,7 @@ _TASK_OPTIONAL_COLUMNS = (
 # Text columns where "" is stored/read as "not set".
 _TASK_EMPTY_IS_NULL_COLUMNS = (
     "model_override", "provider_override", "reasoning_effort", "goal_max_turns", "block_kind",
+    "block_next_assignee",
 )
 
 
@@ -1265,6 +1267,11 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
     block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- ``kanban_block(next_assignee=…),``: a worker asking the DISPATCHER to hand the
+    -- card on instead of mutating the board itself (a worker's shell subprocess is
+    -- fenced). ``apply_block_handoffs`` assigns the target and resumes the card;
+    -- NULL = no pending handoff.
+    block_next_assignee  TEXT,
     -- Unix time a ``scheduled`` task auto-wakes (promote_due_scheduled);
     -- NULL = waits for a manual unblock. Cleared when it leaves ``scheduled``.
     scheduled_wake_at    INTEGER,
@@ -3386,7 +3393,8 @@ def complete_task(
                        claim_expires= NULL,
                        worker_pid   = NULL,
                        block_kind   = NULL,
-                       block_recurrences = 0
+                       block_recurrences = 0,
+                       block_next_assignee = NULL
                  WHERE id = ?
                    AND status IN ('running', 'ready', 'blocked', 'review')
                 """
@@ -3842,6 +3850,7 @@ def set_completion_contract(
 def block_task(
     conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None,
     kind: Optional[str] = None, expected_run_id: Optional[int] = None,
+    next_assignee: Optional[str] = None,
 ) -> bool:
     """``running``/``ready`` -> ``blocked`` (or ``todo`` / ``triage``, see
     :func:`_route_block`). ``kind='dependency'`` with no incomplete parent is
@@ -3856,6 +3865,11 @@ def block_task(
     audit event is appended, while status, failure evidence and the terminal
     runs stay exactly as the breaker left them. A typed block, a card with a
     live run, or a kind-less call on a blocked card are still refused.
+
+    *next_assignee* is the first-class "block for handoff": the target is stored on
+    the row and applied by the DISPATCHER (:func:`apply_block_handoffs`) on its next
+    pass, because a worker — and every shell subprocess it spawns — is fenced from
+    mutating the board. It is ignored on the already-blocked classify-in-place path.
     """
     if kind is not None and kind not in VALID_BLOCK_KINDS:
         raise ValueError(f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None")
@@ -3904,6 +3918,10 @@ def block_task(
         if rekind_reason:
             payload["requested_kind"] = requested_kind
             payload["rekind_reason"] = rekind_reason
+        next_assignee = (next_assignee or "").strip() or None
+        if next_assignee:
+            set_sql = f"{set_sql},\n                       block_next_assignee = ?"
+            params = (*params, next_assignee)
         sql = f"""
                 UPDATE tasks
                    SET status        = '{new_status}',
@@ -3960,6 +3978,67 @@ def _route_block(
         payload["limit"] = BLOCK_RECURRENCE_LIMIT
         return "triage", "block_loop_detected", set_sql, (kind, recurrences), payload
     return "blocked", "blocked", set_sql, (kind, recurrences), payload
+
+
+def apply_block_handoffs(
+    conn: sqlite3.Connection, *, profile_exists=None,
+) -> list[tuple[str, str, str]]:
+    """Apply ``kanban_block(next_assignee=…)``: reassign the card and resume it.
+
+    The worker that asked for the handoff cannot do this itself — it and every shell
+    it spawns are fenced from board mutation — so the DISPATCHER applies it at the
+    top of each pass. The normal unblock transition is reused, so parent gating and
+    the parked-from phase (``review`` survives a park) still apply.
+    Returns ``(task_id, from_assignee, to_assignee)`` per card handed off.
+    """
+    now = int(time.time())
+    applied: list[tuple[str, str, str]] = []
+    rows = conn.execute(
+        "SELECT id, assignee, block_next_assignee FROM tasks "
+        "WHERE status = 'blocked' AND COALESCE(block_next_assignee, '') <> ''"
+    ).fetchall()
+    for row in rows:
+        tid = row["id"]
+        target = str(row["block_next_assignee"]).strip()
+        current = row["assignee"] or ""
+        if not target:
+            continue
+        if profile_exists is not None and not profile_exists(target):
+            _note_handoff_target_unknown(conn, tid, target)
+            continue
+        with write_txn(conn):
+            landed = _resume_parked_task_locked(
+                conn, tid, statuses=("blocked",), event_kind="handoff_applied",
+                now=now, note="block-for-handoff: dispatcher applied next_assignee",
+                extra_payload={"from": current, "to": target},
+            )
+            if landed is None:
+                continue
+            conn.execute(
+                "UPDATE tasks SET assignee = ?, block_next_assignee = NULL WHERE id = ?",
+                (target, tid),
+            )
+        applied.append((tid, current, target))
+    return applied
+
+
+def _note_handoff_target_unknown(
+    conn: sqlite3.Connection, task_id: str, target: str,
+) -> None:
+    """A handoff to a profile that does not exist must not silently park the card
+    (that dead-end is what this replaces): name it once, keep the target so the
+    operator can correct it."""
+    previous = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'handoff_rejected' "
+        "ORDER BY id DESC LIMIT 1", (task_id,)).fetchone()
+    if _json_dict(previous["payload"] if previous else None).get("to") == target:
+        return
+    with write_txn(conn):
+        _append_event(conn, task_id, "handoff_rejected",
+                      {"to": target, "reason": "unknown-profile"})
+    add_comment(conn, task_id, author="kanban-dispatcher",
+                body=(f"BLOCKER:HARNESS handoff — next_assignee {target!r} is not a known "
+                      f"profile; the card stays blocked until the target is corrected."))
 
 
 def redact_review_value(value: Any) -> Any:

@@ -848,6 +848,8 @@ _LATER_TASK_COLUMNS = (
     ("wait_on", "wait_on TEXT"),
     ("wait_on_fingerprint", "wait_on_fingerprint TEXT"),
     ("wait_on_checked_at", "wait_on_checked_at INTEGER"),
+    # First-class block-for-handoff target (kanban_block(next_assignee=…)).
+    ("block_next_assignee", "block_next_assignee TEXT"),
 )
 
 _NOTIFY_SUB_COLUMNS = (
