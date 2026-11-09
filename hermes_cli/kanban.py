@@ -1155,6 +1155,9 @@ def _cmd_set_workspace(args: argparse.Namespace) -> int:
         print(f"{args.task_id}: workspace "
               f"{old['workspace_kind']}:{old['workspace_path'] or '-'} -> "
               f"{new['workspace_kind']}:{new['workspace_path'] or '-'}")
+        cleared = applied.get("cleared")
+        if cleared:
+            print(f"cleared stale: {', '.join(cleared.keys())}")
     return 0
 
 

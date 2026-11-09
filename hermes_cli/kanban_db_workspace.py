@@ -682,16 +682,19 @@ def set_task_workspace(
       explicit path (pairing ``scratch`` with a real source tree is the #28818
       completion-deletes-your-data foot-gun).
     * ``branch_name`` is only meaningful for ``worktree`` (create-time rule),
-      so moving a card that carries one to another kind is refused rather than
-      silently leaving a dangling branch.
+      so moving a card that carries one to another kind clears the branch_name
+      rather than silently leaving a dangling branch.
     * An ACTIVE claim is refused: a running task (or one holding an unexpired
       ``claim_lock``) has a live worker whose cwd is the current workspace.
       Reclaim/finish it first.
+    * Stale ``last_failure_error`` is always cleared — a corrected workspace is
+      new evidence.
 
     Every accepted write appends a ``workspace_updated`` event carrying the old
-    and new values plus ``actor`` — the correction is auditable on the card.
+    and new values plus ``actor`` and any cleared fields — the correction is
+    auditable on the card.
 
-    Returns the applied ``{"task_id", "actor", "old", "new"}`` record.
+    Returns the applied ``{"task_id", "actor", "old", "new", "cleared"}`` record.
     Raises :class:`WorkspaceUpdateRefused` for every rejection.
     """
     kind = (workspace_kind or "").strip()
@@ -731,7 +734,7 @@ def set_task_workspace(
     with _kb.write_txn(conn):
         row = conn.execute(
             "SELECT status, workspace_kind, workspace_path, branch_name, "
-            "claim_lock, claim_expires FROM tasks WHERE id = ?",
+            "claim_lock, claim_expires, last_failure_error FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if not row:
@@ -746,25 +749,39 @@ def set_task_workspace(
                 f"task {task_id} holds an active claim ({row['claim_lock']}); "
                 "reclaim it before changing its workspace"
             )
+        # Collect cleared fields for the audit event
+        cleared: dict[str, Any] = {}
+        if row["last_failure_error"]:
+            cleared["last_failure_error"] = row["last_failure_error"]
+        # branch_name is only valid for worktree; clear when moving away
         if kind != "worktree" and row["branch_name"]:
-            raise WorkspaceUpdateRefused(
-                f"task {task_id} carries branch_name {row['branch_name']!r}, "
-                "which is only valid with workspace_kind='worktree'"
-            )
+            cleared["branch_name"] = row["branch_name"]
+
         old = {
             "workspace_kind": row["workspace_kind"],
             "workspace_path": row["workspace_path"],
         }
         new = {"workspace_kind": kind, "workspace_path": resolved_path}
-        conn.execute(
-            "UPDATE tasks SET workspace_kind = ?, workspace_path = ? WHERE id = ?",
-            (kind, resolved_path, task_id),
-        )
+
+        # Build update: clear last_failure_error always, and branch_name when not worktree
+        sql = "UPDATE tasks SET workspace_kind = ?, workspace_path = ?, last_failure_error = NULL"
+        params: list[Any] = [kind, resolved_path]
+        if kind != "worktree":
+            sql += ", branch_name = NULL"
+        sql += " WHERE id = ?"
+        params.append(task_id)
+        conn.execute(sql, params)
+
+        event_payload = {"actor": actor, "old": old, "new": new}
+        if cleared:
+            event_payload["cleared"] = cleared
         _kb._append_event(
-            conn, task_id, "workspace_updated",
-            {"actor": actor, "old": old, "new": new},
+            conn, task_id, "workspace_updated", event_payload,
         )
-    return {"task_id": task_id, "actor": actor, "old": old, "new": new}
+    result = {"task_id": task_id, "actor": actor, "old": old, "new": new}
+    if cleared:
+        result["cleared"] = cleared
+    return result
 
 
 def set_branch_name(conn: sqlite3.Connection, task_id: str, branch_name: str) -> None:

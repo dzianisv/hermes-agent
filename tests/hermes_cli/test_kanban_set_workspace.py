@@ -5,13 +5,15 @@ is the ONLY supported way to fix a card whose recorded workspace is wrong (the
 dispatcher's own ``set_workspace_path`` is an internal claim-time write with no
 kind, no audit event and no claim guard). The contract under test:
 
-* it rewrites ONLY ``workspace_kind`` + ``workspace_path``;
+* it rewrites ``workspace_kind`` + ``workspace_path``;
+* it clears ``last_failure_error`` (new workspace is new evidence);
+* it clears ``branch_name`` when moving away from worktree kind;
 * it moves NO files and starts NO worker;
 * identity, status, assignee, claim, links/dependencies and prior events are
   preserved;
 * every invalid request is refused, and a refusal writes nothing;
-* the change is auditable (``workspace_updated`` event with old/new + actor)
-  and reads back through the normal API.
+* the change is auditable (``workspace_updated`` event with old/new + actor
+  and any cleared fields) and reads back through the normal API.
 
 Every test runs against an isolated board in a temp ``HERMES_HOME``.
 """
@@ -185,7 +187,8 @@ def test_active_claim_is_refused(kanban_home, tmp_path):
         assert kb.get_task(conn, t).claim_lock == "worker-1"
 
 
-def test_branch_bearing_worktree_cannot_move_to_another_kind(kanban_home, tmp_path):
+def test_worktree_can_move_to_another_kind_clears_branch_name(kanban_home, tmp_path):
+    """A worktree card carrying branch_name CAN move to scratch/dir and branch_name is cleared."""
     ws = tmp_path / "ws-branch"
     ws.mkdir()
     with kb.connect() as conn:
@@ -195,14 +198,24 @@ def test_branch_bearing_worktree_cannot_move_to_another_kind(kanban_home, tmp_pa
                 "UPDATE tasks SET workspace_kind='worktree', branch_name=? "
                 "WHERE id = ?", ("wt/card-e", t),
             )
-        with pytest.raises(kb.WorkspaceUpdateRefused) as exc:
-            kb.set_task_workspace(
-                conn, t, workspace_kind="dir", workspace_path=str(ws))
-        assert "branch_name" in str(exc.value)
-        # Same path is fine when it stays a worktree.
-        kb.set_task_workspace(
-            conn, t, workspace_kind="worktree", workspace_path=str(ws))
-        assert kb.get_task(conn, t).branch_name == "wt/card-e"
+
+        # Moving from worktree to dir should succeed now and clear branch_name
+        applied = kb.set_task_workspace(
+            conn, t, workspace_kind="dir", workspace_path=str(ws))
+
+        task = kb.get_task(conn, t)
+        assert task.workspace_kind == "dir"
+        assert task.workspace_path == str(ws)
+        assert task.branch_name is None  # Cleared
+
+        # The cleared branch_name should be in the result and event
+        assert "cleared" in applied
+        assert applied["cleared"]["branch_name"] == "wt/card-e"
+
+        # Verify the event recorded the cleared field
+        events = kb.list_events(conn, t)
+        ws_event = [e for e in events if e.kind == "workspace_updated"][-1]
+        assert ws_event.payload.get("cleared", {}).get("branch_name") == "wt/card-e"
 
 
 def test_cli_verb_applies_and_refuses(kanban_home, tmp_path, capsys):
@@ -236,6 +249,51 @@ def test_delegated_child_cannot_set_workspace():
     from hermes_cli import kanban as kcli
 
     assert "set-workspace" in kcli._DELEGATED_CHILD_DENIED_ACTIONS
+
+
+def test_set_workspace_clears_stale_failure_error(kanban_home, tmp_path):
+    """set-workspace clears last_failure_error and resets the respawn guard."""
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    ws = tmp_path / "ws-ok"
+    ws.mkdir()
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="card with stale error", initial_status="blocked")
+        # Stamp a workspace EACCES error (the measured shape)
+        error_text = "workspace: [Errno 13] Permission denied: '/root/x'"
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
+                (error_text, t),
+            )
+
+        # Verify the guard parks it (infrastructure_cooldown, not blocker_auth)
+        guard_reason = kbd.check_respawn_guard(conn, t)
+        assert guard_reason != "blocker_auth"
+
+        # Now fix the workspace
+        applied = kb.set_task_workspace(
+            conn, t, workspace_kind="dir", workspace_path=str(ws))
+
+        # last_failure_error should be NULL now
+        row = conn.execute(
+            "SELECT last_failure_error FROM tasks WHERE id = ?", (t,)
+        ).fetchone()
+        assert row[0] is None
+
+        # The cleared error should be recorded
+        assert "cleared" in applied
+        assert applied["cleared"]["last_failure_error"] == error_text
+
+        # The event should record the cleared field
+        events = kb.list_events(conn, t)
+        ws_event = [e for e in events if e.kind == "workspace_updated"][-1]
+        assert ws_event.payload.get("cleared", {}).get("last_failure_error") == error_text
+
+        # check_respawn_guard should no longer park it
+        guard_reason = kbd.check_respawn_guard(conn, t)
+        assert guard_reason is None
 
 
 def _parse_kanban(argv):
