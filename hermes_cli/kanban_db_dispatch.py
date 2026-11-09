@@ -322,6 +322,16 @@ class DispatchResult:
     reclaimed: int = 0
     promoted: int = 0
     woken_scheduled: int = 0
+    phantom_claims: list[str] = field(default_factory=list)
+    """Task ids whose claim was released by :func:`release_phantom_claims`
+    (``running`` with no worker pid and no heartbeat past the grace)."""
+    claim_attempts: int = 0
+    """Claims attempted this tick (successes + spawn faults). The spawn budget
+    caps attempts, so a systemic spawn fault cannot claim the whole ready
+    queue into phantom claims."""
+    spawn_faults: list[str] = field(default_factory=list)
+    """Task ids whose worker never started because the host could not exec it
+    (missing interpreter). Requeued without spending the retry budget."""
     """``scheduled`` tasks whose ``scheduled_wake_at`` came due this tick and
     were resumed by :func:`kanban_db.promote_due_scheduled`."""
     reconciled_orphans: list[str] = field(default_factory=list)
@@ -1715,6 +1725,99 @@ def reconcile_orphaned_running(conn: sqlite3.Connection) -> list[str]:
     return reconciled
 
 
+# A dispatcher claim exists only between the claim INSERT and the worker-PID
+# UPDATE inside ONE tick (milliseconds). A running row still holding a claim
+# with NO worker pid and NO heartbeat after this grace was never placed: the
+# tick died (spawn exception, thread/process death, transiently missing
+# interpreter) before a worker existed. It must be released by the dispatcher
+# itself on the next tick, not by an external monitor 13 minutes later.
+DEFAULT_PHANTOM_CLAIM_GRACE_SECONDS = 90
+
+
+def release_phantom_claims(
+    conn: sqlite3.Connection,
+    *,
+    grace_seconds: int = DEFAULT_PHANTOM_CLAIM_GRACE_SECONDS,
+    failure_limit: int = None,
+) -> list[str]:
+    """Release claims with no worker behind them; returns released task ids.
+
+    A claim is the dispatcher's promise to place a worker, and the worker PID
+    lands in the same tick. A row still ``running`` with ``worker_pid IS NULL``
+    and no heartbeat after ``grace_seconds`` therefore has no worker: waiting
+    out the 15-minute claim TTL leaves the card invisible in the ready lane and
+    makes the board report work that does not exist (runs 3045-3057).
+
+    Released as an INFRASTRUCTURE failure — nothing about the card ran, so
+    ``consecutive_failures`` is untouched, the breaker never trips, and the
+    next tick retries the card. ``worker_pid IS NULL`` + never-heartbeated is
+    the discriminator: any real claimer (spawned worker or an external
+    ``hermes kanban claim``) either records a pid or heartbeats.
+    """
+    if failure_limit is None:
+        failure_limit = DEFAULT_FAILURE_LIMIT
+    now = int(time.time())
+    rows = conn.execute(
+        "SELECT t.id, t.claim_lock, t.claim_expires, t.assignee, t.started_at, "
+        "       COALESCE(r.started_at, t.started_at) AS claimed_at "
+        "FROM tasks t LEFT JOIN task_runs r ON r.id = t.current_run_id "
+        "WHERE t.status = 'running' AND t.claim_lock IS NOT NULL "
+        "  AND t.worker_pid IS NULL AND t.last_heartbeat_at IS NULL"
+    ).fetchall()
+    released: list[str] = []
+    for row in rows:
+        claimed_at = row["claimed_at"]
+        if claimed_at is None:
+            continue
+        age = now - int(claimed_at)
+        if age < grace_seconds:
+            continue
+        tid = row["id"]
+        retry_status = _kb._retry_status_for_run(conn, tid)
+        error = (
+            f"phantom claim: claimed {age}s ago (lock={row['claim_lock']}) "
+            f"with no worker pid and no heartbeat"
+        )
+        with _kb.write_txn(conn):
+            cur = conn.execute(
+                "UPDATE tasks SET status = ?, claim_lock = NULL, "
+                "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, "
+                "last_heartbeat_at = NULL "
+                "WHERE id = ? AND status = 'running' AND worker_pid IS NULL "
+                "  AND claim_lock IS ? AND last_heartbeat_at IS NULL",
+                (retry_status, tid, row["claim_lock"]),
+            )
+            if cur.rowcount != 1:
+                continue
+            payload = {
+                "reason": "phantom_claim",
+                "claim_lock": row["claim_lock"],
+                "claim_expires": _kb._opt_int(row["claim_expires"]),
+                "claimed_at": int(claimed_at),
+                "age_seconds": age,
+                "retry_status": retry_status,
+                "infrastructure": True,
+            }
+            run_id = _kb._end_run(
+                conn, tid, outcome="spawn_failed", status="spawn_failed",
+                error=error, metadata=dict(payload),
+            )
+            _kb._append_event(conn, tid, "spawn_failed", {**payload, "error": error}, run_id=run_id)
+        # Own txn, after the release committed: stamps last_failure_error,
+        # increments nothing (infrastructure), never trips the breaker.
+        _record_task_failure(
+            conn, tid, error, outcome="spawn_failed",
+            failure_limit=failure_limit, release_claim=False, end_run=False,
+            infrastructure=True,
+        )
+        _kb._log.warning(
+            "kanban dispatcher: released phantom claim on %s (%s, %ss old)",
+            tid, row["claim_lock"], age,
+        )
+        released.append(tid)
+    return released
+
+
 def _error_fingerprint(error_text: str) -> str:
     """Normalize an error message (strip PIDs, timestamps) so same-root-cause errors group."""
     fp = re.sub(r'\bpid \d+\b', 'pid N', error_text[:80])
@@ -1843,11 +1946,17 @@ class _DeadWorker:
     credential/model — trips the breaker on this first occurrence."""
     exit_reason: dict = field(default_factory=dict)
     """Structured ``kanban_worker_exit`` record, stored on the closed run."""
+    spawn_fault: bool = False
+    """The launcher could not exec the pinned interpreter (missing runtime,
+    tool install race): the worker never started; treated as infrastructure."""
 
     @property
     def run_outcome(self) -> str:
         # A rate-limited requeue is recorded as ``rate_limited`` so board history
-        # doesn't show a phantom crash for a quota wall.
+        # doesn't show a phantom crash for a quota wall; a launcher fault records
+        # ``spawn_failed`` for the same reason.
+        if self.spawn_fault:
+            return "spawn_failed"
         return "rate_limited" if self.rate_limited else "crashed"
 
 
@@ -1945,6 +2054,8 @@ class _CrashSweep:
 
     crashed: list[str] = field(default_factory=list)
     rate_limited: list[str] = field(default_factory=list)
+    spawn_faults: list[str] = field(default_factory=list)
+    """Tasks whose launcher could not exec the pinned interpreter (infrastructure)."""
     # ``(task_id, pid, claimer, dead_worker)``: accounted after the txn via
     # ``_record_task_failure`` (needs its own write_txn).
     crash_details: list[tuple[str, int, str, _DeadWorker]] = field(default_factory=list)
@@ -1985,6 +2096,11 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                 run_started_at=_kwe.run_started_at(conn, open_run), board=board,
             )
             dead.event_payload["exit_reason"] = dead.exit_reason
+            # The launcher could not exec the pinned interpreter: the card never
+            # started. That is a spawn fault (infrastructure), not a crash.
+            dead.spawn_fault = _kwe.is_spawn_fault(dead.exit_reason, dead.error_text)
+            if dead.spawn_fault:
+                dead.event_payload["infrastructure"] = True
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL "
@@ -2011,10 +2127,11 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                 "outcome": dead.run_outcome,
                 "retry_status": retry_status,
             })
-            if dead.rate_limited or dead.protocol_violation:
+            if dead.rate_limited or dead.protocol_violation or dead.spawn_fault:
                 # Stamp last_failure_error WITHOUT touching ``consecutive_failures``:
                 # a rate-limited requeue must show ``check_respawn_guard`` a quota
-                # blocker; a below-budget protocol violation never reaches
+                # blocker; a launcher fault must never spend the retry budget; a
+                # below-budget protocol violation never reaches
                 # ``_record_task_failure`` (which stamps this column), yet the
                 # board UI and retry worker need the corrective message.
                 conn.execute(
@@ -2023,6 +2140,10 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                 )
             if dead.rate_limited:
                 sweep.rate_limited.append(row["id"])
+            elif dead.spawn_fault:
+                # Host could not place the worker: requeue, budget untouched,
+                # no HARNESS block.
+                sweep.spawn_faults.append(row["id"])
             else:
                 sweep.crashed.append(row["id"])
                 sweep.crash_details.append((row["id"], pid, row["claim_lock"], dead))
@@ -2168,6 +2289,7 @@ def detect_crashed_workers(conn: sqlite3.Connection, board: Optional[str] = None
     # requeues did NOT count a failure and are NOT crashes.
     detect_crashed_workers._last_auto_blocked = auto_blocked  # type: ignore[attr-defined]
     detect_crashed_workers._last_rate_limited = sweep.rate_limited  # type: ignore[attr-defined]
+    detect_crashed_workers._last_spawn_faults = sweep.spawn_faults  # type: ignore[attr-defined]
     # Fired only now, after the reclaim txn AND breaker accounting have
     # committed, so subscribers always observe fully durable board state.
     if sweep.exited_hook_payloads and _kb._kanban_observer_consumed("on_kanban_worker_exited"):
@@ -3230,15 +3352,45 @@ def dispatch_once(
 
 def _call_spawn_fn(spawn_fn, task: Task, workspace: str, board: Optional[str]) -> Optional[int]:
     """Back-compat: older spawn_fn signatures (and test stubs) accept only
-    ``(task, workspace)``; pass ``board`` only when the callable supports it."""
+    ``(task, workspace)``; pass ``board`` only when the callable supports it.
+
+    Only the SIGNATURE probe may swallow ``TypeError``: the call itself is
+    never retried, so an exception raised inside ``spawn_fn`` cannot spawn a
+    second worker for one claim.
+    """
     import inspect
     try:
         sig = inspect.signature(spawn_fn)
-        if "board" in sig.parameters:
-            return spawn_fn(task, workspace, board=board)
-        return spawn_fn(task, workspace)
     except (TypeError, ValueError):
-        return spawn_fn(task, workspace)
+        sig = None
+    if sig is not None and "board" in sig.parameters:
+        return spawn_fn(task, workspace, board=board)
+    return spawn_fn(task, workspace)
+
+
+# Evidence that a launcher never executed the worker: the runtime it is pinned
+# to disappeared mid-install (2026-11-09 live: a tool replacement removed
+# ``.../tools/python-3.14.7+.../bin/python3`` for ~90s and every spawn in that
+# window died before the worker ran).
+_SPAWN_INFRASTRUCTURE_TEXT = (
+    "Failed to find executable",
+    "executable not found",
+)
+
+
+def _is_infrastructure_spawn_error(exc: BaseException) -> bool:
+    """True when the HOST could not place the worker (nothing about the card ran).
+
+    Restart-safe scope refusal, OS-level exec failures (ENOENT/EACCES/ENOMEM)
+    and a transiently missing interpreter are infrastructure faults: they must
+    not spend the card's retry budget.
+    """
+    from tools.process_registry import RestartSafeScopeUnavailable
+
+    if isinstance(exc, (RestartSafeScopeUnavailable, OSError)):
+        return True
+    text = str(exc)
+    return any(marker in text for marker in _SPAWN_INFRASTRUCTURE_TEXT)
 
 
 def _dispatch_lane_task(
@@ -3327,54 +3479,92 @@ def _dispatch_lane_task(
     claimed = claim(conn, task_id, ttl_seconds=ttl_seconds)
     if claimed is None:
         return False
-    try:
-        workspace, resolved_branch_name = _kbw.claim_workspace(conn, claimed, board=board)
-    except Exception as exc:
+    # One claim = one spawn attempt. The caller caps attempts (not only
+    # successes) per tick, so a systemic spawn fault cannot drain the whole
+    # ready queue into claims that have no worker behind them.
+    result.claim_attempts += 1
+
+    def _release_claim_after_fault(error: str, *, infrastructure: bool) -> bool:
+        """Book a spawn fault and release the claim in THIS tick.
+
+        Claim and spawn are one unit: a claim with no worker behind it is a
+        phantom — it hides the card from the ready lane and reports running
+        work that does not exist (13 cards sat `running` with worker_pid NULL
+        for ~13 minutes, runs 3045-3057). Anything that stops the spawn must
+        leave the card ready, with the fault booked as infrastructure when the
+        HOST (not the card) failed.
+        """
         if _record_task_failure(
-            conn, claimed.id, f"workspace: {exc}",
-            outcome="spawn_failed", failure_limit=failure_limit, release_claim=True, end_run=True,
-            infrastructure=True,
+            conn, claimed.id, error,
+            outcome="spawn_failed", failure_limit=failure_limit,
+            release_claim=True, end_run=True, infrastructure=infrastructure,
         ):
             result.auto_blocked.append(claimed.id)
         return False
+
+    try:
+        workspace, resolved_branch_name = _kbw.claim_workspace(conn, claimed, board=board)
+    except Exception as exc:
+        return _release_claim_after_fault(f"workspace: {exc}", infrastructure=True)
     try:
         from hermes_cli.kanban_wait_on import default_head, record_run_head
         record_run_head(conn, claimed.current_run_id, default_head(str(workspace)))
     except Exception:
         pass
-    _kbw._maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
-    if lane == "review":
-        # Force-load sdlc-review; the kanban lifecycle is already in every
-        # worker's system prompt via KANBAN_GUIDANCE.
-        claimed.skills = list(dict.fromkeys([*(claimed.skills or []), "sdlc-review"]))
-    _apply_worker_resume_plan(conn, claimed)
+    try:
+        # Everything between the claim and the spawn runs under the same
+        # release-on-fault guard. An exception here used to escape the tick
+        # with the claim still held and NO `spawn_failed` event: a phantom
+        # claim that only an external stale-claim sweep ever rescued.
+        _kbw._maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
+        if lane == "review":
+            # Force-load sdlc-review; the kanban lifecycle is already in every
+            # worker's system prompt via KANBAN_GUIDANCE.
+            claimed.skills = list(dict.fromkeys([*(claimed.skills or []), "sdlc-review"]))
+        _apply_worker_resume_plan(conn, claimed)
+    except Exception as exc:
+        return _release_claim_after_fault(f"pre-spawn: {exc}", infrastructure=True)
     try:
         pid = _call_spawn_fn(spawn_fn if spawn_fn is not None else _default_spawn, claimed, str(workspace), board)
-        if pid:
-            _set_worker_pid(conn, claimed.id, int(pid))
-        # Fires AFTER the PID (when reported) is durably persisted. Best-effort.
-        _kb._fire_worker_spawned_hook(conn, claimed, str(workspace), pid, board=board)
-        # consecutive_failures is deliberately NOT reset here: resetting on
-        # spawn would let a task that keeps timing out loop forever. Cleared
-        # only on successful completion (complete_task).
-        result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
-        _count_spawn(claimed.assignee)
-        return True
     except Exception as exc:
-        from tools.process_registry import RestartSafeScopeUnavailable
-
-        # The host refused the spawn (no restart-safe scope): nothing about the
-        # card ran, so it must not spend the card's retry budget (#114720).
-        infrastructure = isinstance(exc, RestartSafeScopeUnavailable)
+        # The host refused the spawn (no restart-safe scope, missing
+        # interpreter, OS-level exec failure): nothing about the card ran, so
+        # it must not spend the card's retry budget (#114720).
+        infrastructure = _is_infrastructure_spawn_error(exc)
         if infrastructure:
-            _kb._log.warning("kanban dispatcher: spawn of %s deferred, host cannot place the worker: %s", claimed.id, exc)
-        if _record_task_failure(
-            conn, claimed.id, str(exc),
-            outcome="spawn_failed", failure_limit=failure_limit, release_claim=True, end_run=True,
-            infrastructure=infrastructure,
-        ):
-            result.auto_blocked.append(claimed.id)
-        return False
+            _kb._log.warning(
+                "kanban dispatcher: spawn of %s deferred, host cannot place the worker: %s",
+                claimed.id, exc,
+            )
+        return _release_claim_after_fault(str(exc) or exc.__class__.__name__, infrastructure=infrastructure)
+    if not pid:
+        # A spawn function that reports no pid placed no worker. Keeping the
+        # claim would leave a `running` row with no process behind it.
+        _kb._log.warning(
+            "kanban dispatcher: spawn of %s reported no worker pid; releasing the claim", claimed.id,
+        )
+        return _release_claim_after_fault(
+            "spawn reported no worker pid (worker not placed)", infrastructure=True,
+        )
+    try:
+        _set_worker_pid(conn, claimed.id, int(pid))
+    except Exception:
+        # The worker IS alive; releasing the claim would let a duplicate spawn
+        # beside it. Keep the claim and let the TTL sweep be the backstop.
+        _kb._log.exception("kanban dispatcher: could not record the worker pid for %s", claimed.id)
+    # Fires AFTER the PID (when reported) is durably persisted. Best-effort: an
+    # observer fault must never release a LIVE worker's claim (duplicate spawn)
+    # — that used to happen inside the spawn try-block.
+    try:
+        _kb._fire_worker_spawned_hook(conn, claimed, str(workspace), pid, board=board)
+    except Exception:
+        _kb._log.exception("kanban dispatcher: on_kanban_worker_spawned hook failed for %s", claimed.id)
+    # consecutive_failures is deliberately NOT reset here: resetting on
+    # spawn would let a task that keeps timing out loop forever. Cleared
+    # only on successful completion (complete_task).
+    result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
+    _count_spawn(claimed.assignee)
+    return True
 
 
 def _apply_default_assignee(
@@ -3421,6 +3611,7 @@ def _run_reclaim_phase(
     reap_worker_zombies()
     result.reaped_terminal_workers = reap_terminal_workers(conn)
     result.reclaimed = _kb.release_stale_claims(conn, failure_limit=failure_limit)
+    result.phantom_claims = release_phantom_claims(conn, failure_limit=failure_limit)
     if reconcile_orphans:
         result.reconciled_orphans = reconcile_orphaned_running(conn)
     result.stale = detect_stale_running(conn, stale_timeout_seconds=stale_timeout_seconds)
@@ -3429,6 +3620,7 @@ def _run_reclaim_phase(
     # went back to ``ready`` and the respawn guard defers them until quota clears.
     result.auto_blocked.extend(getattr(detect_crashed_workers, "_last_auto_blocked", []))
     result.rate_limited.extend(getattr(detect_crashed_workers, "_last_rate_limited", []))
+    result.spawn_faults.extend(getattr(detect_crashed_workers, "_last_spawn_faults", []))
     result.timed_out = enforce_max_runtime(conn)
     # Timed waits wake before ready-promotion so a woken card is dispatchable this tick.
     result.woken_scheduled = len(_kb.promote_due_scheduled(conn))
@@ -3686,7 +3878,11 @@ def _dispatch_once_locked(
     default_assignee = _resolve_default_assignee(default_assignee)
     spawned = 0
     for row in ready_rows:
-        if ready_budget is not None and spawned >= ready_budget:
+        # Cap ATTEMPTS too: a spawn fault returns False, so a success-only cap
+        # let one bad tick claim every ready card (13 phantom claims, 42s).
+        if ready_budget is not None and (
+            spawned >= ready_budget or result.claim_attempts >= ready_budget
+        ):
             break
         row_assignee = row["assignee"]
         if not row_assignee:
@@ -3707,7 +3903,7 @@ def _dispatch_once_locked(
     # checks the FULL shared ``spawn_budget`` — the reservation above caps the
     # ready lane, it grants no extra capacity here.
     for row in review_rows:
-        if spawn_budget is not None and spawned >= spawn_budget:
+        if spawn_budget is not None and (spawned >= spawn_budget or result.claim_attempts >= spawn_budget):
             break
         if not row["assignee"]:
             result.skipped_unassigned.append(row["id"])

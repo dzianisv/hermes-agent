@@ -37,6 +37,24 @@ HEARTBEAT_STALE = "heartbeat_stale"
 
 TRANSIENT_REASONS = frozenset({SIGNAL_KILLED, GATEWAY_SHUTDOWN})
 HARNESS_REASONS = frozenset({RC0_NO_HANDOFF, RC_NONZERO})
+
+# A launcher that cannot exec the interpreter it is pinned to (a tool install
+# replaced the runtime / the path is transiently absent) exits BEFORE the
+# worker runs. Signature taken from the live harness: run 3114 (2026-11-09)
+# printed "Failed to find executable .../python3: No such file or directory"
+# and was booked as a crash that spent the card's retry budget.
+SPAWN_FAULT = "spawn_fault"
+SPAWN_FAULT_MARKERS = ("Failed to find executable",)
+
+
+def is_spawn_fault(exit_reason: Optional[dict], error_text: str = "") -> bool:
+    """True when the exit evidence says the worker never reached the task.
+
+    Only launcher/runtime faults match: none of the card's work happened, so
+    the run must not spend the retry budget and must not trip a HARNESS block.
+    """
+    text = f"{error_text or ''}\n{(exit_reason or {}).get('stderr_tail') or ''}"
+    return any(marker in text for marker in SPAWN_FAULT_MARKERS)
 HARNESS_STREAK_LIMIT = 2
 TRANSIENT_STREAK_LIMIT = 6
 _STREAK_SCAN_LIMIT = 50
