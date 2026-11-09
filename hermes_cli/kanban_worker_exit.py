@@ -17,6 +17,8 @@ a worker that is OOM-killed every attempt cannot loop forever either.
 
 from __future__ import annotations
 
+import errno
+import os
 import signal
 import sqlite3
 import time
@@ -48,7 +50,14 @@ _STREAK_SCAN_LIMIT = 50
 # printed "Failed to find executable .../python3: No such file or directory"
 # and was booked as a crash that spent the card's retry budget.
 SPAWN_FAULT = "spawn_fault"
-SPAWN_FAULT_MARKERS = ("Failed to find executable",)
+# The host refused to exec the worker's interpreter. Two shapes are measured:
+# the launcher's own "Failed to find executable <path>" and the kernel's ENOENT
+# text ("<path>: No such file or directory"). The kernel half is DERIVED from
+# errno so this classifier cannot drift from libc's wording — a hand-typed list
+# would silently reclassify a spawn fault as a crash and start burning the
+# retry budget again (the wedge this guard exists to prevent).
+_ENOENT_TEXT = os.strerror(errno.ENOENT)
+SPAWN_FAULT_MARKERS = ("Failed to find executable", _ENOENT_TEXT)
 
 
 def is_spawn_fault(exit_reason: Optional[dict], error_text: str = "") -> bool:
@@ -56,9 +65,20 @@ def is_spawn_fault(exit_reason: Optional[dict], error_text: str = "") -> bool:
 
     Only launcher/runtime faults match: none of the card's work happened, so
     the run must not spend the retry budget and must not trip a HARNESS block.
+    The ENOENT shape additionally requires a path on the line, so ordinary prose
+    about a missing file (a tool's own error message) is not misfiled as a spawn
+    fault and left retrying forever.
     """
     text = f"{error_text or ''}\n{(exit_reason or {}).get('stderr_tail') or ''}"
-    return any(marker in text for marker in SPAWN_FAULT_MARKERS)
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or len(line) > 400:
+            continue
+        if "Failed to find executable" in line:
+            return True
+        if _ENOENT_TEXT in line and "/" in line:
+            return True
+    return False
 
 # Handoff events a worker emits by calling kanban_complete / kanban_block / request_review.
 _HANDOFF_EVENTS = ("completed", "blocked", "review_requested")

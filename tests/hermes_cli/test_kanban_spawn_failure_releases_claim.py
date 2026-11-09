@@ -11,6 +11,8 @@ fault escaped the tick without releasing the claim. The dispatcher must:
 
 from __future__ import annotations
 
+import errno
+import os
 import sqlite3
 from pathlib import Path
 
@@ -248,6 +250,32 @@ def test_a_failing_tick_cannot_claim_more_cards_than_the_budget(kanban_home, con
         "SELECT COUNT(*) FROM task_events WHERE kind='claimed'"
     ).fetchone()[0]
     assert claimed_events == 2
+
+
+def test_spawn_fault_marker_is_derived_from_errno():
+    """A hand-typed list would drift from libc; the marker must come from errno."""
+    from hermes_cli import kanban_worker_exit as kwe
+
+    assert os.strerror(errno.ENOENT) in kwe.SPAWN_FAULT_MARKERS
+    assert len(kwe.SPAWN_FAULT_MARKERS) == 2
+
+
+def test_enoent_without_a_path_is_not_a_spawn_fault():
+    """The card's own tooling reporting a missing file must still count as work."""
+    from hermes_cli import kanban_worker_exit as kwe
+
+    assert not kwe.is_spawn_fault({"stderr_tail": "No such file or directory"})
+
+
+def test_enoent_on_the_interpreter_path_is_a_spawn_fault():
+    from hermes_cli import kanban_worker_exit as kwe
+
+    tail = (
+        "/home/engineer/.hermes/tools/python-3.14.7+20260901-linux-x64/bin/python3: "
+        "No such file or directory\n"
+    )
+    assert kwe.is_spawn_fault({"stderr_tail": tail})
+    assert kwe.is_spawn_fault({}, tail)
 
 
 def test_interpreter_missing_exit_is_a_spawn_fault_not_a_crash(kanban_home, conn, monkeypatch):
