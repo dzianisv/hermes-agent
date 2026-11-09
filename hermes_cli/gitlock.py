@@ -214,7 +214,7 @@ class LockReport:
     age_seconds: float
     size: int
     holder_pids: tuple[int, ...] = ()   # processes that have the lock file open
-    git_pids: tuple[int, ...] = ()      # live `git` processes (machine-wide)
+    git_pids: tuple[int, ...] = ()      # live git processes (scoped to the repo when known)
     checks: tuple[str, ...] = ()        # the probes that actually ran, with their verdict
     probe_available: bool = False       # some probe could see a holder on this platform
 
@@ -317,7 +317,8 @@ def inspect_lock_file(lock_path: Path, *, repo_root: Optional[Path] = None) -> O
         checks.append("lsof: " + (
             "held by PID(s) " + ", ".join(map(str, lsof_holders)) if lsof_holders else "no holder"))
     git_pids = _git_pids_working_in(Path(repo_root)) if repo_root is not None else _git_pids()
-    checks.append("pgrep -x git: " + (
+    checks.append("git process probe (" + ("pgrep -x git + /proc/<pid>/cwd" if repo_root is not None
+                                           else "pgrep -x git, machine-wide") + "): " + (
         "working in this repo as PID(s) " + ", ".join(map(str, git_pids)) if git_pids
         else ("no git process working in this repo" if repo_root is not None else "no git process")))
     return LockReport(
