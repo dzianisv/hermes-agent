@@ -163,9 +163,11 @@ def _failure_hint(command: str, returncode: int, output: str, exit_note,
         from tools import terminal_hints
         if returncode == 0:
             return terminal_hints.annotate_masked_success(command, output)
-        if not exit_note:
-            return terminal_hints.annotate_failure(command, returncode, output, cwd=cwd)
-    return None
+        if exit_note:
+            # "git exit 1 is often normal" is informational, not a diagnosis: it must not swallow
+            # the one failure we can name exactly (a leftover lock reported as a merge conflict).
+            return terminal_hints.annotate_stale_lock_failure(command, returncode, output, cwd=cwd)
+        return terminal_hints.annotate_failure(command, returncode, output, cwd=cwd)
 
 
 def _redact_spill_file(path, total_chars, command) -> list[tuple[str, Any]]:

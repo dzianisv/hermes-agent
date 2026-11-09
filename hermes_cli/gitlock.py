@@ -38,19 +38,52 @@ LOCK_NAMES = ("shallow.lock", "index.lock", "HEAD.lock", "MERGE_HEAD.lock")
 _TMP_PACK_PREFIXES = ("tmp_pack_", "tmp_idx_", "tmp_rev_", "tmp_mtimes_", ".tmp-")
 
 
-def _git_proc_running() -> bool:
+def _proc_cwd(pid: int) -> Optional[str]:
+    """``/proc/<pid>/cwd`` resolved; None where the kernel has no /proc or it is unreadable."""
+    try:
+        return os.path.realpath(f"/proc/{pid}/cwd")
+    except OSError:
+        return None
+
+
+def _git_pids_working_in(repo_root: Optional[Path]) -> tuple[int, ...]:
+    """Live ``git`` PIDs working in ``repo_root`` (all of them when the scope is unknown).
+
+    Machine-wide ``pgrep -x git`` is too blunt to gate anything: a git credential-cache or
+    fsmonitor daemon has the comm ``git`` and runs for days, so the coarse probe made the lock
+    sweep skip forever on such hosts. Does that make us miss a real writer? Only one operating on
+    another repo — which cannot be holding THIS repo's lock; a ``git -C <repo>`` run whose cwd is
+    elsewhere is still caught by the exact open-fd probe on the file itself.
+    """
+    pids = _git_pids()
+    if not pids or repo_root is None:
+        return pids
+    root = os.path.realpath(repo_root)
+    working = []
+    for pid in pids:
+        cwd = _proc_cwd(pid)
+        # Unknown cwd (non-Linux, restricted /proc) stays conservative: assume it may be the writer.
+        if cwd is None or cwd == root or cwd.startswith(root + os.sep):
+            working.append(pid)
+    return tuple(working)
+
+
+def _git_proc_running(repo_root: Optional[Path] = None) -> bool:
     """True when a ``git`` process is running — the check that stops us yanking a lock a live fetch holds.
 
-    A failed probe logs and returns False; the age floor in the sweep still applies.
+    Scoped to ``repo_root`` when given (a git in another checkout is not our writer); machine-wide
+    when the scope is unknown. A failed probe logs and returns False; the age floor still applies.
     """
     try:
         if os.name == "nt":
             proc = subprocess.run(["tasklist", "/FI", "IMAGENAME eq git.exe", "/FO", "CSV"],
                                   capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10)
             return "git.exe" in proc.stdout.lower()
-        proc = subprocess.run(["pgrep", "-x", "git"], capture_output=True, text=True, encoding="utf-8", errors="replace",
-                              timeout=10)
-        return proc.returncode == 0
+        if repo_root is None:
+            proc = subprocess.run(["pgrep", "-x", "git"], capture_output=True, text=True,
+                                  encoding="utf-8", errors="replace", timeout=10)
+            return proc.returncode == 0
+        return bool(_git_pids_working_in(repo_root))
     except Exception:
         logger.debug("git process probe failed; assuming no git running", exc_info=True)
         return False
@@ -83,11 +116,12 @@ def _open_holders(paths: List[Path]) -> dict[Path, tuple[int, ...]]:
 
 
 def _sweep_stale(directory: Path, candidates: Callable[[], Iterable[Path]], *, min_age_seconds: Optional[int],
-                 default_age: int, skip_msg: str, log_removed: Callable[[Path, int], None]) -> List[str]:
+                 default_age: int, skip_msg: str, log_removed: Callable[[Path, int], None],
+                 repo_root: Optional[Path] = None) -> List[str]:
     """Shared guard + age-floor sweep. Never raises; skips anything it cannot stat/unlink."""
     if not directory.is_dir():
         return []
-    if _git_proc_running():
+    if _git_proc_running(repo_root):
         logger.debug(skip_msg)
         return []
     cutoff = time.time() - (min_age_seconds if min_age_seconds is not None else default_age)
@@ -127,8 +161,9 @@ def _sweep_stale(directory: Path, candidates: Callable[[], Iterable[Path]], *, m
 def clear_stale_git_locks(repo_root: Path, *, min_age_seconds: Optional[int] = None) -> List[str]:
     """Remove abandoned ``.git`` lock files under ``repo_root``; returns the removed paths.
 
-    Removes only when older than the age floor AND no git process is running. Never raises: a lock we cannot
-    stat/unlink is skipped (it may have been re-created between the age check and the unlink; skipping is safe).
+    Removes only when older than the age floor, no git process is working in this repo, and no live
+    process has the file open. Never raises: a lock we cannot stat/unlink is skipped (it may have
+    been re-created between the age check and the unlink; skipping is safe).
     """
     git_dir = Path(repo_root) / ".git"
     return _sweep_stale(
@@ -136,6 +171,7 @@ def clear_stale_git_locks(repo_root: Path, *, min_age_seconds: Optional[int] = N
         min_age_seconds=min_age_seconds, default_age=STALE_LOCK_MIN_AGE_SECONDS,
         skip_msg="git process running; skipping stale-lock sweep",
         log_removed=lambda p, _size: logger.info("Removed stale git lock %s", p),
+        repo_root=Path(repo_root),
     )
 
 
@@ -158,6 +194,7 @@ def clear_stale_tmp_packs(repo_root: Path, *, min_age_seconds: Optional[int] = N
         min_age_seconds=min_age_seconds, default_age=STALE_TMP_PACK_MIN_AGE_SECONDS,
         skip_msg="git process running; skipping tmp-pack sweep",
         log_removed=lambda p, size: logger.info("Removed aborted-fetch pack debris %s (%d bytes)", p, size),
+        repo_root=Path(repo_root),
     )
 
 
@@ -250,8 +287,12 @@ def _git_pids() -> tuple[int, ...]:
     return _pids_from_probe(["pgrep", "-x", "git"], accept_codes=(0, 1)) or ()
 
 
-def inspect_lock_file(lock_path: Path) -> Optional[LockReport]:
-    """Probe one existing lock file; None when it does not exist. Never raises."""
+def inspect_lock_file(lock_path: Path, *, repo_root: Optional[Path] = None) -> Optional[LockReport]:
+    """Probe one existing lock file; None when it does not exist. Never raises.
+
+    ``repo_root`` scopes the git-process probe to writers of that repo (a credential-cache daemon
+    elsewhere must not be reported as a possible owner); without it the probe stays machine-wide.
+    """
     try:
         st = Path(lock_path).stat()
     except OSError:
@@ -275,9 +316,10 @@ def inspect_lock_file(lock_path: Path) -> Optional[LockReport]:
         holders.update(lsof_holders)
         checks.append("lsof: " + (
             "held by PID(s) " + ", ".join(map(str, lsof_holders)) if lsof_holders else "no holder"))
-    git_pids = _git_pids()
+    git_pids = _git_pids_working_in(Path(repo_root)) if repo_root is not None else _git_pids()
     checks.append("pgrep -x git: " + (
-        "running as PID(s) " + ", ".join(map(str, git_pids)) if git_pids else "no git process"))
+        "working in this repo as PID(s) " + ", ".join(map(str, git_pids)) if git_pids
+        else ("no git process working in this repo" if repo_root is not None else "no git process")))
     return LockReport(
         path=Path(lock_path), age_seconds=max(0.0, time.time() - st.st_mtime), size=st.st_size,
         holder_pids=tuple(sorted(holders)), git_pids=git_pids, checks=tuple(checks),
@@ -310,9 +352,9 @@ def format_lock_report(report: LockReport) -> str:
             f"retry. If git also refuses to abort because .git/MERGE_HEAD is left over, remove that file too.")
 
 
-def describe_lock_file(lock_path: Path) -> Optional[str]:
+def describe_lock_file(lock_path: Path, *, repo_root: Optional[Path] = None) -> Optional[str]:
     """Message for one lock path; None when it does not exist."""
-    report = inspect_lock_file(lock_path)
+    report = inspect_lock_file(lock_path, repo_root=repo_root)
     return format_lock_report(report) if report is not None else None
 
 
@@ -339,7 +381,7 @@ def describe_repo_lock(repo_root: Path, *, names: Iterable[str] = DIAGNOSABLE_LO
     if git_dir is None:
         return None
     for name in names:
-        described = describe_lock_file(git_dir / name)
+        described = describe_lock_file(git_dir / name, repo_root=Path(repo_root))
         if described:
             return described
     return None
