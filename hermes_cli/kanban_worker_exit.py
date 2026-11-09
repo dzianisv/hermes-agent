@@ -38,6 +38,10 @@ HEARTBEAT_STALE = "heartbeat_stale"
 TRANSIENT_REASONS = frozenset({SIGNAL_KILLED, GATEWAY_SHUTDOWN})
 HARNESS_REASONS = frozenset({RC0_NO_HANDOFF, RC_NONZERO})
 
+HARNESS_STREAK_LIMIT = 2
+TRANSIENT_STREAK_LIMIT = 6
+_STREAK_SCAN_LIMIT = 50
+
 # A launcher that cannot exec the interpreter it is pinned to (a tool install
 # replaced the runtime / the path is transiently absent) exits BEFORE the
 # worker runs. Signature taken from the live harness: run 3114 (2026-11-09)
@@ -55,9 +59,6 @@ def is_spawn_fault(exit_reason: Optional[dict], error_text: str = "") -> bool:
     """
     text = f"{error_text or ''}\n{(exit_reason or {}).get('stderr_tail') or ''}"
     return any(marker in text for marker in SPAWN_FAULT_MARKERS)
-HARNESS_STREAK_LIMIT = 2
-TRANSIENT_STREAK_LIMIT = 6
-_STREAK_SCAN_LIMIT = 50
 
 # Handoff events a worker emits by calling kanban_complete / kanban_block / request_review.
 _HANDOFF_EVENTS = ("completed", "blocked", "review_requested")

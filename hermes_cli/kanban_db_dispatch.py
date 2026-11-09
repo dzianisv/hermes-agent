@@ -322,6 +322,8 @@ class DispatchResult:
     reclaimed: int = 0
     promoted: int = 0
     woken_scheduled: int = 0
+    """``scheduled`` tasks whose ``scheduled_wake_at`` came due this tick and
+    were resumed by :func:`kanban_db.promote_due_scheduled`."""
     phantom_claims: list[str] = field(default_factory=list)
     """Task ids whose claim was released by :func:`release_phantom_claims`
     (``running`` with no worker pid and no heartbeat past the grace)."""
@@ -332,8 +334,6 @@ class DispatchResult:
     spawn_faults: list[str] = field(default_factory=list)
     """Task ids whose worker never started because the host could not exec it
     (missing interpreter). Requeued without spending the retry budget."""
-    """``scheduled`` tasks whose ``scheduled_wake_at`` came due this tick and
-    were resumed by :func:`kanban_db.promote_due_scheduled`."""
     reconciled_orphans: list[str] = field(default_factory=list)
     """``running`` cards requeued by :func:`reconcile_orphaned_running` (broken
     claim bookkeeping, dead/gone worker)."""
@@ -3537,17 +3537,22 @@ def _dispatch_lane_task(
                 claimed.id, exc,
             )
         return _release_claim_after_fault(str(exc) or exc.__class__.__name__, infrastructure=infrastructure)
-    if not pid:
-        # A spawn function that reports no pid placed no worker. Keeping the
-        # claim would leave a `running` row with no process behind it.
+    try:
+        pid_int = int(pid) if pid else 0
+    except (TypeError, ValueError):
+        pid_int = 0
+    if pid_int <= 0:
+        # A spawn function that reports no usable pid placed no worker. Keeping
+        # the claim would leave a `running` row with no process behind it.
         _kb._log.warning(
-            "kanban dispatcher: spawn of %s reported no worker pid; releasing the claim", claimed.id,
+            "kanban dispatcher: spawn of %s reported no worker pid (%r); releasing the claim",
+            claimed.id, pid,
         )
         return _release_claim_after_fault(
-            "spawn reported no worker pid (worker not placed)", infrastructure=True,
+            f"spawn reported no worker pid ({pid!r}): worker not placed", infrastructure=True,
         )
     try:
-        _set_worker_pid(conn, claimed.id, int(pid))
+        _set_worker_pid(conn, claimed.id, pid_int)
     except Exception:
         # The worker IS alive; releasing the claim would let a duplicate spawn
         # beside it. Keep the claim and let the TTL sweep be the backstop.
@@ -3556,7 +3561,7 @@ def _dispatch_lane_task(
     # observer fault must never release a LIVE worker's claim (duplicate spawn)
     # — that used to happen inside the spawn try-block.
     try:
-        _kb._fire_worker_spawned_hook(conn, claimed, str(workspace), pid, board=board)
+        _kb._fire_worker_spawned_hook(conn, claimed, str(workspace), pid_int, board=board)
     except Exception:
         _kb._log.exception("kanban dispatcher: on_kanban_worker_spawned hook failed for %s", claimed.id)
     # consecutive_failures is deliberately NOT reset here: resetting on

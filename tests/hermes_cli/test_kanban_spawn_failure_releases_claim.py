@@ -78,6 +78,8 @@ def test_raising_spawn_releases_the_claim_in_the_same_tick(kanban_home, conn, mo
     ).fetchall()]
     assert "spawn_failed" in outcomes
 
+    assert res.auto_blocked == []
+
 
 def test_spawn_without_a_pid_is_a_phantom_claim_released(kanban_home, conn):
     """A spawn_fn returning None places no worker; the claim must be released."""
@@ -95,6 +97,9 @@ def test_spawn_without_a_pid_is_a_phantom_claim_released(kanban_home, conn):
     assert task.claim_lock is None
     assert task.worker_pid is None
     assert task.consecutive_failures == 0
+
+    # A no-pid spawn is booked as an infrastructure spawn fault, not a success.
+    assert res.spawned == []
 
 
 def test_oserror_spawn_is_infrastructure(kanban_home, conn, monkeypatch):
