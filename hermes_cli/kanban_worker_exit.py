@@ -17,8 +17,6 @@ a worker that is OOM-killed every attempt cannot loop forever either.
 
 from __future__ import annotations
 
-import errno
-import os
 import signal
 import sqlite3
 import time
@@ -49,34 +47,32 @@ _STREAK_SCAN_LIMIT = 50
 # worker runs. Signature taken from the live harness: run 3114 (2026-11-09)
 # printed "Failed to find executable .../python3: No such file or directory"
 # and was booked as a crash that spent the card's retry budget.
-SPAWN_FAULT = "spawn_fault"
-# The host refused to exec the worker's interpreter. Two shapes are measured:
-# the launcher's own "Failed to find executable <path>" and the kernel's ENOENT
-# text ("<path>: No such file or directory"). The kernel half is DERIVED from
-# errno so this classifier cannot drift from libc's wording — a hand-typed list
-# would silently reclassify a spawn fault as a crash and start burning the
-# retry budget again (the wedge this guard exists to prevent).
-_ENOENT_TEXT = os.strerror(errno.ENOENT)
-SPAWN_FAULT_MARKERS = ("Failed to find executable", _ENOENT_TEXT)
+#
+# ONLY the launcher's own line counts. An earlier revision also accepted the
+# bare kernel text ("<path>: No such file or directory"), which absorbed a real
+# worker crash: a worker that ran, heartbeated and then hit its own
+# ``FileNotFoundError: [Errno 2] No such file or directory: '.../data.json'``
+# was booked as infrastructure, retried forever and never tripped the breaker.
+# The kernel text says a file is missing, not WHO failed to exec, so it is not
+# evidence about the worker having started.
+LAUNCHER_EXEC_FAILURE_MARKER = "Failed to find executable"
+SPAWN_FAULT_MARKERS = (LAUNCHER_EXEC_FAILURE_MARKER,)
 
 
 def is_spawn_fault(exit_reason: Optional[dict], error_text: str = "") -> bool:
     """True when the exit evidence says the worker never reached the task.
 
-    Only launcher/runtime faults match: none of the card's work happened, so
-    the run must not spend the retry budget and must not trip a HARNESS block.
-    The ENOENT shape additionally requires a path on the line, so ordinary prose
-    about a missing file (a tool's own error message) is not misfiled as a spawn
-    fault and left retrying forever.
+    Only the launcher's own exec-failure line matches: none of the card's work
+    happened, so the run must not spend the retry budget and must not trip a
+    HARNESS block. A worker's own ``FileNotFoundError`` — with or without a path
+    on the line — stays a crash: it ran, and its failure is the card's to fix.
     """
     text = f"{error_text or ''}\n{(exit_reason or {}).get('stderr_tail') or ''}"
     for line in text.splitlines():
         line = line.strip()
         if not line or len(line) > 400:
             continue
-        if "Failed to find executable" in line:
-            return True
-        if _ENOENT_TEXT in line and "/" in line:
+        if LAUNCHER_EXEC_FAILURE_MARKER in line:
             return True
     return False
 

@@ -11,9 +11,8 @@ fault escaped the tick without releasing the claim. The dispatcher must:
 
 from __future__ import annotations
 
-import errno
-import os
 import sqlite3
+import time
 from pathlib import Path
 
 import pytest
@@ -223,6 +222,59 @@ def test_phantom_claim_is_released_by_the_dispatcher(kanban_home, conn):
     assert events[-1].payload.get("reason") == "phantom_claim"
 
 
+def test_phantom_claim_on_a_reused_card_is_released(kanban_home, conn):
+    """The incident shape: a card reused from an earlier run carries an old heartbeat.
+
+    ``tasks.last_heartbeat_at`` is task-level and is NOT reset by a new claim, so a
+    heartbeat from a previous run must not protect the new claim (runs 3045-3057:
+    13/13 cards had a non-null heartbeat from earlier work).
+    """
+    tid = kb.create_task(conn, title="reused phantom", assignee="dev")
+    conn.execute(
+        "UPDATE tasks SET last_heartbeat_at = ? WHERE id = ?",
+        (int(time.time()) - 3600, tid),
+    )
+    conn.commit()
+
+    claimed = kb.claim_task(conn, tid, ttl_seconds=900)
+    assert claimed is not None
+    run_id = claimed.current_run_id
+    conn.commit()
+
+    # Age the CURRENT claim past the grace window; the earlier heartbeat stays older.
+    conn.execute("UPDATE task_runs SET started_at = started_at - 600 WHERE id = ?", (run_id,))
+    conn.commit()
+
+    released = kbd.release_phantom_claims(conn)
+
+    assert released == [tid]
+    task = kb.get_task(conn, tid)
+    assert task.status == "ready"
+    assert task.claim_lock is None
+    assert task.consecutive_failures == 0
+
+
+def test_a_heartbeat_since_the_claim_protects_it(kanban_home, conn):
+    """A claimer that beats after claiming is live: the sweep must leave it alone."""
+    tid = kb.create_task(conn, title="live claim", assignee="dev")
+    conn.commit()
+
+    claimed = kb.claim_task(conn, tid, ttl_seconds=900)
+    run_id = claimed.current_run_id
+    conn.commit()
+
+    conn.execute("UPDATE task_runs SET started_at = started_at - 600 WHERE id = ?", (run_id,))
+    conn.execute("UPDATE tasks SET last_heartbeat_at = ? WHERE id = ?", (int(time.time()), tid))
+    conn.commit()
+
+    released = kbd.release_phantom_claims(conn)
+
+    assert released == []
+    task = kb.get_task(conn, tid)
+    assert task.status == "running"
+    assert task.claim_lock is not None
+
+
 def test_a_failing_tick_cannot_claim_more_cards_than_the_budget(kanban_home, conn):
     """A systemic spawn fault cannot claim the entire ready queue (13 cards, 42s)."""
     tids = []
@@ -252,30 +304,39 @@ def test_a_failing_tick_cannot_claim_more_cards_than_the_budget(kanban_home, con
     assert claimed_events == 2
 
 
-def test_spawn_fault_marker_is_derived_from_errno():
-    """A hand-typed list would drift from libc; the marker must come from errno."""
+def test_the_two_spawn_paths_share_one_launcher_marker():
+    """The in-process spawn guard and the exit classifier must not drift apart."""
     from hermes_cli import kanban_worker_exit as kwe
 
-    assert os.strerror(errno.ENOENT) in kwe.SPAWN_FAULT_MARKERS
-    assert len(kwe.SPAWN_FAULT_MARKERS) == 2
+    assert kwe.LAUNCHER_EXEC_FAILURE_MARKER in kbd._SPAWN_INFRASTRUCTURE_TEXT
+    for marker in kwe.SPAWN_FAULT_MARKERS:
+        assert kwe.is_spawn_fault({"stderr_tail": f"{marker} /x/bin/python3"})
 
 
-def test_enoent_without_a_path_is_not_a_spawn_fault():
-    """The card's own tooling reporting a missing file must still count as work."""
-    from hermes_cli import kanban_worker_exit as kwe
-
-    assert not kwe.is_spawn_fault({"stderr_tail": "No such file or directory"})
-
-
-def test_enoent_on_the_interpreter_path_is_a_spawn_fault():
+def test_launcher_exec_failure_line_is_a_spawn_fault():
+    """The measured live shape (run 3114): the launcher's own line."""
     from hermes_cli import kanban_worker_exit as kwe
 
     tail = (
-        "/home/engineer/.hermes/tools/python-3.14.7+20260901-linux-x64/bin/python3: "
+        "Failed to find executable /home/engineer/.hermes/tools/python-3.14.7+xxxx/bin/python3: "
         "No such file or directory\n"
     )
     assert kwe.is_spawn_fault({"stderr_tail": tail})
     assert kwe.is_spawn_fault({}, tail)
+
+
+def test_a_workers_own_missing_file_is_not_a_spawn_fault():
+    """A worker that RAN and hit its own FileNotFoundError is work, not a spawn fault."""
+    from hermes_cli import kanban_worker_exit as kwe
+
+    tail = (
+        "Traceback (most recent call last):\n"
+        '  File "/home/engineer/run.py", line 3, in <module>\n'
+        "FileNotFoundError: [Errno 2] No such file or directory: "
+        "'/home/engineer/project/data.json'\n"
+    )
+    assert not kwe.is_spawn_fault({"stderr_tail": tail, "handoff_called": False})
+    assert not kwe.is_spawn_fault({}, tail)
 
 
 def test_interpreter_missing_exit_is_a_spawn_fault_not_a_crash(kanban_home, conn, monkeypatch):
@@ -328,3 +389,40 @@ def test_interpreter_missing_exit_is_a_spawn_fault_not_a_crash(kanban_home, conn
     ).fetchall()]
     for o in outcomes:
         assert o == "spawn_failed", f"Expected spawn_failed, got {o}"
+
+
+def test_a_worker_crash_on_its_own_missing_file_still_counts(kanban_home, conn, monkeypatch):
+    """The over-match that blocked review: a real crash must burn the retry budget."""
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    host = kb._claimer_id().split(":", 1)[0]
+    tid = kb.create_task(conn, title="worker crash", assignee="dev")
+    pid = 81000
+    kb.claim_task(conn, tid, claimer=f"{host}:w0")
+    conn.execute(
+        "UPDATE tasks SET worker_pid=?, last_heartbeat_at=? WHERE id=?",
+        (pid, int(time.time()), tid),
+    )
+    conn.commit()
+
+    log_dir = kb.worker_logs_dir()
+    log_dir.mkdir(parents=True, exist_ok=True)
+    (log_dir / f"{tid}.log").write_text(
+        "Traceback (most recent call last):\n"
+        "FileNotFoundError: [Errno 2] No such file or directory: "
+        "'/home/engineer/project/data.json'\n",
+        encoding="utf-8",
+    )
+
+    kbd._record_worker_exit(pid, _exited_status(1))
+    crashed = kbd.detect_crashed_workers(conn)
+
+    assert tid in crashed, "a worker's own missing file is a crash, not a spawn fault"
+    assert tid not in getattr(kbd.detect_crashed_workers, "_last_spawn_faults", [])
+    task = kb.get_task(conn, tid)
+    assert task.consecutive_failures == 1
+    outcomes = [r["outcome"] for r in conn.execute(
+        "SELECT outcome FROM task_runs WHERE task_id=?", (tid,)
+    ).fetchall()]
+    assert "crashed" in outcomes

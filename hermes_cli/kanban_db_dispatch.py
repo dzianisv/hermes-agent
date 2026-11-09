@@ -1744,15 +1744,26 @@ def release_phantom_claims(
 
     A claim is the dispatcher's promise to place a worker, and the worker PID
     lands in the same tick. A row still ``running`` with ``worker_pid IS NULL``
-    and no heartbeat after ``grace_seconds`` therefore has no worker: waiting
-    out the 15-minute claim TTL leaves the card invisible in the ready lane and
-    makes the board report work that does not exist (runs 3045-3057).
+    and no heartbeat SINCE the claim started after ``grace_seconds`` therefore
+    has no worker: waiting out the claim TTL leaves the card invisible in the
+    ready lane and makes the board report work that does not exist (runs
+    3045-3057).
+
+    The heartbeat test is "older than the claim start", not "NULL":
+    ``tasks.last_heartbeat_at`` is task-level and a new claim does not reset it,
+    so every REUSED card still carries the heartbeat of its previous run — all
+    13 incident cards did (13/13). Comparing against the claim start releases
+    those while still protecting a claimer that beats after claiming:
+    ``heartbeat_worker`` stamps the column, so a live claim's heartbeat is newer
+    than its run's ``started_at``.
+
+    A bare ``hermes kanban claim`` records neither a pid nor a heartbeat, so the
+    dispatcher releases it after the grace — a claim nobody can see a worker for
+    is exactly what this sweep exists to clear.
 
     Released as an INFRASTRUCTURE failure — nothing about the card ran, so
     ``consecutive_failures`` is untouched, the breaker never trips, and the
-    next tick retries the card. ``worker_pid IS NULL`` + never-heartbeated is
-    the discriminator: any real claimer (spawned worker or an external
-    ``hermes kanban claim``) either records a pid or heartbeats.
+    next tick retries the card.
     """
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
@@ -1762,7 +1773,9 @@ def release_phantom_claims(
         "       COALESCE(r.started_at, t.started_at) AS claimed_at "
         "FROM tasks t LEFT JOIN task_runs r ON r.id = t.current_run_id "
         "WHERE t.status = 'running' AND t.claim_lock IS NOT NULL "
-        "  AND t.worker_pid IS NULL AND t.last_heartbeat_at IS NULL"
+        "  AND t.worker_pid IS NULL "
+        "  AND (t.last_heartbeat_at IS NULL "
+        "       OR t.last_heartbeat_at <= COALESCE(r.started_at, t.started_at))"
     ).fetchall()
     released: list[str] = []
     for row in rows:
@@ -1784,8 +1797,9 @@ def release_phantom_claims(
                 "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, "
                 "last_heartbeat_at = NULL "
                 "WHERE id = ? AND status = 'running' AND worker_pid IS NULL "
-                "  AND claim_lock IS ? AND last_heartbeat_at IS NULL",
-                (retry_status, tid, row["claim_lock"]),
+                "  AND claim_lock IS ? "
+                "  AND (last_heartbeat_at IS NULL OR last_heartbeat_at <= ?)",
+                (retry_status, tid, row["claim_lock"], claimed_at),
             )
             if cur.rowcount != 1:
                 continue
@@ -3372,6 +3386,12 @@ def _call_spawn_fn(spawn_fn, task: Task, workspace: str, board: Optional[str]) -
 # to disappeared mid-install (2026-11-09 live: a tool replacement removed
 # ``.../tools/python-3.14.7+.../bin/python3`` for ~90s and every spawn in that
 # window died before the worker ran).
+#
+# The launcher marker is the SAME string the exit classifier matches
+# (``kanban_worker_exit.LAUNCHER_EXEC_FAILURE_MARKER``); this tuple is duplicated
+# rather than imported because ``_kwe`` is late-bound at the bottom of this
+# module. ``test_the_two_spawn_paths_share_one_launcher_marker`` fails if the two
+# definitions drift.
 _SPAWN_INFRASTRUCTURE_TEXT = (
     "Failed to find executable",
     "executable not found",
@@ -3615,8 +3635,11 @@ def _run_reclaim_phase(
     """Reclaim stale/orphaned/crashed/timed-out running tasks, then promote."""
     reap_worker_zombies()
     result.reaped_terminal_workers = reap_terminal_workers(conn)
-    result.reclaimed = _kb.release_stale_claims(conn, failure_limit=failure_limit)
+    # Phantom first: a claim with no worker pid is not a stale claim. The TTL
+    # sweep books a non-infrastructure failure, so letting it run first would
+    # charge the card for a host fault whenever the two windows coincide.
     result.phantom_claims = release_phantom_claims(conn, failure_limit=failure_limit)
+    result.reclaimed = _kb.release_stale_claims(conn, failure_limit=failure_limit)
     if reconcile_orphans:
         result.reconciled_orphans = reconcile_orphaned_running(conn)
     result.stale = detect_stale_running(conn, stale_timeout_seconds=stale_timeout_seconds)
