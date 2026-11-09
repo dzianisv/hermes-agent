@@ -4333,8 +4333,11 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     # ``sys.executable -m hermes_cli.main`` has no launcher bootstrap. The
     # sanitizer strips this checkout from PYTHONPATH (user children must not
     # see it) and PYTHONSAFEPATH drops the workspace cwd, so a bundled
-    # interpreter exits before hermes_cli.main can fix its own path. Re-pin
-    # only this checkout onto the already-sanitized env.
+    # interpreter exits before hermes_cli.main can fix its own path. The
+    # py-safe-path keeps the workspace cwd off sys.path so a workspace that IS
+    # a Hermes checkout cannot shadow the pinned live install; the pin still
+    # makes the live tree importable.
+    env["PYTHONSAFEPATH"] = "1"
     from cron.scheduler_worker_env import pin_hermes_tree_on_pythonpath
     env = pin_hermes_tree_on_pythonpath(
         env, Path(__file__).resolve().parent.parent)

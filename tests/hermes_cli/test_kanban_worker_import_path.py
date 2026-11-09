@@ -39,6 +39,7 @@ def _capture_spawn(monkeypatch, tmp_path, *, assignee: str = "default") -> dict:
     real_popen = subprocess.Popen
     monkeypatch.setattr(subprocess, "Popen", _fake_popen)
     monkeypatch.setattr(kbd, "_retag_legacy_worker_sessions", lambda _root: None)
+    monkeypatch.setattr(kbd, "_restart_safe_worker_argv", lambda task, cmd: cmd)
     monkeypatch.setattr(kb, "worker_logs_dir", lambda board=None: tmp_path / "logs")
 
     workspace = tmp_path / "ws"
@@ -140,3 +141,35 @@ def test_routed_worker_pin_does_not_restore_dispatcher_secrets(monkeypatch, tmp_
     assert "OPENAI_API_KEY" not in env
     assert "dispatcher-launch-key" not in env.get("PYTHONPATH", "")
     assert env["PYTHONPATH"].split(os.pathsep)[0] == str(_repo_root())
+
+
+def test_worker_env_cannot_be_shadowed_by_a_checkout_workspace(monkeypatch, tmp_path):
+    """A workspace that IS a Hermes checkout must not shadow the live install.
+
+    Repro (measured): the dispatcher launches `<python> -m hermes_cli.main` with
+    cwd=workspace; for `-m`, cwd is sys.path[0], so a workspace checkout's own
+    hermes_cli wins and PM raises "no dependency environment is committed for
+    this install". PYTHONSAFEPATH=1 in the worker env drops cwd from sys.path and
+    the pinned live tree still resolves.
+    """
+    home = tmp_path / "hermes-home"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    captured = _capture_spawn(monkeypatch, tmp_path)
+
+    assert captured["env"]["PYTHONSAFEPATH"] == "1"
+
+    checkout = tmp_path / "shadow-checkout"
+    (checkout / "hermes_cli").mkdir(parents=True)
+    (checkout / "hermes_cli" / "__init__.py").write_text("", encoding="utf-8")
+    (checkout / "hermes_cli" / "main.py").write_text(
+        "raise SystemExit('SHADOWED: workspace checkout won')\n", encoding="utf-8"
+    )
+
+    proc = subprocess.run(
+        [*captured["cmd"][:3], "--version"],
+        cwd=checkout, env=captured["env"], capture_output=True, text=True, timeout=120,
+    )
+    assert "SHADOWED" not in proc.stdout
+    assert "no dependency environment is committed" not in (proc.stderr or "")
+    assert proc.returncode == 0, proc.stderr
