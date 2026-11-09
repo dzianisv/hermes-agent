@@ -12,17 +12,42 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 import urllib.request
+from dataclasses import dataclass
 from typing import Any, Optional
 
 from hermes_cli.models import fetch_api_models, normalize_provider, provider_label
 from hermes_cli.models_validate import _is_self_hosted_provider, validate_requested_model
 from hermes_cli.providers import get_provider
+from providers import get_provider_profile
 
 logger = logging.getLogger(__name__)
 
 _GUARD_OFF_VALUES = {"0", "false", "off"}
 _OPENROUTER_KEY_URL = "https://openrouter.ai/api/v1/auth/key"
+_CATALOG_UNREACHABLE = object()
+_CATALOG_SUCCESS_TTL = 300.0
+_CATALOG_FAILURE_TTL = 60.0
+_VERDICT_ACCEPT_TTL = 300.0
+_VERDICT_REJECT_TTL = 60.0
+
+
+@dataclass(frozen=True)
+class _TimedMemoEntry:
+    expires_at: float
+    value: Any
+
+
+@dataclass(frozen=True)
+class _GuardVerdict:
+    accepted: bool
+    diagnosis: str | None
+
+
+_catalog_memo: dict[tuple[str, str], _TimedMemoEntry] = {}
+_verdict_memo: dict[tuple[str, str, str], _TimedMemoEntry] = {}
+_missing_endpoint_warnings: set[tuple[str, str]] = set()
 
 
 def _guard_enabled() -> bool:
@@ -35,14 +60,83 @@ def _normalize_provider_or_blank(provider: Any) -> str:
     return normalize_provider(raw) if raw else ""
 
 
+def _memo_get(store: dict, key: tuple) -> Any:
+    entry = store.get(key)
+    if entry is None:
+        return None
+    if entry.expires_at <= time.monotonic():
+        store.pop(key, None)
+        return None
+    return entry.value
+
+
+def _memo_put(store: dict, key: tuple, value: Any, ttl_seconds: float) -> Any:
+    store[key] = _TimedMemoEntry(expires_at=time.monotonic() + ttl_seconds, value=value)
+    return value
+
+
 def _provider_base_url(provider: str) -> str:
-    if not provider:
+    normalized = _normalize_provider_or_blank(provider)
+    if not normalized:
         return ""
     try:
-        pdef = get_provider(provider, allow_network=False)
+        pdef = get_provider(normalized, allow_network=False)
     except Exception:
-        return ""
-    return str(getattr(pdef, "base_url", "") or "").strip().rstrip("/")
+        pdef = None
+    base_url = str(getattr(pdef, "base_url", "") or "").strip().rstrip("/")
+    if base_url:
+        return base_url
+    try:
+        profile = get_provider_profile(normalized)
+    except Exception:
+        profile = None
+    return str(getattr(profile, "base_url", "") or "").strip().rstrip("/")
+
+
+def _warn_missing_catalog_endpoint(provider: str, model: str) -> None:
+    key = (str(provider or "").strip().lower(), str(model or "").strip())
+    if key in _missing_endpoint_warnings:
+        return
+    _missing_endpoint_warnings.add(key)
+    logger.warning(
+        "cron model guard: provider=%r model=%r has no resolvable catalog endpoint; "
+        "the live catalog could not be consulted, failing open",
+        provider,
+        model,
+    )
+
+
+def _warm_provider_catalog(provider: str, *, base_url: str) -> tuple[bool, list[str] | None]:
+    resolved_base_url = str(base_url or "").strip().rstrip("/")
+    if not resolved_base_url:
+        return False, None
+    memo_key = (_normalize_provider_or_blank(provider), resolved_base_url)
+    cached = _memo_get(_catalog_memo, memo_key)
+    if cached is _CATALOG_UNREACHABLE:
+        logger.debug(
+            "cron model guard: live catalog warm-up still unavailable for provider=%r base_url=%r; "
+            "skipping validation",
+            provider,
+            resolved_base_url,
+        )
+        return False, None
+    if cached is not None:
+        return True, list(cached)
+
+    catalog = fetch_api_models(None, resolved_base_url, timeout=2.0)
+    if catalog is None:
+        _memo_put(_catalog_memo, memo_key, _CATALOG_UNREACHABLE, _CATALOG_FAILURE_TTL)
+        logger.debug(
+            "cron model guard: live catalog warm-up failed for provider=%r base_url=%r; "
+            "skipping validation",
+            provider,
+            resolved_base_url,
+        )
+        return False, None
+
+    warmed = [text for text in (str(model_id or "").strip() for model_id in catalog) if text]
+    _memo_put(_catalog_memo, memo_key, tuple(warmed), _CATALOG_SUCCESS_TTL)
+    return True, warmed
 
 
 def _catalog_alternatives(
@@ -50,19 +144,23 @@ def _catalog_alternatives(
     provider: str,
     *,
     base_url: str | None = None,
+    catalog: list[str] | None = None,
 ) -> tuple[list[str], int, str] | None:
     resolved_base_url = str(base_url or "").strip().rstrip("/")
-    if not resolved_base_url:
-        resolved_base_url = _provider_base_url(provider)
-    if not resolved_base_url:
-        return None
-    catalog = fetch_api_models(None, resolved_base_url)
-    if not catalog:
-        return None
+    live_catalog = catalog
+    if live_catalog is None:
+        if not resolved_base_url:
+            resolved_base_url = _provider_base_url(provider)
+        if not resolved_base_url:
+            return None
+        fetched = fetch_api_models(None, resolved_base_url)
+        if fetched is None:
+            return None
+        live_catalog = [str(model_id or "").strip() for model_id in fetched]
 
     seen: set[str] = set()
     deduped: list[str] = []
-    for model_id in catalog:
+    for model_id in live_catalog:
         text = str(model_id or "").strip()
         if text and text not in seen:
             deduped.append(text)
@@ -137,8 +235,9 @@ def unserved_model_diagnosis(
     """Explain why a cron model pin is unservable, or ``None`` when the check cannot decide.
 
     The guard is intentionally fail-open: blank inputs, custom/self-hosted endpoints, validator
-    errors, and catalog fetch failures all return ``None`` so scheduled work keeps running unless
-    Hermes has positive proof that the slug is absent from the provider's own catalog.
+    errors, unreachable catalogs, and missing catalog endpoints all return ``None`` so scheduled
+    work keeps running unless Hermes has positive proof that the slug is absent from the provider's
+    own catalog.
     """
     del cfg  # reserved for future provider-specific context; signature is part of the public API
     if not _guard_enabled():
@@ -151,13 +250,25 @@ def unserved_model_diagnosis(
     if _is_self_hosted_provider(normalized_provider) or normalized_provider.startswith("custom:"):
         return None
 
-    base_url = _provider_base_url(normalized_provider) or None
+    base_url = _provider_base_url(normalized_provider)
+    if not base_url:
+        _warn_missing_catalog_endpoint(normalized_provider, requested_model)
+        return None
+
+    memo_key = (normalized_provider, base_url, requested_model)
+    cached_verdict = _memo_get(_verdict_memo, memo_key)
+    if cached_verdict is not None:
+        return cached_verdict.diagnosis
+
+    catalog_ready, warmed_catalog = _warm_provider_catalog(normalized_provider, base_url=base_url)
+    if not catalog_ready:
+        return None
 
     try:
         verdict = validate_requested_model(
             requested_model,
             normalized_provider,
-            base_url=base_url or None,
+            base_url=base_url,
         )
     except Exception:
         logger.warning(
@@ -168,6 +279,7 @@ def unserved_model_diagnosis(
         )
         return None
     if verdict.get("accepted"):
+        _memo_put(_verdict_memo, memo_key, _GuardVerdict(accepted=True, diagnosis=None), _VERDICT_ACCEPT_TTL)
         return None
 
     label = provider_label(normalized_provider)
@@ -184,6 +296,7 @@ def unserved_model_diagnosis(
             requested_model,
             normalized_provider,
             base_url=base_url,
+            catalog=warmed_catalog,
         )
     except Exception:
         logger.debug(
@@ -215,7 +328,9 @@ def unserved_model_diagnosis(
         "Operator action: re-pin the job to a serving slug with "
         f"`hermes cron edit {edit_job_id} --model <slug>`, or unpin it with `--pinned false`."
     )
-    return "\n".join(lines)
+    diagnosis = "\n".join(lines)
+    _memo_put(_verdict_memo, memo_key, _GuardVerdict(accepted=False, diagnosis=diagnosis), _VERDICT_REJECT_TTL)
+    return diagnosis
 
 
 def guard_dispatch(

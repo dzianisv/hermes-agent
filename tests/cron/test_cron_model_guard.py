@@ -14,7 +14,38 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from cron import scheduler
-from cron.model_guard import guard_dispatch, unserved_model_diagnosis
+from cron.model_guard import _provider_base_url, guard_dispatch, unserved_model_diagnosis
+
+
+@pytest.fixture(autouse=True)
+def _enable_cron_model_guard(monkeypatch: pytest.MonkeyPatch):
+    """Exercise the real guard in this module even though tests/cron disables it by default."""
+    import cron.model_guard as model_guard
+
+    monkeypatch.setenv("HERMES_CRON_MODEL_GUARD", "on")
+    monkeypatch.setattr(
+        model_guard,
+        "get_provider",
+        lambda provider, **_kwargs: (
+            SimpleNamespace(base_url="https://openrouter.ai/api/v1")
+            if str(provider or "").strip()
+            else None
+        ),
+    )
+    monkeypatch.setattr(
+        model_guard,
+        "fetch_api_models",
+        lambda *_args, **_kwargs: [
+            "test-cron-default-model",
+            "main-model",
+            "good-model",
+            "minimax/minimax-m3.1-flash",
+        ],
+    )
+    model_guard._catalog_memo.clear()
+    model_guard._verdict_memo.clear()
+    model_guard._missing_endpoint_warnings.clear()
+    yield
 
 
 class _JsonResponse:
@@ -162,6 +193,51 @@ def test_unserved_model_diagnosis_passes_provider_base_url_to_validator(monkeypa
     assert "Model was absent from the live catalog." in diagnosis
 
 
+def test_provider_base_url_falls_back_to_provider_profile_when_models_dev_cache_is_cold(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    # Regression: a fresh HERMES_HOME can miss the models.dev cache, so the guard must fall back
+    # to the static provider profile and still recover the canonical endpoint.
+    monkeypatch.setattr("cron.model_guard.get_provider", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        "cron.model_guard.get_provider_profile",
+        lambda *_args, **_kwargs: SimpleNamespace(base_url="https://openrouter.ai/api/v1"),
+    )
+
+    assert _provider_base_url("openrouter") == "https://openrouter.ai/api/v1"
+
+
+def test_missing_catalog_endpoint_warns_once_and_fails_open(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+):
+    # Regression: if neither models.dev nor the static provider profile can resolve an endpoint,
+    # the guard must fail open loudly once instead of silently degrading to a no-op.
+    called = False
+
+    def _validator(*_args, **_kwargs):
+        nonlocal called
+        called = True
+        return {"accepted": False, "persist": False, "recognized": True, "message": "boom"}
+
+    monkeypatch.setattr("cron.model_guard.get_provider", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("cron.model_guard.get_provider_profile", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("cron.model_guard.validate_requested_model", _validator)
+    _patch_openrouter_probe(monkeypatch)
+
+    with caplog.at_level("WARNING"):
+        assert unserved_model_diagnosis("bad-model", "openrouter") is None
+        assert unserved_model_diagnosis("bad-model", "openrouter") is None
+
+    assert called is False
+    warnings = [
+        record.message for record in caplog.records if "live catalog could not be consulted" in record.message
+    ]
+    assert len(warnings) == 1
+    assert "openrouter" in warnings[0]
+    assert "bad-model" in warnings[0]
+
+
 def test_unserved_model_diagnosis_lists_catalog_alternatives_and_key_limit(monkeypatch: pytest.MonkeyPatch):
     # Regression: a retired OpenRouter ``:free`` slug must name a serving sibling and warn that
     # the key cannot reach paid fallbacks when the account limit is $0.00.
@@ -301,6 +377,30 @@ def test_create_and_update_reject_unserved_pins_without_mutating_store(
         jobs.update_job(unpinned["id"], {"pinned": True})
     assert state["jobs"][1]["model"] is None
     assert state["jobs"][1]["provider"] is None
+
+
+def test_guard_skips_validation_when_live_catalog_warmup_fails(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    # Regression: the guard's preflight probe is bounded. If the catalog is unreachable, it must
+    # fail open after the short warm-up instead of letting validate_requested_model do a 5s probe.
+    called = False
+
+    def _validator(*_args, **_kwargs):
+        nonlocal called
+        called = True
+        return {"accepted": False, "persist": False, "recognized": True, "message": "boom"}
+
+    monkeypatch.setattr(
+        "cron.model_guard.get_provider",
+        lambda *_args, **_kwargs: SimpleNamespace(base_url="https://openrouter.ai/api/v1"),
+    )
+    monkeypatch.setattr("cron.model_guard.fetch_api_models", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("cron.model_guard.validate_requested_model", _validator)
+    _patch_openrouter_probe(monkeypatch)
+
+    assert unserved_model_diagnosis("bad-model", "openrouter") is None
+    assert called is False
 
 
 def test_guard_fail_open_on_validator_error_allows_job_to_proceed(
