@@ -129,8 +129,22 @@ def _resolve_budget_fallback(
         api_call_count >= agent.max_iterations or agent.iteration_budget.remaining <= 0
     )
     preserved_verification_fallback = False
+    # At the API-call ceiling the loop can hand the finalizer a falsy-but-not-None answer:
+    # an empty content step (``""``) or whitespace. Gating on ``final_response is None``
+    # therefore skipped the one bounded toolless summary request and let the blank answer
+    # fall through to the ``pending_tool_result`` close below — ``failed=True`` and the
+    # "No reply: ..." text, so cron's ``_final_response_from_result`` raised and the whole
+    # cycle's findings were lost (#37666734c66a). Treat a blank answer as empty.
+    # Never override an answer the model already produced, though: a real ``final_response``
+    # or text already streamed to the user is #95514's recovery case
+    # (``_recover_final_from_stream``), and spending the last call on a summary would
+    # discard it. Stopping short of the cap keeps the #55316/#54756 close intact.
+    _answer_blank = not flatten_message_text(final_response).strip()
+    _streamed_answer = getattr(agent, "_current_streamed_assistant_text", "") or ""
+    if isinstance(_streamed_answer, str) and _streamed_answer.strip():
+        _answer_blank = False
     if (
-        final_response is None and budget_exhausted and not interrupted and not failed
+        _answer_blank and budget_exhausted and not interrupted and not failed
         and str(_turn_exit_reason) in {"unknown", "budget_exhausted"}
     ):
         _turn_exit_reason = f"max_iterations_reached({api_call_count}/{agent.max_iterations})"
