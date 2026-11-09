@@ -456,9 +456,12 @@ def _finalize_routing(agent, api_mode, credential_pool, api_key=None):
 
     with suppress(Exception):
         from hermes_cli.model_normalize import (
-            _AGGREGATOR_PROVIDERS, normalize_model_for_provider
+            _AGGREGATOR_PROVIDERS, normalize_model_for_provider, strip_openrouter_host_prefix
         )
 
+        # Aggregators skip the per-provider normalizer, but an OpenRouter model id copied in
+        # URL form (``openrouter.ai/vendor/model``) must still lose the host or it 400s.
+        agent.model = strip_openrouter_host_prefix(agent.model, agent.provider)
         if agent.provider not in _AGGREGATOR_PROVIDERS:
             agent.model = normalize_model_for_provider(agent.model, agent.provider)
 

@@ -201,3 +201,55 @@ class TestColonProviderPrefixIsStrippedLikeSlash:
     ])
     def test_non_matching_colon_untouched(self, model, provider):
         assert normalize_model_for_provider(model, provider) == model
+
+
+class TestOpenRouterHostPrefixIsStripped:
+    """Copied URL-style ids (``openrouter.ai/vendor/model``) are not valid OpenRouter model ids
+    and get HTTP 400; the host prefix must be dropped and the slug kept byte-identical."""
+
+    @pytest.mark.parametrize("model", [
+        "openrouter.ai/dots-studio/dots-3-note-preview:free",
+        "https://openrouter.ai/dots-studio/dots-3-note-preview:free",
+        "https://www.openrouter.ai/dots-studio/dots-3-note-preview:free",
+        "http://openrouter.ai/dots-studio/dots-3-note-preview:free",
+    ])
+    def test_host_prefix_stripped_for_openrouter(self, model):
+        assert (
+            normalize_model_for_provider(model, "openrouter")
+            == "dots-studio/dots-3-note-preview:free"
+        )
+
+    def test_plain_slug_untouched(self):
+        assert (
+            normalize_model_for_provider("dots-studio/dots-3-note-preview:free", "openrouter")
+            == "dots-studio/dots-3-note-preview:free"
+        )
+
+    def test_vendor_prefix_is_not_a_host(self):
+        """``openai/gpt-5.4`` is a real aggregator id, not a URL — never strip ``openai/``."""
+        assert normalize_model_for_provider("openai/gpt-5.4", "openrouter") == "openai/gpt-5.4"
+
+    @pytest.mark.parametrize("provider", ["custom", "deepseek", "zai"])
+    def test_non_openrouter_providers_untouched(self, provider):
+        assert (
+            normalize_model_for_provider("openrouter.ai/some-vendor/some-model", provider)
+            == "openrouter.ai/some-vendor/some-model"
+        )
+
+
+    def test_agent_init_strips_host_prefix_for_openrouter(self, tmp_path, monkeypatch):
+        """Production path: OpenRouter is an aggregator and skips the generic normalizer, so
+        ``agent_init`` must still drop the URL-style host before the first API call."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        (tmp_path / ".env").write_text("", encoding="utf-8")
+        (tmp_path / "config.yaml").write_text(
+            "openrouter_free_fallback:\n  enabled: false\n", encoding="utf-8"
+        )
+        from run_agent import AIAgent
+
+        agent = AIAgent(
+            model="openrouter.ai/dots-studio/dots-3-note-preview:free", provider="openrouter",
+            api_key="sk-dummy", base_url="https://openrouter.ai/api/v1",
+            quiet_mode=True, skip_context_files=True, skip_memory=True, platform="cli",
+        )
+        assert agent.model == "dots-studio/dots-3-note-preview:free"

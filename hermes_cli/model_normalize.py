@@ -106,6 +106,23 @@ def _strip_vendor_prefix(model_name: str) -> str:
     return model_name.split("/", 1)[1] if "/" in model_name else model_name
 
 
+# URL-style ids pasted from docs/dashboards: ``openrouter.ai/vendor/model`` and its
+# scheme/www variants. Only the host is dropped; the rest of the slug stays byte-identical.
+_OPENROUTER_HOST_PREFIX = re.compile(r"^(?:https?://)?(?:www\.)?openrouter\.ai/", re.IGNORECASE)
+
+
+def strip_openrouter_host_prefix(model_name: str, provider: str) -> str:
+    """Drop a leading ``openrouter.ai/`` host from an OpenRouter model id, once.
+
+    OpenRouter accepts ``vendor/model``; ``openrouter.ai/vendor/model`` is not a model id
+    and gets HTTP 400. Scoped to the ``openrouter`` provider so a legitimate vendor prefix
+    (``openai/gpt-5.4``) is never mistaken for a host."""
+    name = model_name or ""
+    if not name or _normalize_provider_alias(provider) != "openrouter":
+        return name
+    return _OPENROUTER_HOST_PREFIX.sub("", name, count=1)
+
+
 def _dots_to_hyphens(model_name: str) -> str:
     return model_name.replace(".", "-")
 
@@ -206,6 +223,7 @@ def normalize_model_for_provider(model_input: str, target_provider: str) -> str:
     if not name:
         return name
     provider = _normalize_provider_alias(target_provider)
+    name = strip_openrouter_host_prefix(name, provider)
 
     if provider in _AGGREGATOR_PROVIDERS:
         return _prepend_vendor(name)

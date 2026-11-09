@@ -242,6 +242,11 @@ def prepare_turn(agent):
     """Called only between user requests; reuse the existing runtime swap/restore."""
     if not enabled():
         return
+    # An explicitly chosen primary on another provider (e.g. ``opencode-go``) is not ours to
+    # replace: the free-first policy only owns OpenRouter/Codex primaries.
+    primary = getattr(agent, "_primary_runtime", {}) or {}
+    if (primary.get("provider") or getattr(agent, "provider", "")) not in {"openrouter", "openai-codex"}:
+        return
     from agent.openrouter_free_fallback import fetch_free_openrouter_models
     free = fetch_free_openrouter_models(max_entries=6)
     available = bool(free) and free_available(_key(agent), free)
@@ -251,7 +256,6 @@ def prepare_turn(agent):
     agent._smart_codex_models = {entry["model"] for entry in codex}
     agent._fallback_chain = (free if available else []) + codex
     agent._fallback_index = 0
-    primary = getattr(agent, "_primary_runtime", {}) or {}
     if primary.get("provider") == "openrouter":
         agent._rate_limited_until = 0 if available else float("inf")
     provider, model = getattr(agent, "provider", ""), getattr(agent, "model", "")
