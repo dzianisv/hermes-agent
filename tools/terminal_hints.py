@@ -4,13 +4,20 @@ Extends the exit-code semantics table in ``terminal_tool`` with a bounded scan o
 output mapped to ONE short, actionable recovery hint. Rules: only fires on non-zero exit; first
 match wins, patterns ordered by observed production frequency; scans only the first
 ``_SCAN_CHARS`` so hints key on error headers, not deep context; hints state the *next action*
-in 1-2 sentences; pure function, no I/O or config reads.
+in 1-2 sentences. No I/O or config reads, with one deliberate exception: git's stale-lock signature
+triggers a bounded, fail-open liveness probe (``hermes_cli.gitlock``) because removal may only be
+advised once nothing holds the lock — a pure-text guess cannot carry that safety rule.
 """
 
 from __future__ import annotations
 
+import logging
+import os
 import re
+from pathlib import Path
 from typing import Callable, Optional
+
+logger = logging.getLogger(__name__)
 
 _SCAN_CHARS = 4000
 
@@ -41,6 +48,59 @@ def _missing_command_hint(missing: str) -> str:
     return _MISSING_COMMAND_HINTS.get(missing) or (
         f"`{missing}` is not installed or not on PATH. Verify with `which {missing}`; install it "
         "or use an absolute path instead of retrying the same command.")
+
+
+# A crashed git leaves a lock file behind and the next write fails with a WRITE error that git
+# follows with "fix conflicts" — which reads like a content conflict and sends the operator off to
+# resolve files that do not conflict (2026-10-21: a 0-byte .git/index.lock blocked the reviewed-fix
+# install for hours). Recognized before the conflict rule so the hint names the real cause.
+_STALE_GIT_LOCK = re.compile(
+    r"Unable to write index"
+    r"|Unable to create '[^']*\.lock': File exists"
+    r"|a git process may have crashed in this repository earlier")
+_LOCK_FILE_IN_OUTPUT = re.compile(r"'([^']*\.lock)'")
+_GIT_DASH_C = re.compile(r"\bgit\b\s+-C\s+(?P<dir>\"[^\"]+\"|'[^']+'|[^\s;&|]+)")
+
+_STALE_LOCK_FALLBACK_HINT = (
+    "git failed on a leftover git lock file, not on a conflict: \"Unable to write index\" / "
+    "\"'...lock': File exists\" means a crashed git left the lock behind, even though git adds "
+    "\"fix conflicts\". Do not resolve conflicts — there are none. Prove no live process holds it "
+    "(`lsof <lock path>` and `pgrep -x git`), and remove the lock only when both show nothing; if "
+    "a live git owns it, wait for that process. Then retry.")
+
+
+def _git_repo_from_command(command: str) -> Optional[str]:
+    """The repo a ``git -C <dir>`` command was aimed at, when it names one."""
+    match = _GIT_DASH_C.search(command or "")
+    if not match:
+        return None
+    return match.group("dir").strip("\"'")
+
+
+def _stale_git_lock_hint(command: str, output: str, cwd: Optional[str]) -> Optional[str]:
+    """Diagnose git's stale-lock signature; None when the output is not that failure.
+
+    Fail-open: an unusable repo path or a broken probe falls back to the static advice, which still
+    refuses to call the failure a conflict and still requires a liveness check before removal.
+    """
+    if not _STALE_GIT_LOCK.search(output):
+        return None
+    try:
+        from hermes_cli import gitlock
+
+        named = _LOCK_FILE_IN_OUTPUT.search(output)
+        if named and os.path.isabs(named.group(1)):
+            described = gitlock.describe_lock_file(Path(named.group(1)))
+            if described:
+                return described
+        repo_root = _git_repo_from_command(command) or cwd
+        if repo_root:
+            described = gitlock.describe_repo_lock(Path(repo_root))
+            if described:
+                return described
+    except Exception:
+        logger.debug("stale git lock diagnosis failed", exc_info=True)
+    return _STALE_LOCK_FALLBACK_HINT
 
 
 # Ordered by production frequency — first match wins.
@@ -146,11 +206,17 @@ def annotate_masked_success(command: str, output: str) -> Optional[str]:
     return next((note for rx, note in _MASKING_SHAPES if rx.search(cmd)), None)
 
 
-def annotate_failure(command: str, exit_code: int, output: str) -> Optional[str]:
-    """Return one short recovery hint for a failed command, or None (exit 0)."""
+def annotate_failure(command: str, exit_code: int, output: str, *, cwd: Optional[str] = None) -> Optional[str]:
+    """Return one short recovery hint for a failed command, or None (exit 0).
+
+    ``cwd`` lets the stale-lock rule run its liveness probe against the repo that actually failed;
+    without it that rule still fires, with the static "prove nothing holds it first" advice.
+    """
     if exit_code == 0:
         return None
     window = (output or "")[:_SCAN_CHARS]
+    if window and (stale_lock := _stale_git_lock_hint(command or "", window, cwd)):
+        return stale_lock
     for fn in _OUTPUT_HINTS if window else ():
         try:
             if hint := fn(command or "", window):

@@ -1,14 +1,25 @@
 """Stale git lock-file and aborted-fetch pack-debris recovery for update/check paths.
 
 A killed ``git fetch`` can leave ``.git/shallow.lock`` behind (every later fetch fails with "Unable to
-create '.../shallow.lock': File exists") and ``tmp_pack_*`` files git itself never cleans up."""
+create '.../shallow.lock': File exists") and ``tmp_pack_*`` files git itself never cleans up.
+
+The same class of debris is worse without a sweep: a crashed ``git merge``/``git add`` leaves
+``.git/index.lock`` and git then reports ``error: Unable to write index.`` followed by
+``Automatic merge failed; fix conflicts and then commit the result.`` — wording that reads like a
+content conflict and sends the operator off to resolve files that do not conflict (2026-10-21: the
+live runtime checkout was write-blocked for ~6.5 hours by a 0-byte lock). ``describe_repo_lock``
+names the dead lock, its age and the liveness check that cleared it; every removal path is gated on
+a live-holder probe of the exact file.
+"""
 
 from __future__ import annotations
 
 import logging
 import os
+import shutil
 import subprocess
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable, List, Optional
 
@@ -45,6 +56,32 @@ def _git_proc_running() -> bool:
         return False
 
 
+def _open_holders(paths: List[Path]) -> dict[Path, tuple[int, ...]]:
+    """PIDs holding any of ``paths`` open (one /proc pass); {} when no /proc fd view exists.
+
+    Removals are gated on this exact-file probe, not only on the process-name guess: a git that has
+    the inode open is live even when ``pgrep -x git`` raced and found nothing.
+    """
+    targets = {os.path.realpath(p): p for p in paths}
+    proc = Path("/proc")
+    if not targets or not (proc / "self" / "fd").is_dir():
+        return {}
+    found: dict[Path, set[int]] = {}
+    for fd_dir in proc.glob("[0-9]*/fd"):
+        try:
+            pid = int(fd_dir.parent.name)
+            for entry in os.scandir(fd_dir):
+                try:
+                    target = targets.get(os.readlink(entry.path))
+                except OSError:
+                    continue
+                if target is not None:
+                    found.setdefault(target, set()).add(pid)
+        except OSError:
+            continue
+    return {path: tuple(sorted(pids)) for path, pids in found.items()}
+
+
 def _sweep_stale(directory: Path, candidates: Callable[[], Iterable[Path]], *, min_age_seconds: Optional[int],
                  default_age: int, skip_msg: str, log_removed: Callable[[Path, int], None]) -> List[str]:
     """Shared guard + age-floor sweep. Never raises; skips anything it cannot stat/unlink."""
@@ -54,21 +91,32 @@ def _sweep_stale(directory: Path, candidates: Callable[[], Iterable[Path]], *, m
         logger.debug(skip_msg)
         return []
     cutoff = time.time() - (min_age_seconds if min_age_seconds is not None else default_age)
-    removed: List[str] = []
+    eligible: List[tuple[Path, os.stat_result]] = []
     for entry in candidates():
         try:
             if entry.is_file() and (st := entry.stat()).st_mtime < cutoff:
-                if os.name == "nt":
-                    # git renames its transfer temps into place read-only; Windows refuses to
-                    # unlink a read-only file (EACCES/13), so without clearing the write bit
-                    # this sweep silently removes nothing on real debris (#116384).
-                    try:
-                        os.chmod(entry, 0o666)
-                    except OSError:
-                        pass
-                entry.unlink()
-                removed.append(str(entry))
-                log_removed(entry, st.st_size)
+                eligible.append((entry, st))
+        except OSError:
+            continue
+    holders = _open_holders([entry for entry, _st in eligible])
+    removed: List[str] = []
+    for entry, st in eligible:
+        if holders.get(entry):
+            logger.warning("Skipping %s: still held open by PID(s) %s",
+                           entry, ", ".join(map(str, holders[entry])))
+            continue
+        try:
+            if os.name == "nt":
+                # git renames its transfer temps into place read-only; Windows refuses to
+                # unlink a read-only file (EACCES/13), so without clearing the write bit
+                # this sweep silently removes nothing on real debris (#116384).
+                try:
+                    os.chmod(entry, 0o666)
+                except OSError:
+                    pass
+            entry.unlink()
+            removed.append(str(entry))
+            log_removed(entry, st.st_size)
         except OSError as exc:
             # A cleaner that fails silently is worse than none: debug-level skips hid the
             # Windows read-only unlink failure for months while debris grew to gigabytes.
@@ -111,6 +159,190 @@ def clear_stale_tmp_packs(repo_root: Path, *, min_age_seconds: Optional[int] = N
         skip_msg="git process running; skipping tmp-pack sweep",
         log_removed=lambda p, size: logger.info("Removed aborted-fetch pack debris %s (%d bytes)", p, size),
     )
+
+
+# ---- stale-lock diagnosis (name the dead lock; never call it a conflict) ----
+
+# git's wording when a leftover lock blocks a write is a WRITE failure, but it is followed by
+# "Automatic merge failed; fix conflicts and then commit the result." — which reads like a content
+# conflict. The lock names worth diagnosing, in the order the incident produced them.
+DIAGNOSABLE_LOCK_NAMES = ("index.lock", "MERGE_HEAD.lock", "HEAD.lock", "shallow.lock", "gc.log.lock")
+
+
+@dataclass(frozen=True)
+class LockReport:
+    """What the liveness probes found for one existing lock file."""
+
+    path: Path
+    age_seconds: float
+    size: int
+    holder_pids: tuple[int, ...] = ()   # processes that have the lock file open
+    git_pids: tuple[int, ...] = ()      # live `git` processes (machine-wide)
+    checks: tuple[str, ...] = ()        # the probes that actually ran, with their verdict
+    probe_available: bool = False       # some probe could see a holder on this platform
+
+    @property
+    def held(self) -> bool:
+        return bool(self.holder_pids)
+
+
+def _format_age(seconds: float) -> str:
+    total = max(0, int(seconds))
+    if total < 60:
+        return f"{total}s"
+    if total < 3600:
+        return f"{total // 60}m {total % 60}s"
+    if total < 86400:
+        return f"{total // 3600}h {(total % 3600) // 60}m"
+    return f"{total // 86400}d {(total % 86400) // 3600}h"
+
+
+def _pids_from_probe(args: List[str], *, accept_codes: tuple[int, ...]) -> Optional[tuple[int, ...]]:
+    """PIDs printed by a probe (one per line); None when the probe could not run."""
+    try:
+        proc = subprocess.run(args, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                              timeout=10)
+    except Exception:
+        return None
+    if proc.returncode not in accept_codes:
+        return None
+    return tuple(sorted({int(tok) for tok in proc.stdout.split() if tok.isdigit()}))
+
+
+def _proc_fd_holders(target: Path) -> Optional[tuple[int, ...]]:
+    """PIDs holding ``target`` open, or None when this platform has no /proc fd view (macOS, Windows).
+
+    This is the check that matters for the safety rule: a ``git`` between closing its lock and
+    renaming it into place holds the fd even though it is not visible as a separate process name.
+    """
+    proc = Path("/proc")
+    if not (proc / "self" / "fd").is_dir():
+        return None
+    real = os.path.realpath(target)
+    holders: set[int] = set()
+    for fd_dir in proc.glob("[0-9]*/fd"):
+        try:
+            for entry in os.scandir(fd_dir):
+                try:
+                    if os.readlink(entry.path) == real:
+                        holders.add(int(fd_dir.parent.name))
+                        break
+                except OSError:
+                    continue
+        except OSError:
+            continue
+    return tuple(sorted(holders))
+
+
+def _lsof_holders(target: Path) -> Optional[tuple[int, ...]]:
+    """``lsof -t`` PIDs holding ``target``; None when lsof is not installed."""
+    exe = shutil.which("lsof")
+    if not exe:
+        return None
+    return _pids_from_probe([exe, "-t", str(target)], accept_codes=(0, 1))
+
+
+def _git_pids() -> tuple[int, ...]:
+    """Live ``git`` PIDs. Machine-wide by nature: pgrep cannot say which repo a git works on."""
+    if os.name == "nt":
+        pids = _pids_from_probe(["tasklist", "/FI", "IMAGENAME eq git.exe", "/FO", "CSV"], accept_codes=(0,))
+        return pids or ()
+    return _pids_from_probe(["pgrep", "-x", "git"], accept_codes=(0, 1)) or ()
+
+
+def inspect_lock_file(lock_path: Path) -> Optional[LockReport]:
+    """Probe one existing lock file; None when it does not exist. Never raises."""
+    try:
+        st = Path(lock_path).stat()
+    except OSError:
+        return None
+    checks: List[str] = []
+    holders: set[int] = set()
+    probe_available = False
+    fd_holders = _proc_fd_holders(lock_path)
+    if fd_holders is None:
+        checks.append("/proc/*/fd open-fd scan: unavailable on this platform")
+    else:
+        probe_available = True
+        holders.update(fd_holders)
+        checks.append("/proc/*/fd open-fd scan: " + (
+            "held by PID(s) " + ", ".join(map(str, fd_holders)) if fd_holders else "no holder"))
+    lsof_holders = _lsof_holders(lock_path)
+    if lsof_holders is None:
+        checks.append("lsof: unavailable")
+    else:
+        probe_available = True
+        holders.update(lsof_holders)
+        checks.append("lsof: " + (
+            "held by PID(s) " + ", ".join(map(str, lsof_holders)) if lsof_holders else "no holder"))
+    git_pids = _git_pids()
+    checks.append("pgrep -x git: " + (
+        "running as PID(s) " + ", ".join(map(str, git_pids)) if git_pids else "no git process"))
+    return LockReport(
+        path=Path(lock_path), age_seconds=max(0.0, time.time() - st.st_mtime), size=st.st_size,
+        holder_pids=tuple(sorted(holders)), git_pids=git_pids, checks=tuple(checks),
+        probe_available=probe_available,
+    )
+
+
+def format_lock_report(report: LockReport) -> str:
+    """One operator-facing paragraph: what the lock is, whether it is safe to remove, and why."""
+    where = str(report.path)
+    label = report.path.name
+    age = _format_age(report.age_seconds)
+    checks = "; ".join(report.checks)
+    if report.held:
+        return (f"{label} (age {age}, {report.size} bytes) at {where} is HELD by live PID(s) "
+                f"{', '.join(map(str, report.holder_pids))} — {checks}. Do NOT remove it: wait for that "
+                f"process to finish. This is not a conflict.")
+    if report.git_pids:
+        return (f"{label} (age {age}, {report.size} bytes) at {where} is not held open by any process, "
+                f"but live git process(es) {', '.join(map(str, report.git_pids))} are running — {checks}. "
+                f"If those are not working on this repo the lock is stale: confirm with `lsof {where}` "
+                f"showing no holder, then `rm {where}`. There is no conflict to resolve.")
+    if not report.probe_available:
+        return (f"{label} (age {age}, {report.size} bytes) at {where} exists — {checks}. No liveness "
+                f"probe is available here, so confirm by hand (`lsof {where}` or the platform "
+                f"equivalent) before removing it: git reported a write failure, not a conflict.")
+    return (f"stale {label} (age {age}, {report.size} bytes) at {where} — owner PID is gone: no live "
+            f"process holds it and no git process is running ({checks}). git's \"fix conflicts\" line is "
+            f"misleading; this lock, not a conflict, blocked the write. Safe to remove: rm {where}, then "
+            f"retry. If git also refuses to abort because .git/MERGE_HEAD is left over, remove that file too.")
+
+
+def describe_lock_file(lock_path: Path) -> Optional[str]:
+    """Message for one lock path; None when it does not exist."""
+    report = inspect_lock_file(lock_path)
+    return format_lock_report(report) if report is not None else None
+
+
+def _resolve_git_dir(repo_root: Path) -> Optional[Path]:
+    """The repo's git dir via git (handles worktrees and ``.git`` files), else ``<repo>/.git``."""
+    try:
+        proc = subprocess.run(["git", "rev-parse", "--absolute-git-dir"], cwd=str(repo_root),
+                              capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10)
+        if proc.returncode == 0 and proc.stdout.strip():
+            return Path(proc.stdout.strip())
+    except Exception:
+        logger.debug("git dir probe failed for %s", repo_root, exc_info=True)
+    fallback = Path(repo_root) / ".git"
+    return fallback if fallback.is_dir() else None
+
+
+def describe_repo_lock(repo_root: Path, *, names: Iterable[str] = DIAGNOSABLE_LOCK_NAMES) -> Optional[str]:
+    """Message naming the first leftover lock in ``repo_root``; None when there is none.
+
+    Used by the terminal failure hint so a blocked ``git merge`` reports the dead lock instead of
+    sending the reader to resolve conflicts that do not exist.
+    """
+    git_dir = _resolve_git_dir(Path(repo_root))
+    if git_dir is None:
+        return None
+    for name in names:
+        described = describe_lock_file(git_dir / name)
+        if described:
+            return described
+    return None
 
 
 # ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----

@@ -27,6 +27,8 @@ from hermes_cli.gitlock import (
     LOCK_NAMES,
     STALE_LOCK_MIN_AGE_SECONDS,
     clear_stale_git_locks,
+    describe_lock_file,
+    describe_repo_lock,
 )
 
 
@@ -113,3 +115,72 @@ def test_clear_noop_on_non_repo(tmp_path: Path) -> None:
 
 def test_clear_noop_with_no_locks(repo: Path) -> None:
     assert clear_stale_git_locks(repo) == []
+
+
+def test_describe_repo_lock_is_silent_on_a_clean_repo(repo: Path) -> None:
+    assert describe_repo_lock(repo) is None
+
+
+def test_describe_repo_lock_names_the_dead_lock_with_age_and_probes(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The incident's lock was 0 bytes and ~6.5 hours old with no holder."""
+    import hermes_cli.gitlock as gitlock
+
+    monkeypatch.setattr(gitlock, "_git_pids", lambda: ())
+    _touch(repo / ".git" / "index.lock", 6 * 3600 + 31 * 60)
+
+    message = describe_repo_lock(repo)
+
+    assert message is not None
+    assert "stale index.lock" in message
+    assert "6h 31m" in message
+    assert "no live process holds it" in message
+    assert "Safe to remove" in message
+    assert str(repo / ".git" / "index.lock") in message
+    assert "lsof" in message and "pgrep -x git" in message
+
+
+def test_describe_lock_file_never_claims_safety_without_a_probe(repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """No /proc fd view and no lsof: the report must send the reader to check by hand."""
+    import hermes_cli.gitlock as gitlock
+
+    monkeypatch.setattr(gitlock, "_proc_fd_holders", lambda _path: None)
+    monkeypatch.setattr(gitlock, "_lsof_holders", lambda _path: None)
+    monkeypatch.setattr(gitlock, "_git_pids", lambda: ())
+    lock = repo / ".git" / "index.lock"
+    lock.touch()
+
+    message = describe_lock_file(lock)
+
+    assert message is not None
+    assert "No liveness probe is available" in message
+    assert "Safe to remove" not in message
+
+
+@pytest.mark.platforms("linux")
+def test_clear_refuses_a_lock_a_live_process_holds_open(repo: Path, no_git_running: None) -> None:
+    """The sweep may not remove a lock whose inode a live process still has open."""
+    import subprocess as sp
+    import sys as _sys
+
+    import hermes_cli.gitlock as gitlock
+
+    lock = repo / ".git" / "index.lock"
+    _touch(lock, STALE_LOCK_MIN_AGE_SECONDS + 60)
+    holder = sp.Popen(
+        [_sys.executable, "-c", "import sys, time; f = open(sys.argv[1], 'rb'); time.sleep(60)", str(lock)],
+    )
+    try:
+        deadline = time.time() + 10
+        while time.time() < deadline and not gitlock._proc_fd_holders(lock):
+            time.sleep(0.05)
+        if not gitlock._proc_fd_holders(lock):
+            pytest.skip("no /proc fd visibility on this host")
+
+        assert clear_stale_git_locks(repo) == []
+        assert lock.exists()
+    finally:
+        holder.kill()
+        holder.wait(timeout=10)
+

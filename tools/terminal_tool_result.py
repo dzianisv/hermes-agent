@@ -154,7 +154,8 @@ def _truncate_head_tail(output: str) -> str:
     return truncate_head_tail(output, get_max_bytes())
 
 
-def _failure_hint(command: str, returncode: int, output: str, exit_note) -> Optional[str]:
+def _failure_hint(command: str, returncode: int, output: str, exit_note,
+                  cwd: Optional[str] = None) -> Optional[str]:
     """Recovery hints for well-known failure shapes (tools/terminal_hints.py);
     on rc=0, warn when a pipeline tail / `|| echo` may mask an upstream
     failure and the output carries strong failure indicators (advisory only)."""
@@ -163,7 +164,7 @@ def _failure_hint(command: str, returncode: int, output: str, exit_note) -> Opti
         if returncode == 0:
             return terminal_hints.annotate_masked_success(command, output)
         if not exit_note:
-            return terminal_hints.annotate_failure(command, returncode, output)
+            return terminal_hints.annotate_failure(command, returncode, output, cwd=cwd)
     return None
 
 
@@ -242,7 +243,8 @@ def finalize_foreground_result(
     output = redact_terminal_output(output.strip(), command) if output else ""
 
     exit_note = _interpret_exit_code(command, returncode)
-    failure_hint = _failure_hint(command, returncode, output, exit_note)
+    failure_hint = _failure_hint(command, returncode, output, exit_note,
+                                cwd=str(observed_cwd or command_cwd or "") or None)
     # cwd echo when the command changed directory (gated on the observation
     # flag so an interrupted command can't echo another session's cwd).
     changed_cwd = None
