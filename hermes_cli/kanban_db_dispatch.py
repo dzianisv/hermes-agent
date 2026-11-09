@@ -84,6 +84,25 @@ _RESPAWN_BLOCKER_RE = re.compile(
 # failures, so the task-scoped text they inherit is stale.
 _BLOCKER_DIAGNOSTIC_OUTCOMES = frozenset({"timed_out", "spawn_failed", "gave_up"})
 
+# A workspace fault is a HOST condition, never a credential one. The claim path
+# prefixes every workspace-resolution failure with ``workspace:`` (relative or
+# missing dir, unwritable path, repo root that is not a git tree); the OS EACCES
+# and not-a-git-repo phrasings below also occur inside those messages and in
+# rows recorded before the prefix existed. "permission denied" alone is an auth
+# signal; these are not.
+_WORKSPACE_FAULT_RE = re.compile(
+    r"^\s*workspace:"
+    r"|not inside a git repo"
+    r"|not a git (?:repository|repo|work ?tree)"
+    r"|\[Errno 13\] Permission denied",
+    re.IGNORECASE,
+)
+
+
+def is_workspace_fault(error: object) -> bool:
+    """True when ``error`` describes the card's workspace/host path, not a provider."""
+    return bool(_WORKSPACE_FAULT_RE.search(_kb._lossy_text(error) or ""))
+
 # Within this window a completed run counts as "recent proof"; don't re-spawn.
 _RESPAWN_GUARD_SUCCESS_WINDOW = 3600  # 1 hour
 
@@ -2194,10 +2213,10 @@ def _record_task_failure(
     unconditionally (caller applied its own bounded-retry policy).
 
     ``infrastructure=True``: the host refused the spawn (no restart-safe scope,
-    #114720) — nothing about the card ran, so the run and event are recorded
-    with ``infrastructure: true`` but ``consecutive_failures`` is left alone and
-    the breaker never trips; the card stays retryable and
-    :func:`check_respawn_guard` spaces the retries.
+    #114720) or the workspace resolution failed — nothing about the card ran,
+    so the run and event are recorded with ``infrastructure: true`` but
+    ``consecutive_failures`` is left alone and the breaker never trips; the card
+    stays retryable and :func:`check_respawn_guard` spaces the retries.
     """
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
@@ -2352,7 +2371,8 @@ def check_respawn_guard(
 
     Called per ready/review row before any claim attempt. Priority order:
     ``"infrastructure_cooldown"`` (latest run is a ``spawn_failed`` the host
-    refused — no restart-safe scope — within the cooldown; never counted),
+    refused — no restart-safe scope or a workspace fault — within the cooldown;
+    never counted),
     ``"rate_limit_cooldown"`` (latest run ``rate_limited`` within the cooldown;
     checked BEFORE ``blocker_auth`` because the requeue stamps a quota-flavored
     ``last_failure_error`` that would otherwise park the task forever — that
@@ -2426,6 +2446,17 @@ def check_respawn_guard(
         and (latest_run is None or latest_outcome in _BLOCKER_DIAGNOSTIC_OUTCOMES)
         and _RESPAWN_BLOCKER_RE.search(err)
     ):
+        # A workspace fault matches the auth regex ("permission denied") but is a
+        # host condition: retry it spaced, never count it as auth (t_a5455cf4).
+        if is_workspace_fault(err):
+            if (
+                rl_cooldown > 0
+                and latest_run is not None
+                and latest_run["ended_at"] is not None
+                and (now - int(latest_run["ended_at"])) < rl_cooldown
+            ):
+                return "infrastructure_cooldown"
+            return None
         return "blocker_auth"
 
     # Review-lane spawns stop here: a recent completed run and a fresh PR URL
@@ -3290,6 +3321,7 @@ def _dispatch_lane_task(
         if _record_task_failure(
             conn, claimed.id, f"workspace: {exc}",
             outcome="spawn_failed", failure_limit=failure_limit, release_claim=True, end_run=True,
+            infrastructure=True,
         ):
             result.auto_blocked.append(claimed.id)
         return False

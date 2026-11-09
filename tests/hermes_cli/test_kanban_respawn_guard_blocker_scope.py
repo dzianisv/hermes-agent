@@ -688,3 +688,115 @@ def test_recorder_flags_a_new_outcome(kanban_home):
         with kb.write_txn(conn):
             kb._end_run(conn, tid, outcome="brand_new_outcome", status="brand_new_outcome")
         assert unclassified(_seen(conn)) == {"brand_new_outcome"}
+
+
+# -----------------------------------------------------------------------------
+# A6-A8: Workspace fault handling (t_a5455cf4)
+# -----------------------------------------------------------------------------
+
+# Exact measured shape from the defect report
+WORKSPACE_EACCES_ERROR = "workspace: [Errno 13] Permission denied: '/root/x'"
+
+
+def test_workspace_fault_never_parked_as_auth(kanban_home, all_assignees_spawnable, monkeypatch):
+    """A workspace EACCES error must NOT be classified as blocker_auth."""
+    monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "0")
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="workspace fault", assignee="worker")
+        # End a spawn_failed run with workspace fault error (no infrastructure flag in metadata)
+        with kb.write_txn(conn):
+            kb._end_run(
+                conn, tid,
+                outcome="spawn_failed",
+                status="spawn_failed",
+                error=WORKSPACE_EACCES_ERROR,
+                metadata={},
+            )
+            conn.execute(
+                "UPDATE tasks SET status = 'ready', last_failure_error = ? WHERE id = ?",
+                (WORKSPACE_EACCES_ERROR, tid),
+            )
+
+        # The guard must NOT return blocker_auth
+        guard_reason = kbd.check_respawn_guard(conn, tid)
+        assert guard_reason != "blocker_auth"
+        # It should be None (ready to spawn) or infrastructure_cooldown
+        assert guard_reason in (None, "infrastructure_cooldown")
+
+        # Drive dispatch_once and verify the card spawns
+        spawned: list[str] = []
+
+        def _spawn(task, workspace, board=None):
+            spawned.append(task.id)
+            return 42
+
+        # With cooldown=0, the card should spawn
+        result = kbd.dispatch_once(conn, spawn_fn=_spawn)
+        assert tid in spawned
+        # No blocker_auth event should be recorded
+        auth_events = conn.execute(
+            "SELECT count(*) FROM task_events WHERE task_id = ? AND kind = 'respawn_guarded' AND payload LIKE '%blocker_auth%'",
+            (tid,),
+        ).fetchone()[0]
+        assert auth_events == 0
+
+
+def test_auth_failure_still_parked(kanban_home, monkeypatch):
+    """A genuine auth failure must still be classified as blocker_auth."""
+    monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "0")
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="auth failure", assignee="worker")
+        # End a spawn_failed run with genuine auth error
+        auth_error = "auth: invalid api key"
+        with kb.write_txn(conn):
+            kb._end_run(
+                conn, tid,
+                outcome="spawn_failed",
+                status="spawn_failed",
+                error=auth_error,
+                metadata={},
+            )
+            conn.execute(
+                "UPDATE tasks SET status = 'ready', last_failure_error = ? WHERE id = ?",
+                (auth_error, tid),
+            )
+
+        # The guard MUST return blocker_auth
+        guard_reason = kbd.check_respawn_guard(conn, tid)
+        assert guard_reason == "blocker_auth"
+
+
+def test_workspace_resolution_sets_infrastructure_and_no_failure_increment(kanban_home, all_assignees_spawnable, monkeypatch):
+    """Workspace resolution failures set infrastructure=true and don't increment consecutive_failures."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(
+            conn, title="workspace fail",
+            assignee="worker", max_retries=2,
+            workspace_kind="worktree", workspace_path="rel/path",  # Relative path triggers workspace error
+        )
+        # Record consecutive_failures baseline
+        base_failures = conn.execute(
+            "SELECT consecutive_failures FROM tasks WHERE id = ?", (tid,)
+        ).fetchone()[0]
+
+        # Drive dispatch - workspace resolution will fail
+        spawned: list[str] = []
+        result = kbd.dispatch_once(conn, spawn_fn=lambda task, ws, board=None: spawned.append(task.id))
+        assert tid not in spawned  # Should not have spawned due to workspace error
+
+        # Find the run that was created
+        run_row = conn.execute(
+            "SELECT metadata FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1", (tid,)
+        ).fetchone()
+        assert run_row is not None
+        import json
+        metadata = json.loads(run_row["metadata"] or "{}")
+
+        # The run metadata must have infrastructure: true
+        assert metadata.get("infrastructure") is True, f"Expected infrastructure=true, got {metadata}"
+
+        # consecutive_failures must NOT have been incremented
+        current_failures = conn.execute(
+            "SELECT consecutive_failures FROM tasks WHERE id = ?", (tid,)
+        ).fetchone()[0]
+        assert current_failures == base_failures, f"consecutive_failures should stay at {base_failures}, got {current_failures}"
