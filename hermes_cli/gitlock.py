@@ -47,14 +47,19 @@ def _proc_cwd(pid: int) -> Optional[str]:
     pid and the conservative ``cwd is None`` branch in :func:`_git_pids_working_in` was
     unreachable. That made every pid — including a live git working in the repo — classify as
     "not our writer", and the lock sweep then unlinked a lock a running git held open.
+
+    A ``" (deleted)"`` target is returned verbatim, NOT reported as unknown: ``git
+    credential-cache--daemon`` lives for days inside a credential directory it has already
+    removed, and mapping that to ``None`` made it "possibly working in EVERY repo" — the sweep
+    and the "safe to remove" report went permanently inert on such a host. The raw target cannot
+    equal or prefix a live repo root, so the daemon is correctly excluded; on a host without
+    /proc ``readlink`` raises and the conservative ``None`` branch still holds, and the exact
+    open-fd probe on the lock file remains the authority on a live holder.
     """
     try:
-        target = os.readlink(f"/proc/{pid}/cwd")
+        return os.readlink(f"/proc/{pid}/cwd")
     except OSError:
         return None
-    # A deleted cwd cannot be matched against a repo root; report it as unknown so callers stay
-    # conservative rather than treating the pid as "working somewhere else".
-    return None if target.endswith(" (deleted)") else target
 
 
 def _proc_fd_scan_available() -> bool:
@@ -384,6 +389,19 @@ def inspect_lock_file(lock_path: Path, *, repo_root: Optional[Path] = None) -> O
     )
 
 
+def _holder_confirm_hint(where: str) -> str:
+    """How to confirm by hand that nothing holds ``where`` open, on this platform.
+
+    The "live git process(es) are running" branch is reachable on Windows (every process cwd is
+    unknown there), where ``lsof`` does not exist — naming only ``lsof`` sent the reader at a
+    command the platform cannot run.
+    """
+    if os.name == "nt":
+        return (f"an open-file check showing no holder (e.g. Sysinternals `handle {where}`, or "
+                f"Resource Monitor's associated-handles search)")
+    return f"`lsof {where}` showing no holder"
+
+
 def format_lock_report(report: LockReport) -> str:
     """One operator-facing paragraph: what the lock is, whether it is safe to remove, and why."""
     where = str(report.path)
@@ -397,12 +415,12 @@ def format_lock_report(report: LockReport) -> str:
     if report.git_pids:
         return (f"{label} (age {age}, {report.size} bytes) at {where} is not held open by any process, "
                 f"but live git process(es) {', '.join(map(str, report.git_pids))} are running — {checks}. "
-                f"If those are not working on this repo the lock is stale: confirm with `lsof {where}` "
-                f"showing no holder, then `rm {where}`. There is no conflict to resolve.")
+                f"If those are not working on this repo the lock is stale: confirm with "
+                f"{_holder_confirm_hint(where)}, then `rm {where}`. There is no conflict to resolve.")
     if not report.probe_available:
         return (f"{label} (age {age}, {report.size} bytes) at {where} exists — {checks}. No liveness "
-                f"probe is available here, so confirm by hand (`lsof {where}` or the platform "
-                f"equivalent) before removing it: git reported a write failure, not a conflict.")
+                f"probe is available here, so confirm by hand ({_holder_confirm_hint(where)}) before "
+                f"removing it: git reported a write failure, not a conflict.")
     return (f"stale {label} (age {age}, {report.size} bytes) at {where} — owner PID is gone: no live "
             f"process holds it and no git process is running ({checks}). git's \"fix conflicts\" line is "
             f"misleading; this lock, not a conflict, blocked the write. Safe to remove: rm {where}, then "
