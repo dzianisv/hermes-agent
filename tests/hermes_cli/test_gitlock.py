@@ -220,8 +220,17 @@ def test_proc_cwd_is_none_for_a_pid_the_kernel_cannot_resolve() -> None:
 
 
 @pytest.mark.platforms("linux")
-def test_proc_cwd_reports_a_deleted_cwd_as_unknown(tmp_path: Path) -> None:
-    """A cwd the kernel marks "(deleted)" must read as unknown, not as some other directory."""
+def test_deleted_cwd_git_process_does_not_gate_the_sweep(
+    repo: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A git whose cwd was deleted must not disable the sweep for every repo (F3).
+
+    ``git credential-cache--daemon`` lives for days inside a credential directory it has already
+    removed. Mapping that cwd to "unknown" made ``_git_pids_working_in`` count the daemon as a
+    possible writer of EVERY repo, so the sweep returned [] and the report could never reach
+    "Safe to remove" on the host that filed the incident. The exact open-fd probe on the lock
+    file is what carries liveness on this platform.
+    """
     import hermes_cli.gitlock as gitlock
 
     gone = tmp_path / "gone"
@@ -230,9 +239,26 @@ def test_proc_cwd_reports_a_deleted_cwd_as_unknown(tmp_path: Path) -> None:
     try:
         os.chdir(gone)
         gone.rmdir()
-        assert gitlock._proc_cwd(os.getpid()) is None
+        # The real kernel target, from a real process (this one), behind a deleted cwd.
+        assert gitlock._proc_cwd(os.getpid()) == f"{gone} (deleted)"
     finally:
         os.chdir(previous)
+
+    monkeypatch.setattr(gitlock, "_git_pids", lambda: (os.getpid(),))
+    monkeypatch.setattr(gitlock, "_proc_cwd", lambda _pid: f"{gone} (deleted)")
+    _touch(repo / ".git" / "index.lock", STALE_LOCK_MIN_AGE_SECONDS + 60)
+
+    assert gitlock._git_proc_running(repo) is False
+    removed = clear_stale_git_locks(repo)
+    assert str(repo / ".git" / "index.lock") in removed
+    assert not (repo / ".git" / "index.lock").exists()
+
+    # ACCEPTANCE 2 for the same shape: the report must name the dead lock, not a running git.
+    _touch(repo / ".git" / "index.lock", STALE_LOCK_MIN_AGE_SECONDS + 60)
+    message = describe_repo_lock(repo)
+    assert message is not None
+    assert "Safe to remove" in message
+    assert "fix conflicts and then commit" not in message
 
 
 def test_git_proc_running_stays_conservative_when_the_cwd_is_unknown(
