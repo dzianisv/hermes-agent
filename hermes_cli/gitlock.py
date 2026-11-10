@@ -14,6 +14,7 @@ a live-holder probe of the exact file.
 
 from __future__ import annotations
 
+import csv
 import logging
 import os
 import shutil
@@ -39,11 +40,26 @@ _TMP_PACK_PREFIXES = ("tmp_pack_", "tmp_idx_", "tmp_rev_", "tmp_mtimes_", ".tmp-
 
 
 def _proc_cwd(pid: int) -> Optional[str]:
-    """``/proc/<pid>/cwd`` resolved; None where the kernel has no /proc or it is unreadable."""
+    """``/proc/<pid>/cwd`` target; None where the kernel has no /proc or it is unreadable.
+
+    ``os.readlink`` and not ``os.path.realpath``: realpath NORMALISES a path it cannot resolve
+    instead of raising, so on a host without /proc it returned ``"/proc/<pid>/cwd"`` for every
+    pid and the conservative ``cwd is None`` branch in :func:`_git_pids_working_in` was
+    unreachable. That made every pid — including a live git working in the repo — classify as
+    "not our writer", and the lock sweep then unlinked a lock a running git held open.
+    """
     try:
-        return os.path.realpath(f"/proc/{pid}/cwd")
+        target = os.readlink(f"/proc/{pid}/cwd")
     except OSError:
         return None
+    # A deleted cwd cannot be matched against a repo root; report it as unknown so callers stay
+    # conservative rather than treating the pid as "working somewhere else".
+    return None if target.endswith(" (deleted)") else target
+
+
+def _proc_fd_scan_available() -> bool:
+    """True when this host exposes the ``/proc/<pid>/fd`` view used for exact-holder probes."""
+    return (Path("/proc") / "self" / "fd").is_dir()
 
 
 def _git_pids_working_in(repo_root: Optional[Path]) -> tuple[int, ...]:
@@ -90,28 +106,37 @@ def _git_proc_running(repo_root: Optional[Path] = None) -> bool:
 
 
 def _open_holders(paths: List[Path]) -> dict[Path, tuple[int, ...]]:
-    """PIDs holding any of ``paths`` open (one /proc pass); {} when no /proc fd view exists.
+    """PIDs holding any of ``paths`` open (one /proc pass); {} when no holder probe can run.
 
     Removals are gated on this exact-file probe, not only on the process-name guess: a git that has
     the inode open is live even when ``pgrep -x git`` raced and found nothing.
+
+    Without a ``/proc`` fd view (macOS, Windows) the probe falls back to ``lsof -t``. Before that
+    fallback existed the sweep had NO holder check on those platforms, and once the cwd probe was
+    fixed to stay conservative it could still unlink a lock a live process held open.
     """
     targets = {os.path.realpath(p): p for p in paths}
-    proc = Path("/proc")
-    if not targets or not (proc / "self" / "fd").is_dir():
+    if not targets:
         return {}
     found: dict[Path, set[int]] = {}
-    for fd_dir in proc.glob("[0-9]*/fd"):
-        try:
-            pid = int(fd_dir.parent.name)
-            for entry in os.scandir(fd_dir):
-                try:
-                    target = targets.get(os.readlink(entry.path))
-                except OSError:
-                    continue
-                if target is not None:
-                    found.setdefault(target, set()).add(pid)
-        except OSError:
-            continue
+    if _proc_fd_scan_available():
+        for fd_dir in Path("/proc").glob("[0-9]*/fd"):
+            try:
+                pid = int(fd_dir.parent.name)
+                for entry in os.scandir(fd_dir):
+                    try:
+                        target = targets.get(os.readlink(entry.path))
+                    except OSError:
+                        continue
+                    if target is not None:
+                        found.setdefault(target, set()).add(pid)
+            except OSError:
+                continue
+    else:
+        for original in targets.values():
+            pids = _lsof_holders(original)
+            if pids:
+                found.setdefault(original, set()).update(pids)
     return {path: tuple(sorted(pids)) for path, pids in found.items()}
 
 
@@ -252,12 +277,11 @@ def _proc_fd_holders(target: Path) -> Optional[tuple[int, ...]]:
     This is the check that matters for the safety rule: a ``git`` between closing its lock and
     renaming it into place holds the fd even though it is not visible as a separate process name.
     """
-    proc = Path("/proc")
-    if not (proc / "self" / "fd").is_dir():
+    if not _proc_fd_scan_available():
         return None
     real = os.path.realpath(target)
     holders: set[int] = set()
-    for fd_dir in proc.glob("[0-9]*/fd"):
+    for fd_dir in Path("/proc").glob("[0-9]*/fd"):
         try:
             for entry in os.scandir(fd_dir):
                 try:
@@ -279,11 +303,36 @@ def _lsof_holders(target: Path) -> Optional[tuple[int, ...]]:
     return _pids_from_probe([exe, "-t", str(target)], accept_codes=(0, 1))
 
 
+def _pids_from_tasklist_csv(output: str) -> tuple[int, ...]:
+    """PIDs from ``tasklist /FO CSV`` output, parsed as CSV.
+
+    ``tasklist`` quotes every field, so the whitespace tokeniser in :func:`_pids_from_probe`
+    never sees a bare PID (it would report the Session# or nothing). Rows are
+    ``"Image Name","PID","Session Name","Session#","Mem Usage"``; the header and the
+    "INFO: No tasks are running..." line are skipped by the ``git.exe`` name check.
+    """
+    pids: set[int] = set()
+    for row in csv.reader(output.splitlines()):
+        if len(row) < 2 or row[0].strip().lower() != "git.exe":
+            continue
+        pid = row[1].strip()
+        if pid.isdigit():
+            pids.add(int(pid))
+    return tuple(sorted(pids))
+
+
 def _git_pids() -> tuple[int, ...]:
     """Live ``git`` PIDs. Machine-wide by nature: pgrep cannot say which repo a git works on."""
     if os.name == "nt":
-        pids = _pids_from_probe(["tasklist", "/FI", "IMAGENAME eq git.exe", "/FO", "CSV"], accept_codes=(0,))
-        return pids or ()
+        try:
+            proc = subprocess.run(["tasklist", "/FI", "IMAGENAME eq git.exe", "/FO", "CSV"],
+                                  capture_output=True, text=True, encoding="utf-8",
+                                  errors="replace", timeout=10)
+        except Exception:
+            return ()
+        if proc.returncode != 0:
+            return ()
+        return _pids_from_tasklist_csv(proc.stdout)
     return _pids_from_probe(["pgrep", "-x", "git"], accept_codes=(0, 1)) or ()
 
 
@@ -316,11 +365,18 @@ def inspect_lock_file(lock_path: Path, *, repo_root: Optional[Path] = None) -> O
         holders.update(lsof_holders)
         checks.append("lsof: " + (
             "held by PID(s) " + ", ".join(map(str, lsof_holders)) if lsof_holders else "no holder"))
-    git_pids = _git_pids_working_in(Path(repo_root)) if repo_root is not None else _git_pids()
-    checks.append("git process probe (" + ("pgrep -x git + /proc/<pid>/cwd" if repo_root is not None
-                                           else "pgrep -x git, machine-wide") + "): " + (
-        "working in this repo as PID(s) " + ", ".join(map(str, git_pids)) if git_pids
-        else ("no git process working in this repo" if repo_root is not None else "no git process")))
+    if repo_root is not None:
+        git_pids = _git_pids_working_in(Path(repo_root))
+        probe = "tasklist git.exe + process cwd" if os.name == "nt" else "pgrep -x git + /proc/<pid>/cwd"
+        # A pid whose cwd could not be read is kept conservatively, so only the resolved ones are
+        # certainly working here; naming that keeps the report honest on hosts without /proc.
+        verdict = ("working in (or not excludable from) this repo as PID(s) "
+                   + ", ".join(map(str, git_pids))) if git_pids else "no git process working in this repo"
+    else:
+        git_pids = _git_pids()
+        probe = "tasklist git.exe, machine-wide" if os.name == "nt" else "pgrep -x git, machine-wide"
+        verdict = ("live PID(s) " + ", ".join(map(str, git_pids))) if git_pids else "no git process"
+    checks.append(f"git process probe ({probe}): {verdict}")
     return LockReport(
         path=Path(lock_path), age_seconds=max(0.0, time.time() - st.st_mtime), size=st.st_size,
         holder_pids=tuple(sorted(holders)), git_pids=git_pids, checks=tuple(checks),

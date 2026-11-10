@@ -1049,7 +1049,7 @@ class TestPruneSweepsTmpPackDebris:
     def test_sweeps_debris_even_when_no_ref_moved(self, checkpoint_base, tmp_path, monkeypatch):
         import tools.checkpoint_manager as cm
         monkeypatch.setattr(cm, "CHECKPOINT_BASE", checkpoint_base)
-        monkeypatch.setattr("hermes_cli.gitlock._git_proc_running", lambda: False)
+        monkeypatch.setattr("hermes_cli.gitlock._git_proc_running", lambda *args, **kwargs: False)
         work = tmp_path / "proj"
         work.mkdir()
         (work / "f").write_text("f")
