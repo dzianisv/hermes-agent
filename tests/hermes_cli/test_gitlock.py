@@ -204,6 +204,125 @@ def test_git_proc_running_is_scoped_to_the_repo(repo: Path, monkeypatch: pytest.
     assert gitlock._git_proc_running(repo) is True
 
 
+def test_proc_cwd_is_none_for_a_pid_the_kernel_cannot_resolve() -> None:
+    """``_proc_cwd`` must report "unknown", not a fabricated path (the F1 defect).
+
+    ``os.path.realpath("/proc/<dead>/cwd")`` returns the input path instead of raising, so the
+    conservative ``cwd is None`` branch in ``_git_pids_working_in`` never ran and every pid on a
+    host without /proc was classified as "not working in this repo".
+    """
+    import hermes_cli.gitlock as gitlock
+
+    absent = max(
+        (int(p.name) for p in Path("/proc").iterdir() if p.name.isdigit()), default=1
+    ) + 1000 if Path("/proc").is_dir() else 999999
+    assert gitlock._proc_cwd(absent) is None
+
+
+@pytest.mark.platforms("linux")
+def test_proc_cwd_reports_a_deleted_cwd_as_unknown(tmp_path: Path) -> None:
+    """A cwd the kernel marks "(deleted)" must read as unknown, not as some other directory."""
+    import hermes_cli.gitlock as gitlock
+
+    gone = tmp_path / "gone"
+    gone.mkdir()
+    previous = os.getcwd()
+    try:
+        os.chdir(gone)
+        gone.rmdir()
+        assert gitlock._proc_cwd(os.getpid()) is None
+    finally:
+        os.chdir(previous)
+
+
+def test_git_proc_running_stays_conservative_when_the_cwd_is_unknown(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No /proc (macOS/Windows) or an unreadable pid must keep the sweep gated, not open it."""
+    import hermes_cli.gitlock as gitlock
+
+    monkeypatch.setattr(gitlock, "_git_pids", lambda: (4242,))
+    monkeypatch.setattr(gitlock, "_proc_cwd", lambda _pid: None)
+
+    assert gitlock._git_proc_running(repo) is True
+
+
+def test_tasklist_csv_yields_the_git_pids() -> None:
+    """``tasklist /FO CSV`` quotes every field, so a whitespace tokeniser finds no PID at all."""
+    import hermes_cli.gitlock as gitlock
+
+    output = (
+        '"Image Name","PID","Session Name","Session#","Mem Usage"\r\n'
+        '"git.exe","1234","Console","1","12,345 K"\r\n'
+        '"git.exe","5678","Services","0","1,234 K"\r\n'
+        '"notepad.exe","9999","Console","1","9,999 K"\r\n'
+    )
+
+    assert gitlock._pids_from_tasklist_csv(output) == (1234, 5678)
+    assert gitlock._pids_from_tasklist_csv('INFO: No tasks are running which match the specified criteria.\r\n') == ()
+
+
+@pytest.mark.platforms("posix")
+def test_sweep_refuses_a_held_lock_without_a_proc_fd_view(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """macOS shape: no /proc fd view. The sweep must still ask lsof before unlinking.
+
+    On that platform ``_proc_fd_scan_available()`` is False and ``_open_holders`` falls back to
+    ``lsof -t``. Without the fallback the sweep had no holder check at all there and removed a
+    lock a live process held open (the F1 data-loss case).
+    """
+    import subprocess as sp
+    import sys as _sys
+
+    import hermes_cli.gitlock as gitlock
+
+    lock = repo / ".git" / "index.lock"
+    _touch(lock, STALE_LOCK_MIN_AGE_SECONDS + 60)
+    holder = sp.Popen(
+        [_sys.executable, "-c", "import sys, time; f = open(sys.argv[1], 'rb'); time.sleep(60)", str(lock)],
+    )
+    try:
+        deadline = time.time() + 10
+        while time.time() < deadline and holder.poll() is None:
+            if gitlock._proc_fd_holders(lock):
+                break
+            if not Path("/proc/self/fd").is_dir():
+                time.sleep(0.3)  # no fd view here: give the child time to open the file
+                break
+            time.sleep(0.05)
+        assert holder.poll() is None, "holder process died before the sweep ran"
+
+        monkeypatch.setattr(gitlock, "_proc_fd_scan_available", lambda: False)
+        monkeypatch.setattr(gitlock, "_lsof_holders",
+                            lambda path: (holder.pid,) if os.path.realpath(path) == os.path.realpath(lock) else ())
+        monkeypatch.setattr(gitlock, "_git_pids", lambda: ())
+
+        assert gitlock._open_holders([lock]) == {lock: (holder.pid,)}
+        assert clear_stale_git_locks(repo) == []
+        assert lock.exists()
+    finally:
+        holder.kill()
+        holder.wait(timeout=10)
+
+
+def test_sweep_still_clears_a_stale_lock_without_a_proc_fd_view(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The lsof fallback must not turn into a permanent skip: no holder -> the lock is removed."""
+    import hermes_cli.gitlock as gitlock
+
+    monkeypatch.setattr(gitlock, "_proc_fd_scan_available", lambda: False)
+    monkeypatch.setattr(gitlock, "_lsof_holders", lambda _path: ())
+    monkeypatch.setattr(gitlock, "_git_pids", lambda: ())
+    _touch(repo / ".git" / "index.lock", STALE_LOCK_MIN_AGE_SECONDS + 60)
+
+    removed = clear_stale_git_locks(repo)
+
+    assert str(repo / ".git" / "index.lock") in removed
+    assert not (repo / ".git" / "index.lock").exists()
+
+
 def test_sweep_clears_a_stale_lock_while_an_unrelated_git_process_runs(
     repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
