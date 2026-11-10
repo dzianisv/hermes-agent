@@ -52,6 +52,10 @@ def _default_cron_test_model(monkeypatch):
     yield
 
 
+# tests/conftest.py owns the suite-wide HERMES_CRON_MODEL_GUARD kill-switch so tests outside
+# tests/cron stay hermetic too. The guard's own module tests re-enable it explicitly.
+
+
 @pytest.fixture(autouse=True)
 def _reset_session_context_vars():
     """Restore session ContextVars around cron tests that call run_job directly.

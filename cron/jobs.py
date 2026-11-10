@@ -29,6 +29,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from hermes_constants import get_hermes_home
 from cron.constants import CLAIM_TTL_INACTIVITY_HEADROOM, FIRE_CLAIM_SKEW_SECONDS, FIRE_CLAIM_TTL_SECONDS
+from cron.model_guard import guard_pin_write
 from cron.env_settings import cron_env_setting
 from typing import Optional, Dict, List, Any, Callable, Set, Tuple, Union, Collection
 
@@ -1610,12 +1611,45 @@ def _main_model_pin() -> Tuple[Optional[str], Optional[str]]:
     return (provider.lower() if provider else None), model
 
 
+def _cron_model_provider_pin() -> Optional[str]:
+    from hermes_cli.config_effective import load_user_config_effective
+
+    cfg_path = get_hermes_home() / "config.yaml"
+    cfg = {}
+    with contextlib.suppress(Exception):
+        cfg = load_user_config_effective(cfg_path) if cfg_path.exists() else {}
+    cron_cfg = cfg.get("cron") if isinstance(cfg.get("cron"), dict) else {}
+    return _normalize_job_optional_text(cron_cfg.get("model_provider"))
+
+
 def _normalize_job_optional_text(
     value: Any, *, strip_trailing_slash: bool = False
 ) -> Optional[str]:
     if not isinstance(value, str):
         return None
     return (value.strip().rstrip("/") if strip_trailing_slash else value.strip()) or None
+
+
+def _guard_write_provider(
+    explicit_provider: Any, existing_provider: Any = None
+) -> Optional[str]:
+    """Provider used to validate a stored model pin.
+
+    Why: ``create_job``/``update_job`` are the single write choke point for cron pins, including
+    ``pinned=True`` copying the current main model onto a job. The write-time guard must validate
+    against the provider that will actually be stored, or against the current main-model provider
+    when the write stores only a model.
+    """
+    if explicit_provider is not _MISSING:
+        return _normalize_job_optional_text(explicit_provider)
+    existing = _normalize_job_optional_text(existing_provider)
+    if existing:
+        return existing
+    cron_provider = _cron_model_provider_pin()
+    if cron_provider:
+        return cron_provider
+    main_provider, _main_model = _main_model_pin()
+    return _normalize_job_optional_text(main_provider)
 
 
 def _normalize_base_url(value: Any) -> Optional[str]:
@@ -1804,6 +1838,14 @@ def create_job(
     name = name or label_source[:50].strip()
     if pinned and not f["model"]:
         f["provider"], f["model"] = _main_model_pin()
+    if f["model"]:
+        explicit_provider = f["provider"] if _normalize_job_optional_text(provider) is not None else _MISSING
+        guard_pin_write(
+            f["model"],
+            _guard_write_provider(explicit_provider),
+            job_id=job_id,
+            job_name=name,
+        )
     next_run_at = _next_run_or_reject_past_oneshot(parsed_schedule, name, schedule, "")
 
     job = {
@@ -2029,11 +2071,20 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
     if bad_fields:
         raise ValueError(f"Cron job field(s) cannot be updated: {', '.join(sorted(bad_fields))}")
 
+    guard_model_write = bool({"model", "pinned"}.intersection(updates or {}))
+
     def apply(jobs, i, job):
         _rederive_repeat_for_schedule_change(job, updates)
         _normalize_job_updates(job, updates)
         _apply_pin_update(job, updates)
         updated = _apply_skill_fields({**job, **updates})
+        if guard_model_write and updated.get("model"):
+            guard_pin_write(
+                updated["model"],
+                _guard_write_provider(updates.get("provider", _MISSING), job.get("provider")),
+                job_id=job_id,
+                job_name=str(updated.get("name") or job.get("name") or job_id),
+            )
         _reject_terminal_activation(job, updated, job_id)
         # Re-check on the MERGED record; scoped to changed fields so legacy records keep loading.
         if {"monitor_script", "monitor_url", "no_agent", "script"}.intersection(updates):
